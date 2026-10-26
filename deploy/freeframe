@@ -1117,7 +1117,25 @@ install_fail() {
     _ff_term_say "" "The admin account for $FF_ADMIN_EMAIL was created, with the password made for you:" \
       "  $FF_ADMIN_PASSWORD" "Write it down now: it is shown on the screen only and saved nowhere."
   fi
+  # Let tee finish writing, so every line is on the screen before the
+  # prompt comes back. Bounded: when this runs inside a redirection (a trap
+  # during `_ff_logged ...`), bash still holds a saved copy of the pipe, so
+  # tee only ends when this script does.
+  if [[ -n ${FF_TERM_OUT:-} ]]; then
+    exec 1>&"$FF_TERM_OUT" 2>&"$FF_TERM_ERR"
+    _ff_wait_tee 20
+  fi
   exit 1
+}
+
+# _ff_wait_tee TENTHS: wait up to TENTHS tenths of a second for tee to end.
+_ff_wait_tee() {
+  local i=0
+  while ((i < $1)) && kill -0 "${FF_TEE_PID:-0}" 2>/dev/null; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 0
 }
 
 # _ff_answer_error MESSAGE WHAT_TO_TRY: an answer given ahead of time is not
@@ -1326,7 +1344,12 @@ _install_log_start() {
   # Everything printed from here on goes to the terminal and to install.log.
   # The terminal's own fds are kept, for the one line the log must not hold.
   exec {FF_TERM_OUT}>&1 {FF_TERM_ERR}>&2
-  exec > >(tee -a "$FF_LOG") 2>&1
+  # tee ignores Ctrl-C, a closed terminal and TERM, which reach the whole
+  # process group: it must outlive this script so the message that says
+  # what was interrupted still reaches the screen and the log (a dead tee
+  # would end the script with SIGPIPE at its next line instead). It ends
+  # when this script does.
+  exec > >(trap '' INT TERM HUP; exec tee -a "$FF_LOG") 2>&1
   FF_TEE_PID=$!
 }
 
@@ -2463,6 +2486,14 @@ backup_create() {
       "What to try: check that the disk is not full or read-only, then run: $retry"
     return 1
   fi
+  # What a backup killed part-way (SIGKILL, power loss) left behind. Callers
+  # hold the backup/restore lock, so no other backup is writing these.
+  for f in "$dir"/freeframe-*.partial; do
+    if [[ -e $f ]]; then
+      rm -f -- "$f"
+      printf 'backup: removed %s, left by a backup that did not finish\n' "$f" >>"${FF_LOG:-/dev/null}"
+    fi
+  done
 
   # The copy an unfinished restore can be undone with is kept out of the
   # size rule and out of pruning while it is recorded.
@@ -2540,6 +2571,17 @@ _backup_on_error() {
   exit 1
 }
 
+# _backup_on_signal SIG: Ctrl-C, systemctl stop or a shutdown during a
+# backup. The part-written files are removed (and a SIGKILL's are removed by
+# the next backup).
+_backup_on_signal() {
+  trap '' INT TERM HUP
+  # To the saved stderr: a trap runs inside the redirection of the command
+  # it interrupted.
+  _ff_backup_refused "The backup was stopped (SIG$1) before it finished." 2>&"${FF_BACKUP_ERR:-2}"
+  exit 1
+}
+
 # cmd_backup: `freeframe backup [--quiet]`. --quiet (the nightly timer)
 # prints nothing when the backup is saved, and a plain error when not.
 cmd_backup() {
@@ -2556,9 +2598,13 @@ cmd_backup() {
     _ff_stop 1 "Another backup or restore is running right now, so this backup did not start." \
       "wait a few minutes for it to finish, then run sudo freeframe backup again."
   fi
+  exec {FF_BACKUP_ERR}>&2
   trap _backup_on_error ERR
+  trap '_backup_on_signal INT' INT
+  trap '_backup_on_signal TERM' TERM
+  trap '_backup_on_signal HUP' HUP
   if ! backup_create prune; then exit 1; fi
-  trap - ERR
+  trap - ERR INT TERM HUP
   [[ -z ${FF_QUIET:-} ]] || return 0
   base=${FF_BACKUP_MADE%.dump}
   size=$(_ff_human_size "$(_ff_size_bytes "$FF_BACKUP_MADE")")
@@ -2679,8 +2725,32 @@ _restore_on_error() {
   if ((BASH_SUBSHELL > 0)); then exit "$code"; fi
   trap - ERR
   _ff_backup_cleanup
-  install_fail "The restore stopped unexpectedly while ${FF_STEP:-restoring} (error $code)." \
+  _restore_report "The restore stopped unexpectedly while ${FF_STEP:-restoring} (error $code)." \
     "look at the end of ${FF_LOG:-the output above} for the reason."
+}
+
+# _restore_report MESSAGE WHAT_TO_TRY: install_fail for the restore's traps.
+# A trap runs inside the redirection of the command it interrupted (often
+# `_ff_logged ...`, which writes to the log only), so the lines go through a
+# pipe of their own to the terminal and the log, then the restore exits 1.
+_restore_report() {
+  if [[ -z ${FF_TERM_ERR:-} ]]; then install_fail "$1" "$2"; fi
+  (
+    FF_TERM_OUT=""
+    install_fail "$1" "$2"
+  ) 2>&1 | tee -a "${FF_LOG:-/dev/null}" >&"$FF_TERM_ERR" || true
+  exit 1
+}
+
+# _restore_on_signal SIG: Ctrl-C, a closed terminal or a shutdown during a
+# restore. Says what state the database is in and how to go on, like any
+# other stop.
+_restore_on_signal() {
+  trap '' INT TERM HUP
+  trap - ERR
+  _ff_backup_cleanup
+  _restore_report "The restore was stopped (SIG$1) while ${FF_STEP:-restoring}, before it finished." \
+    "to finish it, run: $FF_RERUN"
 }
 
 # cmd_restore: `freeframe restore [FILE]` (spec goal 13). With no FILE it
@@ -2737,6 +2807,9 @@ cmd_restore() {
   FF_STATE="Nothing has been changed."
   _install_log_start restore
   trap _restore_on_error ERR
+  trap '_restore_on_signal INT' INT
+  trap '_restore_on_signal TERM' TERM
+  trap '_restore_on_signal HUP' HUP
   _ff_pg_names
   recorded=$(_restore_undo_path)
   if [[ -z $recorded && -f $(_restore_undo_file) ]]; then
@@ -2838,7 +2911,7 @@ cmd_restore() {
     install_fail "The backup has been put back, but FreeFrame did not finish starting within $(((${FF_API_WAIT:-600} + 59) / 60)) minutes." \
       "see why with: sudo freeframe logs, then run: sudo freeframe restart"
   fi
-  trap - ERR
+  trap - ERR INT TERM HUP
   _restore_undo_clear
   say ""
   say "The database is back as it was in $dump${when:+ (made $when)}."

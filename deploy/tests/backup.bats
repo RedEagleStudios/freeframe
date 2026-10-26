@@ -585,6 +585,85 @@ dumps() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null) || true; }
   grep -q 'The database is back as it was' "$FF_ROOT/install.log"
 }
 
+# ---------------------------------------------------------------- signals
+
+# ff_signal SIG STEP ARGS...: run `freeframe ARGS` in its own process group,
+# wait until the stubbed STEP hangs, then send SIG to the whole group (as
+# systemctl stop, a shutdown or Ctrl-C do). INT cannot be tested this way:
+# bash starts background jobs with SIGINT ignored, and an ignored signal
+# cannot be trapped. INT, TERM and HUP share one handler.
+ff_signal() {
+  local sig=$1 step=$2 pid n=0
+  shift 2
+  command -v setsid >/dev/null || skip "no setsid"
+  setsid bash -c 'set -Eeuo pipefail; source "$1"; source "$2"; shift 2; main "$@"' \
+    ff-run "$FF_SCRIPT" "$STUBS" "$@" >"$BATS_TEST_TMPDIR/out" 2>&1 &
+  pid=$!
+  while [[ ! -e $STUB_DIR/hanging-$step ]]; do
+    sleep 0.1
+    n=$((n + 1))
+    if ((n > 150)); then
+      echo "the step $step never started"
+      cat "$BATS_TEST_TMPDIR/out"
+      return 1
+    fi
+  done
+  kill -"$sig" -- -"$(cat "$STUB_DIR/pgid")"
+  status=0
+  wait "$pid" || status=$?
+  output=$(cat "$BATS_TEST_TMPDIR/out")
+}
+
+@test "backup: stopped part-way (TERM), it removes the part-written files and says so" {
+  export STUB_DUMP_HANG=1
+  ff_signal TERM pg_dump backup --quiet
+  [ "$status" -eq 1 ]
+  assert_out "The backup was stopped (SIGTERM) before it finished."
+  assert_out "No new backup was made"
+  [ -z "$(ls -A "$BK" | grep -v '^\.')" ]
+}
+
+@test "backup: files a killed backup left behind are removed by the next one" {
+  mkdir -p "$BK"
+  printf 'PGDMP-half' >"$BK/freeframe-20261020-030000.dump.partial"
+  printf 'X=1' >"$BK/freeframe-20261020-030000.env.prod.partial"
+  old_backup 20261019-030000
+  ff backup
+  [ "$status" -eq 0 ]
+  [ -z "$(ls -A "$BK" | grep partial)" ]
+  [ -e "$BK/freeframe-20261019-030000.dump" ]
+  grep -q 'left by a backup that did not finish' "$FF_ROOT/install.log"
+}
+
+@test "restore: stopped (TERM) while the backup goes in, it says the database is empty and how to go on" {
+  old_backup 20261020-030000
+  export STUB_RESTORE_HANG=1
+  ff_signal TERM pg_restore restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  assert_out "The restore was stopped (SIGTERM) while putting the backup back"
+  assert_out "The database is empty now"
+  assert_out "sudo freeframe restore --yes $BK/freeframe-20261020-030000.dump"
+  local safety
+  safety=$(dumps | tail -1)
+  assert_out "sudo freeframe restore --yes $BK/$safety"
+  assert_out "install.log"
+  # FreeFrame was not started on the empty database, and the undo is kept.
+  [ "$(grep -c '^dc up -d' "$CALLS")" -eq 1 ]
+  assert_eq "$(cat "$FF_ROOT/.restore-undo")" "$BK/$safety"
+  grep -q "stopped (SIGTERM)" "$FF_ROOT/install.log"
+}
+
+@test "restore: stopped (HUP) while saving the safety copy, nothing was changed and no part file is left" {
+  old_backup 20261020-030000
+  export STUB_DUMP_HANG=1
+  ff_signal HUP pg_dump restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ] || { echo "status $status"; echo "$output"; cat "$CALLS"; false; }
+  assert_out "The restore was stopped (SIGHUP) while saving a copy of the current database"
+  assert_out "the database has not been changed"
+  assert_not_called dropdb
+  [ -z "$(ls -A "$BK" | grep partial)" ]
+}
+
 # ---------------------------------------------------------------- the timer
 
 UNITS="${BATS_TEST_DIRNAME}/../systemd"

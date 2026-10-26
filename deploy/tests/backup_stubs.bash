@@ -30,6 +30,17 @@ fi
 _stub_db() { cat "$STUB_DIR/dbstate" 2>/dev/null || printf '%s' "${STUB_DB_STATE:-data}"; }
 _stub_db_set() { printf '%s' "$1" >"$STUB_DIR/dbstate"; }
 
+# _stub_hang NAME: for the signal tests. Note this process group (the test
+# signals all of it, as systemctl stop and Ctrl-C do), say the long step has
+# started, and wait.
+_stub_hang() {
+  local -a st
+  read -r -a st </proc/$BASHPID/stat
+  printf '%s' "${st[4]}" >"$STUB_DIR/pgid"
+  : >"$STUB_DIR/hanging-$1"
+  sleep 30
+}
+
 # docker compose for this install.
 dc() {
   _stub_log "dc $*"
@@ -43,6 +54,10 @@ dc() {
       if [[ -n ${STUB_DUMP_FAIL:-} || $(_stub_db) == absent ]]; then
         printf 'PGDMP-half-written'
         return 1
+      fi
+      if [[ -n ${STUB_DUMP_HANG:-} ]]; then
+        printf 'PGDMP-so-far'
+        _stub_hang pg_dump
       fi
       if [[ -n ${STUB_DUMP_GARBAGE:-} ]]; then
         printf 'pg_dump: error: connection failed\n'
@@ -76,6 +91,7 @@ dc() {
       ;;
     "exec -T postgres pg_restore "*)
       cat >"$STUB_DIR/restored"
+      [[ -z ${STUB_RESTORE_HANG:-} ]] || _stub_hang pg_restore
       [[ -z ${STUB_RESTORE_FAIL:-} ]] || return 1
       _stub_db_set data
       ;;
