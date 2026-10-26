@@ -25,6 +25,11 @@ if [[ -n ${STUB_BIG_LAST:-} ]]; then
   }
 fi
 
+# The database's state, kept in a file so it carries across runs like a
+# real database: data (the default, or STUB_DB_STATE), absent, empty.
+_stub_db() { cat "$STUB_DIR/dbstate" 2>/dev/null || printf '%s' "${STUB_DB_STATE:-data}"; }
+_stub_db_set() { printf '%s' "$1" >"$STUB_DIR/dbstate"; }
+
 # docker compose for this install.
 dc() {
   _stub_log "dc $*"
@@ -35,7 +40,7 @@ dc() {
     "exec -T postgres pg_dump "*)
       # What the backups folder holds while the dump is being written.
       ls -A "$FF_ROOT/backups" >"$STUB_DIR/during-dump"
-      if [[ -n ${STUB_DUMP_FAIL:-} ]]; then
+      if [[ -n ${STUB_DUMP_FAIL:-} || $(_stub_db) == absent ]]; then
         printf 'PGDMP-half-written'
         return 1
       fi
@@ -43,15 +48,36 @@ dc() {
         printf 'pg_dump: error: connection failed\n'
         return 0
       fi
-      printf 'PGDMP current database %s\n' "${STUB_DB_CONTENT:-v2}"
+      if [[ $(_stub_db) == empty ]]; then
+        printf 'PGDMP empty database\n'
+      else
+        printf 'PGDMP current database %s\n' "${STUB_DB_CONTENT:-v2}"
+      fi
       ;;
     "exec -T postgres pg_isready "*) [[ -z ${STUB_PG_DOWN:-} ]] ;;
-    "exec -T postgres psql "*) [[ -z ${STUB_DB_MISSING:-} ]] ;;
-    "exec -T postgres dropdb "*) [[ -z ${STUB_DROP_FAIL:-} ]] ;;
-    "exec -T postgres createdb "*) [[ -z ${STUB_CREATE_FAIL:-} ]] ;;
+    # The maintenance database: does FreeFrame's database exist?
+    "exec -T postgres psql -U "*" -d postgres "*)
+      cat >"$STUB_DIR/maint-sql"
+      [[ -z ${STUB_MAINT_FAIL:-} ]] || return 1
+      if [[ $(_stub_db) == absent ]]; then echo 0; else echo 1; fi
+      ;;
+    # FreeFrame's database: how many tables?
+    "exec -T postgres psql "*)
+      [[ -z ${STUB_DB_OPEN_FAIL:-} && $(_stub_db) != absent ]] || return 1
+      if [[ $(_stub_db) == empty ]]; then echo 0; else echo 42; fi
+      ;;
+    "exec -T postgres dropdb "*)
+      [[ -z ${STUB_DROP_FAIL:-} ]] || return 1
+      _stub_db_set absent
+      ;;
+    "exec -T postgres createdb "*)
+      [[ -z ${STUB_CREATE_FAIL:-} ]] || return 1
+      _stub_db_set empty
+      ;;
     "exec -T postgres pg_restore "*)
       cat >"$STUB_DIR/restored"
-      [[ -z ${STUB_RESTORE_FAIL:-} ]]
+      [[ -z ${STUB_RESTORE_FAIL:-} ]] || return 1
+      _stub_db_set data
       ;;
     *"localhost:8000/health"*) [[ -z ${STUB_API_DOWN:-} ]] ;;
     "up -d --no-build postgres") [[ -z ${STUB_PG_DOWN:-} ]] ;;

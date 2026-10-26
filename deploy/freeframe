@@ -799,11 +799,13 @@ dc() {
 # Backups
 # ------------------------------------------------------------
 
-# backup_prune DIR KEEP: delete all but the newest KEEP freeframe-*.dump files
-# in DIR, with their freeframe-*.env.prod settings copies. Backups are named
-# freeframe-<YYYYmmdd-HHMMSS>.dump, so newest is last in name order.
+# backup_prune DIR KEEP [PROTECT]: delete all but the newest KEEP
+# freeframe-*.dump files in DIR, with their freeframe-*.env.prod settings
+# copies. Backups are named freeframe-<YYYYmmdd-HHMMSS>.dump, so newest is
+# last in name order. PROTECT (a dump path) is never deleted and not counted:
+# restore uses it for the copy an unfinished restore can be undone with.
 backup_prune() {
-  local dir=$1 keep=$2 f n i=0
+  local dir=$1 keep=$2 protect=${3:-} f n i=0
   local LC_ALL=C
   local -a dumps=()
   if [[ ! $keep =~ ^[0-9]+$ ]]; then
@@ -812,7 +814,7 @@ backup_prune() {
   fi
   [[ -d $dir ]] || return 0
   for f in "$dir"/freeframe-*.dump; do
-    [[ -f $f ]] && dumps+=("$f")
+    [[ -f $f && $f != "$protect" ]] && dumps+=("$f")
   done
   n=$((${#dumps[@]} - 10#$keep))
   while ((i < n)); do
@@ -2449,7 +2451,7 @@ _ff_backup_refused() {
 # less free space than twice the last backup, or 1 GB. Prints its own
 # message and returns 1 when no backup was made.
 backup_create() {
-  local mode=${1:-prune} root dir file base stamp last_bytes=0 need free retry
+  local mode=${1:-prune} root dir file base stamp last="" last_bytes=0 need free retry protect f
   local -a dumps=()
   root=$(ff_root)
   dir="$root/backups"
@@ -2462,9 +2464,15 @@ backup_create() {
     return 1
   fi
 
+  # The copy an unfinished restore can be undone with is kept out of the
+  # size rule and out of pruning while it is recorded.
+  protect=$(_restore_undo_path)
   mapfile -t dumps < <(_ff_backup_dumps "$dir")
-  if ((${#dumps[@]})); then
-    last_bytes=$(_ff_size_bytes "${dumps[-1]}") || last_bytes=0
+  for f in ${dumps[@]+"${dumps[@]}"}; do
+    if [[ $f != "$protect" ]]; then last=$f; fi
+  done
+  if [[ -n $last ]]; then
+    last_bytes=$(_ff_size_bytes "$last") || last_bytes=0
     [[ $last_bytes =~ ^[0-9]+$ ]] || last_bytes=0
   fi
   need=$(((2 * last_bytes + 1048575) / 1048576))
@@ -2516,7 +2524,7 @@ backup_create() {
   FF_PARTIAL=""
   FF_BACKUP_MADE="$base.dump"
   printf 'backup: saved %s.dump (%s)\n' "$base" "$(_ff_human_size "$(_ff_size_bytes "$base.dump")")" >>"${FF_LOG:-/dev/null}"
-  if [[ $mode == prune ]] && ! backup_prune "$dir" "$FF_BACKUP_KEEP"; then
+  if [[ $mode == prune ]] && ! backup_prune "$dir" "$FF_BACKUP_KEEP" "$protect"; then
     warn "The backup was saved, but older backups could not be cleared away."
   fi
   return 0
@@ -2563,7 +2571,7 @@ cmd_backup() {
 
 # restore_list: the backups on this server, newest first, with dates and sizes.
 restore_list() {
-  local dir f name when i
+  local dir f name when i undo
   local -a dumps=()
   dir="$(ff_root)/backups"
   mapfile -t dumps < <(_ff_backup_dumps "$dir")
@@ -2583,6 +2591,12 @@ restore_list() {
   say "To put one back, run for example (this replaces the current database, after saving a copy of it):"
   say "  sudo freeframe restore ${dumps[-1]}"
   say "A backup copied from another server can be given by its path."
+  undo=$(_restore_undo_path)
+  if [[ -n $undo ]]; then
+    say ""
+    say "A restore did not finish. The copy of the database from before it is kept: $undo"
+    say "To go back to it, run: sudo freeframe restore --yes $undo"
+  fi
 }
 
 # _restore_resolve ARG: the full path of the backup ARG names: a path, or a
@@ -2604,6 +2618,53 @@ _restore_resolve() {
       "pick one of the backups listed by: sudo freeframe restore. A .sql.gz backup from a manual setup is restored by hand, as the guide explains: $FF_GUIDE_URL"
   fi
   FF_RESTORE_FILE=$path
+}
+
+# The undo record ($FF_ROOT/.restore-undo, mode 600): the path of the safety
+# copy taken by a restore that has not finished yet. A retry keeps pointing
+# at it instead of copying the empty database the failed attempt left, and
+# backup_create keeps it out of pruning and the size rule. Cleared when a
+# restore succeeds.
+_restore_undo_file() { printf '%s/.restore-undo' "$(ff_root)"; }
+
+# _restore_undo_path: the recorded safety copy, when it still exists.
+_restore_undo_path() {
+  local f p=""
+  f=$(_restore_undo_file)
+  [[ -f $f ]] || return 0
+  IFS= read -r p <"$f" || true
+  if [[ -n $p && -f $p ]]; then printf '%s' "$p"; fi
+  return 0
+}
+
+_restore_undo_set() {
+  local f
+  f=$(_restore_undo_file)
+  (umask 077 && printf '%s\n' "$1" >"$f.tmp") && chmod 600 "$f.tmp" && mv -f "$f.tmp" "$f"
+}
+
+_restore_undo_clear() { rm -f "$(_restore_undo_file)"; }
+
+# _restore_db_state: what is in FreeFrame's database now, asked through the
+# maintenance database: absent, empty (no tables, as a failed restore leaves
+# it) or data. Fails (1) when that cannot be found out.
+_restore_db_state() {
+  local n
+  n=$(printf "SELECT count(*) FROM pg_database WHERE datname = :'db';\n" |
+    dc exec -T postgres psql -U "$FF_PG_USER" -d postgres -v db="$FF_PG_DB" -Atq 2>>"${FF_LOG:-/dev/null}") || return 1
+  case $n in
+    0)
+      printf 'absent'
+      return 0
+      ;;
+    1) ;;
+    *) return 1 ;;
+  esac
+  n=$(dc exec -T postgres psql -U "$FF_PG_USER" -d "$FF_PG_DB" -Atqc \
+    "SELECT count(*) FROM pg_tables WHERE schemaname NOT IN ('pg_catalog', 'information_schema')" \
+    2>>"${FF_LOG:-/dev/null}") || return 1
+  [[ $n =~ ^[0-9]+$ ]] || return 1
+  if ((n == 0)); then printf 'empty'; else printf 'data'; fi
 }
 
 # _restore_fail STATE MESSAGE WHAT_TO_TRY: a step failed; STATE says where
@@ -2633,7 +2694,7 @@ _restore_on_error() {
 # database its setup page would be open to anyone) and the message says what
 # state the database is in and the command that tries again.
 cmd_restore() {
-  local root dump when out s safety="" undo=""
+  local root dump when out s state recorded="" undo="" undo_cmd=""
   local -a all=() svcs=()
   root=$(ff_root)
   if ((${#FF_ARGS[@]} > 1)); then
@@ -2677,6 +2738,11 @@ cmd_restore() {
   _install_log_start restore
   trap _restore_on_error ERR
   _ff_pg_names
+  recorded=$(_restore_undo_path)
+  if [[ -z $recorded && -f $(_restore_undo_file) ]]; then
+    warn "The copy recorded by an earlier restore that did not finish is no longer there, so it cannot be used to undo."
+    _restore_undo_clear
+  fi
 
   FF_STEP="starting the database"
   say "Restoring the database from $dump"
@@ -2702,19 +2768,44 @@ cmd_restore() {
   fi
   FF_STATE="FreeFrame is stopped and the database has not been changed. To start FreeFrame again as it was, run: sudo freeframe restart"
 
+  # Whether a copy is needed is asked through the maintenance database: an
+  # absent or empty database has nothing to save, and one that exists but
+  # cannot be checked is never dropped without a copy.
+  FF_STEP="checking the current database"
+  if ! state=$(_restore_db_state); then
+    _ff_logged dc up -d --no-build || true
+    _restore_fail "" "The current database could not be checked, so the restore stopped before changing anything (it will not replace a database it cannot copy first). FreeFrame has been started again." \
+      "the reason is at the end of $FF_LOG. Then run: $FF_RERUN"
+  fi
   FF_STEP="saving a copy of the current database"
-  if _ff_logged dc exec -T postgres psql -U "$FF_PG_USER" -d "$FF_PG_DB" -Atqc 'SELECT 1'; then
+  if [[ $state == data ]]; then
     say "Saving a copy of the current database first..."
     if ! backup_create keep; then
       _ff_logged dc up -d --no-build || true
       _restore_fail "" "No copy of the current database could be saved, so the restore stopped before changing anything. FreeFrame has been started again." \
         "fix what the message above says, then run: $FF_RERUN"
     fi
-    safety=$FF_BACKUP_MADE
-    undo="sudo freeframe restore --yes $safety"
-    say "Saved the current database as $safety"
+    if [[ -n $recorded ]]; then
+      say "Saved the current database as $FF_BACKUP_MADE"
+      say "The copy from before the earlier restore that did not finish is kept too: $recorded"
+    else
+      recorded=$FF_BACKUP_MADE
+      if ! _restore_undo_set "$recorded"; then
+        _ff_logged dc up -d --no-build || true
+        _restore_fail "" "The copy of the current database ($recorded) could not be recorded, so the restore stopped before changing anything. FreeFrame has been started again." \
+          "check that the disk is not full, then run: $FF_RERUN"
+      fi
+      say "Saved the current database as $recorded"
+    fi
+  elif [[ -n $recorded ]]; then
+    say "The database is empty after an earlier restore that did not finish, so there is nothing new to save."
+    say "The copy from before that restore is kept: $recorded"
   else
-    say "The current database could not be opened, so no copy of it was saved before the restore."
+    say "The current database is empty or not there, so there is nothing to save before the restore."
+  fi
+  if [[ -n $recorded ]]; then
+    undo=$recorded
+    undo_cmd="sudo freeframe restore --yes $undo"
   fi
 
   FF_STEP="removing the current database"
@@ -2724,19 +2815,19 @@ cmd_restore() {
     _restore_fail "" "The current database could not be removed, so it is unchanged, and FreeFrame has been started again." \
       "the reason is at the end of $FF_LOG. Then run: $FF_RERUN"
   fi
-  FF_STATE="The database has been removed and is not back yet. FreeFrame is stopped, so nothing can write to it. To try again, run: $FF_RERUN${undo:+. To go back to the data as it was just before this restore instead, run: $undo}"
+  FF_STATE="The database has been removed and is not back yet. FreeFrame is stopped, so nothing can write to it. To try again, run: $FF_RERUN${undo:+. To go back to the data as it was before this restore instead, run: $undo_cmd}"
   FF_STEP="creating the database again"
   if ! _ff_logged dc exec -T postgres createdb -U "$FF_PG_USER" -O "$FF_PG_USER" "$FF_PG_DB"; then
     install_fail "The database could not be created again." "the reason is at the end of $FF_LOG."
   fi
-  FF_STATE="The database is empty now and FreeFrame is stopped, so nothing can write to it. To try again, run: $FF_RERUN${undo:+. To go back to the data as it was just before this restore instead, run: $undo}"
+  FF_STATE="The database is empty now and FreeFrame is stopped, so nothing can write to it. To try again, run: $FF_RERUN${undo:+. To go back to the data as it was before this restore instead, run: $undo_cmd}"
   FF_STEP="putting the backup back"
   if ! _ff_logged dc exec -T postgres pg_restore -U "$FF_PG_USER" -d "$FF_PG_DB" --no-owner --no-acl --single-transaction <"$dump"; then
-    _restore_fail "The database is empty now: the backup goes back in one piece or not at all, so nothing from it was half applied. FreeFrame is stopped, so nothing can write to it. To try again, run: $FF_RERUN${undo:+. To go back to the data as it was just before this restore instead, run: $undo}" \
+    _restore_fail "The database is empty now: the backup goes back in one piece or not at all, so nothing from it was half applied. FreeFrame is stopped, so nothing can write to it. To try again, run: $FF_RERUN${undo:+. To go back to the data as it was before this restore instead, run: $undo_cmd}" \
       "The backup could not be put back into the database." "the reason is at the end of $FF_LOG."
   fi
 
-  FF_STATE="The backup has been put back${undo:+ (the database as it was before is saved; to go back to it, run: $undo)}."
+  FF_STATE="The backup has been put back${undo:+ (the database as it was before is saved; to go back to it, run: $undo_cmd)}."
   FF_STEP="starting FreeFrame again"
   say "Starting FreeFrame again..."
   if ! _ff_logged dc up -d --no-build; then
@@ -2748,9 +2839,10 @@ cmd_restore() {
       "see why with: sudo freeframe logs, then run: sudo freeframe restart"
   fi
   trap - ERR
+  _restore_undo_clear
   say ""
   say "The database is back as it was in $dump${when:+ (made $when)}."
-  if [[ -n $undo ]]; then say "The database as it was before is saved; to go back to it, run: $undo"; fi
+  if [[ -n $undo ]]; then say "The database as it was before is saved; to go back to it, run: $undo_cmd"; fi
   _install_log_stop
 }
 

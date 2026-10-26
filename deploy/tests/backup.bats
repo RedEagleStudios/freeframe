@@ -359,14 +359,140 @@ dumps() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null) || true; }
   assert_eq "$(cat "$STUB_DIR/restored")" "PGDMP old 20261014-030000"
 }
 
-@test "restore: a database that cannot be opened skips the safety copy and says so" {
+@test "restore: a database that is not there has nothing to save, and the restore goes ahead" {
   old_backup 20261020-030000
-  export STUB_DB_MISSING=1
+  export STUB_DB_STATE=absent
   ff restore --yes "$BK/freeframe-20261020-030000.dump"
   [ "$status" -eq 0 ] || { echo "$output"; false; }
   assert_not_called pg_dump
-  assert_out "no copy of it was saved"
+  assert_out "nothing to save"
   assert_order "dc exec -T postgres dropdb" "dc exec -T postgres pg_restore"
+  # The check goes through the maintenance database, with the name as a
+  # psql variable.
+  grep -q -- "-d postgres -v db=ffdb" "$CALLS"
+  grep -q "datname = :'db'" "$STUB_DIR/maint-sql"
+}
+
+@test "restore: an empty database (no tables) has nothing to save" {
+  old_backup 20261020-030000
+  export STUB_DB_STATE=empty
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_not_called pg_dump
+  assert_out "nothing to save"
+  [ ! -e "$FF_ROOT/.restore-undo" ]
+}
+
+@test "restore: a database that exists but cannot be opened is never dropped" {
+  old_backup 20261020-030000
+  export STUB_DB_OPEN_FAIL=1
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  assert_not_called pg_dump
+  assert_not_called dropdb
+  assert_out "could not be checked"
+  assert_out "before changing anything"
+  assert_order "dc stop " "dc up -d --no-build"
+}
+
+@test "restore: the maintenance check failing is never read as nothing to save" {
+  old_backup 20261020-030000
+  export STUB_MAINT_FAIL=1
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  assert_not_called dropdb
+  assert_out "could not be checked"
+}
+
+@test "restore: a retry after a failed restore keeps the first safety copy as the undo" {
+  old_backup 20261020-030000
+  export STUB_RESTORE_FAIL=1
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  local safety1
+  safety1=$(dumps | tail -1)
+  assert_eq "$(cat "$BK/$safety1")" "PGDMP current database v2"
+  assert_eq "$(cat "$FF_ROOT/.restore-undo")" "$BK/$safety1"
+  assert_eq "$(stat -c %a "$FF_ROOT/.restore-undo")" 600
+  # The retry fails too: no copy of the empty database is taken, and the
+  # undo still points at the first copy.
+  : >"$CALLS"
+  sleep 1
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  assert_not_called pg_dump
+  assert_out "nothing new to save"
+  assert_out "sudo freeframe restore --yes $BK/$safety1"
+  assert_eq "$(dumps | tail -1)" "$safety1"
+  assert_eq "$(cat "$FF_ROOT/.restore-undo")" "$BK/$safety1"
+  # The undo itself then works, puts the first copy back and clears the record.
+  unset STUB_RESTORE_FAIL
+  ff restore --yes "$BK/$safety1"
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(cat "$STUB_DIR/restored")" "PGDMP current database v2"
+  [ ! -e "$FF_ROOT/.restore-undo" ]
+}
+
+@test "restore: a retry over a database with data copies it too, but the undo stays the first copy" {
+  old_backup 20261020-030000
+  export STUB_API_DOWN=1 FF_API_WAIT=10
+  # Attempt 1 puts the backup back but FreeFrame does not come up: not done.
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  local safety1
+  safety1=$(dumps | tail -1)
+  [ -e "$FF_ROOT/.restore-undo" ]
+  unset STUB_API_DOWN
+  sleep 1
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -q 'pg_dump' "$CALLS"
+  assert_out "is kept too: $BK/$safety1"
+  assert_out "to go back to it, run: sudo freeframe restore --yes $BK/$safety1"
+  [ ! -e "$FF_ROOT/.restore-undo" ]
+}
+
+@test "restore: a recorded copy that was deleted is said, and the record dropped" {
+  old_backup 20261020-030000
+  printf '%s\n' "$BK/freeframe-20261001-000000.dump" >"$FF_ROOT/.restore-undo"
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "no longer there"
+  grep -q pg_dump "$CALLS"
+}
+
+@test "backup: the recorded undo copy is never pruned and not used for the size rule" {
+  local s
+  old_backup 20261001-030000 "the copy to undo with"
+  printf '%s\n' "$BK/freeframe-20261001-030000.dump" >"$FF_ROOT/.restore-undo"
+  for s in 02 03 04 05 06 07 08 09; do old_backup "202610$s-030000"; done
+  # The recorded copy is huge, the others are small: it must not count.
+  export STUB_BIG_LAST=$((900 * 1048576)) STUB_BIG_LAST_FILE="$BK/freeframe-20261001-030000.dump"
+  export STUB_FREE_MB=1100
+  ff backup
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  [ -e "$BK/freeframe-20261001-030000.dump" ]
+  [ -e "$BK/freeframe-20261001-030000.env.prod" ]
+  # 7 normal ones are kept besides it.
+  assert_eq "$(dumps | wc -l | tr -d ' ')" 8
+  [ ! -e "$BK/freeframe-20261003-030000.dump" ]
+  [ -e "$BK/freeframe-20261004-030000.dump" ]
+}
+
+@test "backup_prune leaves a protected dump alone and does not count it" {
+  local s
+  for s in 01 02 03 04; do old_backup "202610$s-030000"; done
+  backup_prune "$BK" 2 "$BK/freeframe-20261001-030000.dump"
+  assert_eq "$(dumps | tr '\n' ' ')" "freeframe-20261001-030000.dump freeframe-20261003-030000.dump freeframe-20261004-030000.dump "
+}
+
+@test "restore without FILE mentions an unfinished restore's undo copy" {
+  old_backup 20261020-030000
+  printf '%s\n' "$BK/freeframe-20261020-030000.dump" >"$FF_ROOT/.restore-undo"
+  ff restore
+  [ "$status" -eq 0 ]
+  assert_out "A restore did not finish"
+  assert_out "sudo freeframe restore --yes $BK/freeframe-20261020-030000.dump"
 }
 
 @test "restore: a failed safety copy changes nothing and starts FreeFrame again" {
@@ -439,6 +565,7 @@ dumps() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null) || true; }
   safety=$(dumps | tail -1)
   assert_out "sudo freeframe restore --yes $BK/$safety"
   assert_out "install.log"
+  assert_eq "$(cat "$FF_ROOT/.restore-undo")" "$BK/$safety"
 }
 
 @test "restore: FreeFrame not answering afterwards says the backup is back but the app is not" {
