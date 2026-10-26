@@ -347,3 +347,11 @@ derive_with_secret() {
   [[ "$output" == *"derive failed"* ]]
   assert_no_key "$F" DATABASE_URL
 }
+
+@test "derive_env keeps an export-prefixed JWT_SECRET from a copied file and adds no second one" {
+  printf 'export JWT_SECRET=x\n' > "$F"
+  run derive FF_HTTPS=off FF_IP=192.168.1.20
+  [ "$status" -eq 0 ]
+  assert_eq "$(grep -c 'JWT_SECRET' "$F")" "1"
+  assert_has "$F" "export JWT_SECRET=x"
+}

@@ -94,15 +94,22 @@ _env_encode() {
   printf '"%s"' "$v"
 }
 
-# env_get FILE KEY: print the value of KEY (empty when absent). The last
-# KEY= line wins, as in compose.
+# _env_key_re KEY: the pattern for a line that sets KEY. Like compose, a line
+# may be indented and may start with "export " (measured: compose reads
+# "export A=x" and "   B=y" as A and B).
+_env_key_re() { printf '^[[:space:]]*(export[[:space:]]+)?%s=' "$1"; }
+
+# env_get FILE KEY: print the value of KEY (empty when absent). The last line
+# setting KEY wins, as in compose.
 env_get() {
-  local file=$1 key=$2 line raw="" found=0
+  local file=$1 key=$2 line re raw="" found=0
   [[ -f $file ]] || return 0
+  _env_key_ok "$key" || return 0
+  re=$(_env_key_re "$key")
   while IFS= read -r line || [[ -n $line ]]; do
     line=${line%$'\r'}
-    if [[ $line == "$key="* ]]; then
-      raw=${line#"$key="}
+    if [[ $line =~ $re ]]; then
+      raw=${line:${#BASH_REMATCH[0]}}
       found=1
     fi
   done <"$file"
@@ -112,7 +119,7 @@ env_get() {
 
 # _env_write FILE KEY VALUE missing|always
 _env_write() {
-  local file=$1 key=$2 value=$3 mode=$4 enc line tmp idx=-1 i=0
+  local file=$1 key=$2 value=$3 mode=$4 enc line re prefix="" tmp idx=-1 i=0
   local -a lines=()
   if ! _env_key_ok "$key"; then
     warn "Cannot save the setting '$key': that is not a valid setting name."
@@ -141,9 +148,13 @@ _env_write() {
     warn "Cannot make $file private (chmod 600 failed)."
     return 1
   fi
+  re=$(_env_key_re "$key")
   while IFS= read -r line || [[ -n $line ]]; do
     lines+=("$line")
-    [[ ${line%$'\r'} == "$key="* ]] && idx=$i
+    if [[ ${line%$'\r'} =~ $re ]]; then
+      idx=$i
+      prefix=${BASH_REMATCH[0]}
+    fi
     i=$((i + 1))
   done <"$file"
   if ((idx < 0)); then
@@ -154,7 +165,8 @@ _env_write() {
     printf '%s=%s\n' "$key" "$enc" >>"$file"
     return 0
   fi
-  lines[idx]="$key=$enc"
+  # Keep the line's own indentation and "export " prefix.
+  lines[idx]="$prefix$enc"
   # Write a copy beside the file (same mode and owner via cp -p), then rename
   # it over the original, so a crash never leaves a half-written file.
   tmp=$(mktemp "$file.tmp.XXXXXX") || return 1

@@ -40,6 +40,41 @@ X
   assert_eq "$(env_get "$F" DUP)" "last"
 }
 
+@test "env_get reads export-prefixed and indented lines, as compose does" {
+  printf 'export JWT_SECRET=x\n   DOMAIN=review.example.com\n\texport  A=1\n' > "$F"
+  assert_eq "$(env_get "$F" JWT_SECRET)" "x"
+  assert_eq "$(env_get "$F" DOMAIN)" "review.example.com"
+  assert_eq "$(env_get "$F" A)" "1"
+  assert_eq "$(env_get "$F" EXPORT)" ""
+}
+
+@test "a copied file using export JWT_SECRET=x keeps x and never gets a second line" {
+  printf 'export JWT_SECRET=x\n' > "$F"
+  env_set_if_missing "$F" JWT_SECRET newvalue
+  assert_eq "$(cat "$F")" "export JWT_SECRET=x"
+}
+
+@test "an indented empty key is filled in place, keeping its indentation" {
+  printf 'A=1\n  export REDIS_PASSWORD=\nC=3\n' > "$F"
+  env_set_if_missing "$F" REDIS_PASSWORD abc
+  assert_eq "$(cat "$F")" "$(printf 'A=1\n  export REDIS_PASSWORD=abc\nC=3')"
+}
+
+@test "env_set replaces an export-prefixed line in place" {
+  printf 'export A=1\nB=2\n' > "$F"
+  env_set "$F" A 9
+  assert_eq "$(cat "$F")" "$(printf 'export A=9\nB=2')"
+}
+
+@test "a key that only shares a prefix is a different key" {
+  printf 'JWT_SECRET_OLD=x\nMYJWT_SECRET=y\n' > "$F"
+  assert_eq "$(env_get "$F" JWT_SECRET)" ""
+  env_set_if_missing "$F" JWT_SECRET z
+  assert_has "$F" "JWT_SECRET=z"
+  assert_has "$F" "JWT_SECRET_OLD=x"
+  assert_has "$F" "MYJWT_SECRET=y"
+}
+
 @test "env_set_if_missing writes a missing key" {
   printf 'A=1\n' > "$F"
   run env_set_if_missing "$F" B two
