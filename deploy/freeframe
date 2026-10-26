@@ -430,19 +430,25 @@ _ff_has_tty() {
   { true <"$t"; } 2>/dev/null
 }
 
+# _ff_tty_open: open the terminal (${FF_TTY:-/dev/tty}) once, on the fd in
+# _FF_TTY_FD, and keep it open, so successive reads get successive lines.
+_ff_tty_open() {
+  local tty
+  tty=$(_ff_tty_path)
+  [[ ${_FF_TTY_OPEN:-} == "$tty" ]] && return 0
+  _ff_has_tty || return 1
+  { exec {_FF_TTY_FD}<"$tty"; } 2>/dev/null || return 1
+  _FF_TTY_OPEN=$tty
+}
+
 # ask VAR QUESTION DEFAULT: print QUESTION, read one line from the terminal
 # (${FF_TTY:-/dev/tty}), trim spaces, and store it in VAR, or DEFAULT when the
 # line is empty. Fails when there is no terminal or the input has ended.
 # The terminal is opened once and kept open, so successive calls read
 # successive lines.
 ask() {
-  local var=$1 question=$2 default=${3:-} tty line=""
-  tty=$(_ff_tty_path)
-  if [[ ${_FF_TTY_OPEN:-} != "$tty" ]]; then
-    _ff_has_tty || return 1
-    { exec {_FF_TTY_FD}<"$tty"; } 2>/dev/null || return 1
-    _FF_TTY_OPEN=$tty
-  fi
+  local var=$1 question=$2 default=${3:-} line=""
+  _ff_tty_open || return 1
   if [[ -n $default ]]; then
     printf '%s [%s]: ' "$question" "$default" >&2
   else
@@ -457,6 +463,30 @@ ask() {
   line=${line%"${line##*[![:space:]]}"}
   [[ -n $line ]] || line=$default
   printf -v "$var" '%s' "$line"
+}
+
+# ask_secret VAR QUESTION: like ask, but what is typed is not shown and not
+# trimmed (spaces in a password are kept). Fails when the input has ended.
+ask_secret() {
+  local var=$1 question=$2 line=""
+  _ff_tty_open || return 1
+  printf '%s: ' "$question" >&2
+  if ! IFS= read -r -s -u "$_FF_TTY_FD" line && [[ -z $line ]]; then
+    printf '\n' >&2
+    return 1
+  fi
+  printf '\n' >&2
+  printf -v "$var" '%s' "${line%$'\r'}"
+}
+
+# confirm QUESTION Y|N: ask a yes/no question; Enter means the default.
+# 0 for yes. The input ending counts as no.
+confirm() {
+  local question=$1 default=${2:-N} answer="" hint="[y/N]"
+  [[ $default == Y ]] && hint="[Y/n]"
+  ask answer "$question $hint" "" || return 1
+  answer=${answer:-$default}
+  [[ ${answer,,} == y || ${answer,,} == yes ]]
 }
 
 # require_answer VAR ENVNAME QUESTION: make sure VAR has a value. Asks on the
@@ -789,6 +819,1311 @@ backup_prune() {
 }
 
 # ------------------------------------------------------------
+# Install: wrappers for everything that changes the server or reaches the
+# network. Each one is a small function so the tests can replace it
+# (deploy/tests/install_stubs.bash); nothing else in the install flow runs a
+# side effect directly.
+#
+# Test-only switches, used by deploy/tests and the installer CI and never
+# needed on a real server:
+#   FF_SKIP_PULL=1         skip `docker compose pull` (the images are local)
+#   FF_FETCH_FROM_DIR=DIR  copy the compose files from DIR instead of
+#                          downloading them
+#   FF_OS_RELEASE=FILE     read FILE instead of /etc/os-release
+# Waits, in seconds (also for unusually slow servers): FF_API_WAIT (600),
+# FF_HEALTH_WAIT (300), FF_CERT_WAIT (300 per name), FF_DNS_WAIT (1800,
+# unattended runs only; with a terminal the installer waits until told).
+# ------------------------------------------------------------
+
+FF_RAW_BASE=https://raw.githubusercontent.com/Techiebutler/freeframe
+FF_GUIDE_URL=https://github.com/Techiebutler/freeframe/blob/main/docs/deployment.md
+
+ff_is_root() { [[ $(id -u) == 0 ]]; }
+machine_arch() { uname -m; }
+ff_sleep() { sleep "$1"; }
+
+# run_apt ARGS...: apt-get without questions, waiting for the apt lock that
+# a fresh server's automatic updates often hold for the first minutes.
+run_apt() {
+  DEBIAN_FRONTEND=noninteractive apt-get -y -q -o DPkg::Lock::Timeout=300 \
+    -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@"
+}
+
+# public_ip: this server's address as the internet sees it.
+public_ip() {
+  local url ip
+  for url in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+    ip=$(curl -fsS4 --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]') || continue
+    if [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      printf '%s\n' "$ip"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# local_ip: the address of the network interface that reaches the internet.
+local_ip() {
+  local ip=""
+  ip=$(ip -4 route get 1.1.1.1 2>/dev/null |
+    awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }') || ip=""
+  [[ -n $ip ]] || ip=$(hostname -I 2>/dev/null | awk '{ print $1 }') || ip=""
+  [[ -n $ip ]] || return 1
+  printf '%s\n' "$ip"
+}
+
+# net_reachable URL: 0 when an HTTPS connection to URL works (any HTTP status).
+net_reachable() { curl -sS -o /dev/null --max-time 15 "$1" >/dev/null 2>&1; }
+
+# _ff_free_mb PATH: free space in MB on the filesystem holding PATH (or its
+# nearest existing parent, for /var/lib/docker before Docker is installed).
+_ff_free_mb() {
+  local p=$1
+  while [[ ! -e $p && $p != / ]]; do p=$(dirname "$p"); done
+  df -Pk "$p" 2>/dev/null | awk 'NR == 2 { print int($4 / 1024) }'
+}
+
+# port_holder PORT: "NAME PID" of the program listening on TCP PORT, or
+# nothing when the port is free (from ss -ltnp).
+port_holder() {
+  local port=$1 line re='users:\(\("([^"]+)",pid=([0-9]+)'
+  line=$(ss -Hltnp 2>/dev/null | awk -v p=":$port" \
+    '{ a = $4; if (length(a) > length(p) && substr(a, length(a) - length(p) + 1) == p) { print; exit } }') || line=""
+  [[ -n $line ]] || return 0
+  if [[ $line =~ $re ]]; then
+    printf '%s %s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+  else
+    printf 'unknown 0\n'
+  fi
+}
+
+_ff_unit_of_pid() { ps -o unit= -p "$1" 2>/dev/null | tr -d '[:space:]'; }
+
+swap_present() { [[ -n $(swapon --show --noheadings 2>/dev/null) ]]; }
+
+# add_swap: a 2 GB /swapfile, the usual way; removed again if any step fails.
+add_swap() {
+  local f=/swapfile
+  [[ ! -e $f ]] || return 1
+  if install -o root -g root -m 0600 /dev/null "$f" &&
+    { fallocate -l 2G "$f" 2>/dev/null || dd if=/dev/zero of="$f" bs=1M count=2048 status=none; } &&
+    mkswap "$f" && swapon "$f"; then
+    grep -qs "^$f " /etc/fstab || printf '%s none swap sw 0 0\n' "$f" >>/etc/fstab
+    sysctl -q -w vm.swappiness=10 || true
+    printf 'vm.swappiness = 10\n' >/etc/sysctl.d/30-freeframe-swap.conf
+    return 0
+  fi
+  swapoff "$f" 2>/dev/null || true
+  rm -f "$f"
+  return 1
+}
+
+ufw_active() { command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; }
+
+# docker_status: one word for the Docker on this server: none, snap,
+# "old VERSION", nocompose, down (installed but not answering) or ok
+# (Docker 24 or newer with the compose plugin).
+docker_status() {
+  local path ver major
+  if ! path=$(command -v docker 2>/dev/null); then
+    printf 'none\n'
+    return 0
+  fi
+  if [[ $path == /snap/* ]] || { command -v snap >/dev/null 2>&1 && snap list docker >/dev/null 2>&1; }; then
+    printf 'snap\n'
+    return 0
+  fi
+  if ! ver=$(docker version --format '{{.Server.Version}}' 2>/dev/null) || [[ -z $ver ]]; then
+    printf 'down\n'
+    return 0
+  fi
+  major=${ver%%.*}
+  if [[ ! $major =~ ^[0-9]+$ ]] || ((10#$major < 24)); then
+    printf 'old %s\n' "$ver"
+    return 0
+  fi
+  if ! docker compose version >/dev/null 2>&1; then
+    printf 'nocompose\n'
+    return 0
+  fi
+  printf 'ok\n'
+}
+
+# _ff_os_field KEY: a value from /etc/os-release (or FF_OS_RELEASE).
+_ff_os_field() {
+  local key=$1 file=${FF_OS_RELEASE:-/etc/os-release}
+  [[ -r $file ]] || return 0
+  (
+    # shellcheck disable=SC1090
+    . "$file" >/dev/null 2>&1 || true
+    printf '%s' "${!key:-}"
+  )
+}
+
+# install_docker: Docker Engine and the compose plugin from Docker's own apt
+# repository, following Docker's documented steps for Ubuntu and Debian (not
+# the get.docker.com script, which Docker says is not for production).
+install_docker() {
+  local id codename arch
+  id=$(_ff_os_field ID)
+  codename=$(_ff_os_field UBUNTU_CODENAME)
+  [[ -n $codename ]] || codename=$(_ff_os_field VERSION_CODENAME)
+  run_apt update || return 1
+  run_apt install ca-certificates curl || return 1
+  install -m 0755 -d /etc/apt/keyrings || return 1
+  curl -fsSL "https://download.docker.com/linux/$id/gpg" -o /etc/apt/keyrings/docker.asc || return 1
+  chmod a+r /etc/apt/keyrings/docker.asc || return 1
+  arch=$(dpkg --print-architecture) || return 1
+  cat >/etc/apt/sources.list.d/docker.sources <<EOF || return 1
+Types: deb
+URIs: https://download.docker.com/linux/$id
+Suites: $codename
+Components: stable
+Architectures: $arch
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+  run_apt update || return 1
+  run_apt install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || return 1
+  systemctl enable --now docker
+}
+
+# fetch REF PATH DEST: download PATH from the repository at REF (a branch or
+# tag) to DEST. The old DEST stays in place unless the download completes.
+# With FF_FETCH_FROM_DIR (test-only) PATH is copied from that folder instead.
+fetch() {
+  local ref=$1 path=$2 dest=$3 tmp
+  tmp=$(mktemp "$dest.tmp.XXXXXX") || return 1
+  if [[ -n ${FF_FETCH_FROM_DIR:-} ]]; then
+    cp "$FF_FETCH_FROM_DIR/$path" "$tmp"
+  else
+    curl -fsSL --retry 3 --max-time 60 "$FF_RAW_BASE/$ref/$path" -o "$tmp"
+  fi || {
+    rm -f "$tmp"
+    return 1
+  }
+  chmod 644 "$tmp" && mv -f "$tmp" "$dest"
+}
+
+# probe_health MODE HOST: 0 when FreeFrame's API answers through Traefik on
+# this server. HTTPS is checked with HOST sent to 127.0.0.1, so it works
+# before outside DNS or hairpin routing does, and with -k because the
+# certificate is checked separately (cert_issued).
+probe_health() {
+  local mode=$1 host=$2
+  # Retries are expected while it starts: curl's complaints go to the log.
+  if [[ $mode == off ]]; then
+    curl -fsS --max-time 10 -o /dev/null http://127.0.0.1/api/health 2>>"${FF_LOG:-/dev/null}"
+  else
+    curl -fsSk --max-time 10 -o /dev/null --resolve "$host:443:127.0.0.1" "https://$host/api/health" \
+      2>>"${FF_LOG:-/dev/null}"
+  fi
+}
+
+# cert_issued HOST: 0 when Traefik serves a real certificate for HOST, not
+# its self-signed TRAEFIK DEFAULT CERT.
+cert_issued() {
+  local host=$1 issuer
+  issuer=$({ timeout 20 openssl s_client -connect 127.0.0.1:443 -servername "$host" </dev/null 2>/dev/null || true; } |
+    openssl x509 -noout -issuer 2>/dev/null) || return 1
+  [[ -n $issuer && $issuer != *"TRAEFIK DEFAULT CERT"* ]]
+}
+
+# ------------------------------------------------------------
+# Install: messages and small helpers
+# ------------------------------------------------------------
+
+say() { printf '%s\n' "$*"; }
+
+# _ff_logged CMD...: run CMD with its output going to install.log only.
+_ff_logged() { "$@" >>"${FF_LOG:-/dev/null}" 2>&1; }
+
+# _ff_stop CODE MESSAGE [WHAT_TO_TRY]: print the message and exit with CODE.
+_ff_stop() {
+  warn ""
+  warn "$2"
+  if [[ -n ${3:-} ]]; then warn "What to try: $3"; fi
+  exit "$1"
+}
+
+# install_fail MESSAGE WHAT_TO_TRY: a step failed. Says what state the
+# server is in and where the log is, then exits 1.
+install_fail() {
+  warn ""
+  warn "$1"
+  if [[ -n ${2:-} ]]; then warn "What to try: $2"; fi
+  if [[ -n ${FF_STATE:-} ]]; then warn "$FF_STATE"; fi
+  if [[ -n ${FF_LOG:-} ]]; then warn "Everything the installer did is written to $FF_LOG."; fi
+  exit 1
+}
+
+# _ff_answer_error MESSAGE WHAT_TO_TRY: an answer given ahead of time is not
+# usable (exit 2, like any other usage error).
+_ff_answer_error() { _ff_stop 2 "$1" "$2"; }
+
+_ff_input_ended() {
+  _ff_stop 2 "The answers ended before every question was answered, so nothing was installed." \
+    "run the installer in a terminal, or give every answer ahead of time with --yes (see: freeframe help)."
+}
+
+# _install_on_error: the ERR trap. A command failed that the installer did
+# not expect to fail; say so in plain words instead of stopping silently.
+_install_on_error() {
+  local code=$?
+  if ((BASH_SUBSHELL > 0)); then exit "$code"; fi
+  trap - ERR
+  install_fail "The installer stopped unexpectedly while ${FF_STEP:-checking the server} (error $code)." \
+    "look at the end of ${FF_LOG:-the output above} for the reason, then run sudo freeframe install again."
+}
+
+_ff_interactive() { [[ -z ${FF_YES:-} ]] && _ff_has_tty; }
+
+_ff_is_ipv4() { [[ ${1:-} =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; }
+
+valid_email() {
+  local re='^[^@[:space:]]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$'
+  [[ ${1:-} =~ $re ]]
+}
+
+# _ff_password_ok PW: 8 to 72 bytes, what the API accepts.
+_ff_password_ok() {
+  local LC_ALL=C
+  ((${#1} >= 8 && ${#1} <= 72))
+}
+
+# _ff_clean_host TEXT: forgive a pasted https:// or a trailing slash.
+_ff_clean_host() {
+  local h=${1,,}
+  h=${h#"${h%%[![:space:]]*}"}
+  h=${h%"${h##*[![:space:]]}"}
+  h=${h#http://}
+  h=${h#https://}
+  h=${h%/}
+  printf '%s' "$h"
+}
+
+# _ff_json_str TEXT: TEXT as a JSON string.
+_ff_json_str() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\t'/\\t}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\n'/\\n}
+  printf '"%s"' "$s"
+}
+
+# _ff_api_detail BODY: the human part of a FastAPI error response.
+_ff_api_detail() {
+  local body=$1 re_msg='"msg":"([^"]*)"' re_detail='"detail":"([^"]*)"'
+  if [[ $body =~ $re_msg ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+  elif [[ $body =~ $re_detail ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+  fi
+}
+
+# _ff_wait_for MAX STEP CMD...: run CMD every STEP seconds until it works,
+# for at most MAX seconds. 1 when it never worked.
+_ff_wait_for() {
+  local max=$1 step=$2 waited=0
+  shift 2
+  until "$@"; do
+    ((waited < max)) || return 1
+    ff_sleep "$step"
+    waited=$((waited + step))
+  done
+}
+
+_ff_scheme() { if [[ $1 == off ]]; then printf 'http'; else printf 'https'; fi; }
+
+# _ff_dns_label NAME: what most registrars want in the "name" box:
+# review.yourstudio.com becomes review, the bare domain becomes @.
+_ff_dns_label() {
+  local name=$1 rest
+  rest=${name#*.}
+  if [[ $rest == *.* ]]; then
+    printf '%s' "${name%.*.*}"
+  else
+    printf '@'
+  fi
+}
+
+# switch_to_http_mode FILE ADDRESS: move an HTTPS install to plain HTTP on
+# ADDRESS (usually the server's IP). Backs up FILE first, then changes only
+# the keys tied to the web address (FREEFRAME_HTTPS, FRONTEND_URL, DOMAIN and,
+# with bundled storage, S3_PUBLIC_ENDPOINT, STORAGE_DOMAIN, STORAGE_ROUTED,
+# STORAGE_PORT_BIND), and restarts FreeFrame so every service picks them up.
+# Secrets and every other answer stay as they are. Used by install when the
+# automatic address cannot get a certificate, and by configure.
+switch_to_http_mode() {
+  local file=$1 address=$2 backup
+  if ! valid_hostname "$address"; then
+    warn "Cannot switch to plain HTTP: '$address' is not a usable address."
+    return 1
+  fi
+  backup=$(env_backup "$file") || return 1
+  env_set "$file" FREEFRAME_HTTPS off || return 1
+  env_set "$file" FRONTEND_URL "http://$address" || return 1
+  env_set "$file" DOMAIN "" || return 1
+  if [[ $(env_get "$file" FREEFRAME_STORAGE) == bundled ]]; then
+    env_set "$file" S3_PUBLIC_ENDPOINT "http://$address:9000" || return 1
+    env_set "$file" STORAGE_DOMAIN "" || return 1
+    env_set "$file" STORAGE_ROUTED false || return 1
+    env_set "$file" STORAGE_PORT_BIND 0.0.0.0:9000 || return 1
+  fi
+  say "FreeFrame now uses plain HTTP at http://$address. The previous settings are saved in $backup."
+  if ! _ff_logged dc up -d --no-build --force-recreate; then
+    warn "FreeFrame could not be restarted with the new settings."
+    return 1
+  fi
+}
+
+# ------------------------------------------------------------
+# Install: the steps, in the order cmd_install runs them
+# ------------------------------------------------------------
+
+_install_check_system() {
+  local id ver pretty arch
+  if ! ff_is_root; then
+    _ff_stop 2 "Please run the installer as root." \
+      "put sudo in front of the command: sudo freeframe install (in the one-line install command: ... | sudo bash)."
+  fi
+  id=$(_ff_os_field ID)
+  ver=$(_ff_os_field VERSION_ID)
+  pretty=$(_ff_os_field PRETTY_NAME)
+  if ! os_supported "$id" "$ver"; then
+    _ff_stop 3 "This server runs ${pretty:-an unknown system} (${id:-unknown} ${ver:-}), which is not supported yet, so nothing was changed." \
+      "use a server with Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13. To set FreeFrame up by hand on another system, follow the guide: $FF_GUIDE_URL"
+  fi
+  arch=$(machine_arch)
+  case $arch in
+    x86_64 | amd64 | aarch64 | arm64) ;;
+    *)
+      _ff_stop 3 "This server's processor type ($arch) is not supported yet, so nothing was changed. FreeFrame runs on amd64 (x86_64) and arm64 servers." \
+        "choose a server with an amd64 or arm64 processor."
+      ;;
+  esac
+}
+
+_install_check_foreign() {
+  local rc=0
+  detect_foreign_install || rc=$?
+  case $rc in
+    0)
+      _ff_stop 3 "This server already runs FreeFrame that was set up by hand, not with this installer. The installer will not touch it, so nothing was changed." \
+        "keep updating that FreeFrame with the manual steps in the guide: $FF_GUIDE_URL"
+      ;;
+    1) ;;
+    *) _ff_stop 1 "The installer could not check this server for an existing FreeFrame, so it stopped before changing anything." ;;
+  esac
+}
+
+_install_log_start() {
+  local root
+  root=$(ff_root)
+  if ! { mkdir -p "$root" && chmod 755 "$root" && (umask 077 && : >>"$root/install.log") &&
+    chmod 600 "$root/install.log"; }; then
+    _ff_stop 1 "Cannot create $root for FreeFrame's files." "check that the disk is not full or read-only, then run the installer again."
+  fi
+  FF_LOG="$root/install.log"
+  printf '\n===== freeframe install, %s =====\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" >>"$FF_LOG"
+  # Everything printed from here on goes to the terminal and to install.log.
+  # The terminal's own fds are kept, for the one line the log must not hold.
+  exec {FF_TERM_OUT}>&1 {FF_TERM_ERR}>&2
+  exec > >(tee -a "$FF_LOG") 2>&1
+  FF_TEE_PID=$!
+}
+
+# _install_log_stop: back to the plain terminal, once tee has written
+# everything, so what follows comes after it on the screen.
+_install_log_stop() {
+  [[ -n ${FF_TERM_OUT:-} ]] || return 0
+  exec 1>&"$FF_TERM_OUT" 2>&"$FF_TERM_ERR"
+  wait "$FF_TEE_PID" 2>/dev/null || true
+}
+
+# install_find_ip: FF_IP, the address the web address and DNS records use.
+# A public interface address wins; on a cloud server behind 1:1 NAT the
+# address the internet sees; otherwise (an office server) the local one.
+install_find_ip() {
+  local pub=""
+  FF_LOCAL_IP=$(local_ip) || FF_LOCAL_IP=""
+  if is_public_ipv4 "$FF_LOCAL_IP"; then
+    FF_IP=$FF_LOCAL_IP
+    return 0
+  fi
+  pub=$(public_ip) || pub=""
+  if is_public_ipv4 "$pub"; then
+    FF_IP=$pub
+  else
+    FF_IP=$FF_LOCAL_IP
+  fi
+  if [[ -z $FF_IP ]]; then
+    install_fail "Could not find this server's IP address." "check the server's network connection, then run the installer again."
+  fi
+}
+
+# _install_check_port PORT SERVICE NEED: make sure PORT is free (or held by
+# this install's own SERVICE from an earlier attempt). Offers to stop the
+# program holding it when there is a terminal.
+_install_check_port() {
+  local port=$1 service=$2 need=$3 holder name pid unit=""
+  holder=$(port_holder "$port")
+  [[ -n $holder ]] || return 0
+  name=${holder% *}
+  pid=${holder##* }
+  [[ $name != unknown ]] || name="another program"
+  if [[ $name == docker-proxy ]]; then
+    if [[ -f "$(ff_root)/.env.prod" && -n $(dc ps -q "$service" 2>/dev/null) ]]; then
+      return 0
+    fi
+    install_fail "Port $port is used by another program running in Docker. $need" \
+      "stop that program (sudo docker ps lists what runs in Docker), then run the installer again."
+  fi
+  unit=$(_ff_unit_of_pid "$pid") || unit=""
+  if [[ $unit == *.service ]] && _ff_interactive; then
+    say "Port $port is used by $name ($unit). $need"
+    if confirm "Stop $name now and keep it from starting again?" N; then
+      if ! _ff_logged systemctl disable --now "$unit"; then
+        install_fail "Could not stop $name." "stop it yourself (sudo systemctl disable --now $unit), then run the installer again."
+      fi
+      if [[ -n $(port_holder "$port") ]]; then
+        install_fail "Port $port is still in use after stopping $name." "find what holds it with: sudo ss -ltnp, stop it, then run the installer again."
+      fi
+      say "Stopped $name."
+      return 0
+    fi
+  fi
+  if [[ $unit == *.service ]]; then
+    install_fail "Port $port is used by $name. $need" "stop $name (sudo systemctl disable --now $unit), then run the installer again."
+  fi
+  install_fail "Port $port is used by $name. $need" "stop $name, then run the installer again."
+}
+
+install_preflight() {
+  local cores ram free path last=
+  FF_STEP="checking the server"
+  say "Checking this server..."
+  cores=${FF_CORES:-$(_ff_cores)}
+  ram=${FF_RAM_MB:-$(_ff_ram_mb)}
+  if ((ram < 1800)); then
+    _ff_stop 3 "This server has $ram MB of memory. FreeFrame needs at least 2 GB (4 GB is recommended), so nothing was changed." \
+      "choose a server with 4 GB of memory or more."
+  elif ((ram < 3600)); then
+    warn "This server has about $(((ram + 512) / 1024)) GB of memory. FreeFrame runs, but 4 GB or more is recommended: large videos will be slow to prepare."
+  fi
+  if ((cores < 2)); then
+    warn "This server has 1 processor core. FreeFrame runs, but 2 or more are recommended."
+  fi
+  for path in /opt /var/lib/docker; do
+    free=$(_ff_free_mb "$path") || free=""
+    # Usually one filesystem holds both: warn once.
+    [[ $free != "$last" ]] || continue
+    last=$free
+    if [[ $free =~ ^[0-9]+$ ]] && ((free < 20480)); then
+      warn "There is only about $((free / 1024)) GB of free disk space for $path. 20 GB or more is recommended, and much more when footage is kept on this server."
+    fi
+  done
+
+  FF_DOCKER=$(docker_status)
+  case $FF_DOCKER in
+    ok | none) ;;
+    snap)
+      _ff_stop 3 "Docker on this server was installed with snap, which FreeFrame cannot use, so nothing was changed." \
+        "if nothing else on this server uses Docker, remove it with: sudo snap remove --purge docker. Then run the installer again: it installs Docker from Docker's own repository."
+      ;;
+    old*)
+      _ff_stop 3 "This server has Docker ${FF_DOCKER#old }, but FreeFrame needs Docker 24 or newer, so nothing was changed." \
+        "update Docker (https://docs.docker.com/engine/install/), or if nothing else on this server uses it, remove it and run the installer again: it then installs a current Docker itself."
+      ;;
+    nocompose)
+      _ff_stop 3 "Docker is installed without its compose plugin, which FreeFrame needs, so nothing was changed." \
+        "install the plugin (sudo apt-get install docker-compose-plugin, or docker-compose-v2 for Ubuntu's own Docker), then run the installer again."
+      ;;
+    *)
+      install_fail "Docker is installed but does not answer." "run: sudo systemctl start docker, then run the installer again."
+      ;;
+  esac
+
+  _install_check_port 80 traefik "FreeFrame needs ports 80 and 443 for its web address."
+  _install_check_port 443 traefik "FreeFrame needs ports 80 and 443 for its web address."
+
+  if ! net_reachable https://ghcr.io/v2/; then
+    install_fail "This server cannot reach ghcr.io, where FreeFrame is downloaded from." \
+      "check the server's internet connection, and that the provider's firewall allows outgoing HTTPS (port 443), then run the installer again."
+  fi
+  if [[ $FF_DOCKER == none ]] && ! net_reachable "https://download.docker.com/linux/"; then
+    install_fail "This server cannot reach download.docker.com, where Docker is downloaded from." \
+      "check the server's internet connection, and that the provider's firewall allows outgoing HTTPS (port 443), then run the installer again."
+  fi
+  install_find_ip
+}
+
+# --- Questions (spec goal 3). Each one is skipped when the answer was given
+# ahead of time or is already in the settings file (settings copied from
+# another server, or an earlier attempt).
+
+_install_ask_channel() {
+  local file=$1 ref
+  ref=$(env_get "$file" FREEFRAME_CHANNEL)
+  ref=${ref:-${FF_CHANNEL:-stable}}
+  if [[ ! $ref =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ || $ref == *..* ]]; then
+    _ff_answer_error "The channel '$ref' is not a branch or tag name such as stable or latest." "use --channel stable or --channel latest."
+  fi
+  FF_CHANNEL=$ref
+}
+
+_install_prompt_address() {
+  local answer=""
+  say ""
+  say "1. Web address"
+  say "   The address your team will type in the browser, for example review.yourstudio.com."
+  if is_public_ipv4 "$FF_IP"; then
+    say "   No domain yet? Press Enter for a free temporary address with HTTPS,"
+    say "   $(sslip_host "$FF_IP"). It is fine for trying FreeFrame; use your own domain for production."
+    if [[ -n ${FF_LOCAL_IP:-} && $FF_LOCAL_IP != "$FF_IP" ]]; then
+      say "   Only used inside your office? Type this server's local address, $FF_LOCAL_IP, for plain HTTP."
+    fi
+  else
+    say "   No domain? Press Enter to use this server's address, http://$FF_IP"
+    say "   (plain HTTP, for use inside your office network)."
+  fi
+  while :; do
+    ask answer "   Web address" "" || _ff_input_ended
+    answer=$(_ff_clean_host "$answer")
+    [[ -n $answer ]] || return 0
+    if valid_hostname "$answer"; then
+      FF_DOMAIN=$answer
+      return 0
+    fi
+    say "   '$answer' is not a plain name like review.yourstudio.com. Type only the name, without a port, a path or spaces."
+  done
+}
+
+_install_ask_address() {
+  local file=$1 url mode
+  url=$(env_get "$file" FRONTEND_URL)
+  if [[ -n $url ]]; then
+    FF_ADDR_FROM_FILE=1
+    mode=$(env_get "$file" FREEFRAME_HTTPS)
+    if [[ -z $mode ]]; then
+      if [[ $url == https://* ]]; then mode=own; else mode=off; fi
+    fi
+    FF_MODE=$mode
+    FF_HTTPS=$mode
+    FF_HOST=${url#*://}
+    FF_HOST=${FF_HOST%%/*}
+    FF_HOST=${FF_HOST%%:*}
+    say "Web address: $url (from the existing settings in $file)"
+    return 0
+  fi
+  case ${FF_HTTPS:-auto} in
+    auto | own | sslip | off) ;;
+    *) _ff_answer_error "FREEFRAME_HTTPS (--https) must be auto, own, sslip or off; it is '$FF_HTTPS'." "use one of those four words." ;;
+  esac
+  if [[ -n ${FF_DOMAIN:-} ]]; then
+    FF_DOMAIN=$(_ff_clean_host "$FF_DOMAIN")
+    if ! valid_hostname "$FF_DOMAIN"; then
+      _ff_answer_error "The web address '$FF_DOMAIN' is not a plain name like review.yourstudio.com." \
+        "give only the name, without a port, a path or spaces."
+    fi
+  elif [[ ${FF_HTTPS:-auto} == auto ]] && _ff_interactive; then
+    _install_prompt_address
+  fi
+  if [[ -n ${FF_DOMAIN:-} ]] && _ff_is_ipv4 "$FF_DOMAIN"; then
+    case ${FF_HTTPS:-auto} in
+      auto | off) FF_HTTPS=off ;;
+      *) _ff_answer_error "A certificate needs a name, not an IP address ($FF_DOMAIN)." "use a domain name, or plain HTTP with --https off." ;;
+    esac
+  fi
+  if [[ ${FF_HTTPS:-auto} == sslip && -n ${FF_DOMAIN:-} ]]; then
+    _ff_answer_error "Both a domain ($FF_DOMAIN) and the automatic sslip.io address were asked for." \
+      "choose one: --domain for your own address, or --https sslip for the automatic one."
+  fi
+  if [[ ${FF_HTTPS:-auto} == own && -z ${FF_DOMAIN:-} ]]; then
+    require_answer FF_DOMAIN FREEFRAME_DOMAIN "the web address, for example review.yourstudio.com" || exit 2
+    FF_DOMAIN=$(_ff_clean_host "$FF_DOMAIN")
+    valid_hostname "$FF_DOMAIN" || _ff_answer_error "The web address '$FF_DOMAIN' is not a plain name like review.yourstudio.com." \
+      "give only the name, without a port, a path or spaces."
+  fi
+  FF_MODE=$(https_mode) || exit 2
+  case $FF_MODE in
+    own) FF_HOST=$FF_DOMAIN ;;
+    sslip)
+      if ! is_public_ipv4 "$FF_IP"; then
+        _ff_answer_error "The automatic sslip.io address needs a public IPv4 address, and this server's is '$FF_IP'." \
+          "use your own domain (--domain), or plain HTTP (--https off) on an office network."
+      fi
+      FF_HOST=$(sslip_host "$FF_IP")
+      ;;
+    *) FF_HOST=${FF_DOMAIN:-$FF_IP} ;;
+  esac
+  FF_HTTPS=$FF_MODE
+}
+
+# _ff_ask_email VAR QUESTION DEFAULT: ask until an email address is typed.
+_ff_ask_email() {
+  local var=$1 question=$2 default=$3 answer=""
+  while :; do
+    ask answer "$question" "$default" || _ff_input_ended
+    if valid_email "$answer"; then
+      printf -v "$var" '%s' "$answer"
+      return 0
+    fi
+    say "   That does not look like an email address."
+  done
+}
+
+_install_ask_acme_email() {
+  local file=$1
+  [[ $FF_MODE == own || $FF_MODE == sslip ]] || return 0
+  [[ -z $(env_get "$file" ACME_EMAIL) ]] || return 0
+  if [[ -z ${FF_ACME_EMAIL:-} ]]; then
+    if _ff_interactive; then
+      say ""
+      say "2. Email for certificate notices"
+      say "   Let's Encrypt, who issue the free HTTPS certificate, write to this address if it needs attention."
+      _ff_ask_email FF_ACME_EMAIL "   Email" "${FF_ADMIN_EMAIL:-}"
+    else
+      FF_ACME_EMAIL=${FF_ADMIN_EMAIL:-}
+      require_answer FF_ACME_EMAIL FREEFRAME_ACME_EMAIL "the email for certificate notices" || exit 2
+    fi
+  fi
+  if ! valid_email "$FF_ACME_EMAIL"; then
+    _ff_answer_error "'$FF_ACME_EMAIL' does not look like an email address (the email for certificate notices)." "give an address such as you@yourstudio.com."
+  fi
+}
+
+_install_ask_s3() {
+  local interactive=0 re_bucket='^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+  _ff_interactive && interactive=1
+  if ((interactive)); then
+    say ""
+    say "   Your bucket's details come from your storage provider."
+    if [[ -z ${FF_S3_ENDPOINT:-} ]]; then
+      say "   The S3 address (endpoint), for example https://<account>.r2.cloudflarestorage.com."
+      ask FF_S3_ENDPOINT "   Endpoint (press Enter for AWS S3)" "" || _ff_input_ended
+    fi
+  fi
+  require_answer FF_S3_BUCKET FREEFRAME_S3_BUCKET "   Bucket name" || exit 2
+  require_answer FF_S3_ACCESS_KEY FREEFRAME_S3_ACCESS_KEY "   Access key" || exit 2
+  if [[ -z ${FF_S3_SECRET_KEY:-} ]]; then
+    if ((interactive)); then
+      while [[ -z ${FF_S3_SECRET_KEY:-} ]]; do
+        ask_secret FF_S3_SECRET_KEY "   Secret key" || _ff_input_ended
+      done
+    else
+      require_answer FF_S3_SECRET_KEY FREEFRAME_S3_SECRET_KEY "the bucket's secret key" || exit 2
+    fi
+  fi
+  if ((interactive)) && [[ -z ${FF_S3_REGION:-} ]]; then
+    ask FF_S3_REGION "   Region (for Cloudflare R2 type auto)" us-east-1 || _ff_input_ended
+  fi
+  if [[ -n ${FF_S3_ENDPOINT:-} && ! $FF_S3_ENDPOINT =~ ^https?://[^[:space:]]+$ ]]; then
+    _ff_answer_error "The storage endpoint '$FF_S3_ENDPOINT' must start with https://." "copy the endpoint address exactly as your storage provider shows it."
+  fi
+  if [[ ! $FF_S3_BUCKET =~ $re_bucket ]]; then
+    _ff_answer_error "The bucket name '$FF_S3_BUCKET' can only hold lowercase letters, digits, dots and hyphens." "check the bucket name at your storage provider."
+  fi
+}
+
+_install_ask_storage() {
+  local file=$1 s answer=""
+  s=$(env_get "$file" FREEFRAME_STORAGE)
+  if [[ -n $s ]]; then
+    FF_STORAGE=$s
+    return 0
+  fi
+  if [[ -z ${FF_STORAGE:-} ]] && _ff_interactive; then
+    say ""
+    say "3. Where should uploaded footage be kept?"
+    say "   1) On this server (the simplest; needs enough disk space)"
+    say "   2) In an S3 bucket you already have (AWS S3, Cloudflare R2, Backblaze B2, DigitalOcean Spaces)"
+    while :; do
+      ask answer "   Choose 1 or 2" 1 || _ff_input_ended
+      case ${answer,,} in
+        1 | bundled) FF_STORAGE=bundled && break ;;
+        2 | s3) FF_STORAGE=s3 && break ;;
+      esac
+      say "   Type 1 or 2."
+    done
+  fi
+  FF_STORAGE=${FF_STORAGE:-bundled}
+  case $FF_STORAGE in
+    bundled) ;;
+    s3) _install_ask_s3 ;;
+    *) _ff_answer_error "FREEFRAME_STORAGE (--storage) must be bundled or s3; it is '$FF_STORAGE'." "use bundled (on this server) or s3 (your own bucket)." ;;
+  esac
+}
+
+_install_no_email_note() {
+  warn "Without email, sign-in codes and invitation emails are not sent, and there is no other way to"
+  warn "recover a forgotten password. Invitation links can still be copied from the admin page."
+  warn "To add email later, run: sudo freeframe configure"
+}
+
+_install_ask_smtp() {
+  local file=$1 def=""
+  if [[ -n $(env_get "$file" MAIL_PROVIDER) ]]; then
+    FF_SMTP_FROM_FILE=1
+    return 0
+  fi
+  if [[ -z ${FF_SMTP_HOST:-} ]] && _ff_interactive; then
+    say ""
+    say "4. Sending email (sign-in codes and invitations)"
+    say "   Type your mail server's address (SMTP host, for example smtp.postmarkapp.com),"
+    say "   or press Enter to skip and add it later."
+    ask FF_SMTP_HOST "   Mail server" "" || _ff_input_ended
+    if [[ -z $FF_SMTP_HOST ]]; then
+      _install_no_email_note
+      return 0
+    fi
+    ask FF_SMTP_PORT "   Port" "${FF_SMTP_PORT:-587}" || _ff_input_ended
+    ask FF_SMTP_USER "   User name" "${FF_SMTP_USER:-}" || _ff_input_ended
+    if [[ -z ${FF_SMTP_PASSWORD:-} ]]; then
+      ask_secret FF_SMTP_PASSWORD "   Password" || _ff_input_ended
+    fi
+    def=${FF_SMTP_FROM:-}
+    if [[ -z $def ]] && valid_email "${FF_SMTP_USER:-}"; then def=$FF_SMTP_USER; fi
+    _ff_ask_email FF_SMTP_FROM "   Send emails from (address)" "$def"
+  fi
+  [[ -n ${FF_SMTP_HOST:-} ]] || return 0
+  FF_SMTP_HOST=$(_ff_clean_host "$FF_SMTP_HOST")
+  if ! valid_hostname "$FF_SMTP_HOST"; then
+    _ff_answer_error "The mail server '$FF_SMTP_HOST' is not a plain name like smtp.postmarkapp.com." "give only the server's name."
+  fi
+  FF_SMTP_PORT=${FF_SMTP_PORT:-587}
+  if [[ ! $FF_SMTP_PORT =~ ^[0-9]{1,5}$ ]] || ((10#$FF_SMTP_PORT < 1 || 10#$FF_SMTP_PORT > 65535)); then
+    _ff_answer_error "The mail server port '$FF_SMTP_PORT' is not a port number." "use the port your email provider gives, usually 587 or 465."
+  fi
+  if [[ -z ${FF_SMTP_FROM:-} ]] && valid_email "${FF_SMTP_USER:-}"; then FF_SMTP_FROM=$FF_SMTP_USER; fi
+  require_answer FF_SMTP_FROM FREEFRAME_SMTP_FROM "the address emails are sent from" || exit 2
+  if ! valid_email "$FF_SMTP_FROM"; then
+    _ff_answer_error "'$FF_SMTP_FROM' does not look like an email address (the address emails are sent from)." "give an address such as noreply@yourstudio.com."
+  fi
+}
+
+_install_ask_admin() {
+  local again=""
+  FF_PW_GENERATED=""
+  if _ff_interactive; then
+    say ""
+    say "5. Your admin account (you sign in with it, and invite your team from it)"
+  fi
+  if [[ -z ${FF_ADMIN_NAME:-} ]]; then
+    if _ff_interactive; then
+      require_answer FF_ADMIN_NAME FREEFRAME_ADMIN_NAME "   Your name" || exit 2
+    else
+      FF_ADMIN_NAME=Admin
+    fi
+  fi
+  if [[ -z ${FF_ADMIN_EMAIL:-} ]]; then
+    if _ff_interactive; then
+      _ff_ask_email FF_ADMIN_EMAIL "   Your email" ""
+    else
+      require_answer FF_ADMIN_EMAIL FREEFRAME_ADMIN_EMAIL "the admin account's email" || exit 2
+    fi
+  fi
+  if ! valid_email "$FF_ADMIN_EMAIL"; then
+    _ff_answer_error "'$FF_ADMIN_EMAIL' does not look like an email address (the admin account's email)." "give an address such as you@yourstudio.com."
+  fi
+  if [[ -n ${FF_ADMIN_PASSWORD:-} ]]; then
+    if ! _ff_password_ok "$FF_ADMIN_PASSWORD"; then
+      _ff_answer_error "The admin password must be 8 to 72 characters long." "choose another FREEFRAME_ADMIN_PASSWORD, or leave it out to have one made for you."
+    fi
+    return 0
+  fi
+  if _ff_interactive; then
+    while :; do
+      ask_secret FF_ADMIN_PASSWORD "   Choose a password (at least 8 characters), or press Enter to have one made for you" ||
+        _ff_input_ended
+      [[ -n $FF_ADMIN_PASSWORD ]] || break
+      if ! _ff_password_ok "$FF_ADMIN_PASSWORD"; then
+        say "   The password must be 8 to 72 characters long."
+        continue
+      fi
+      ask_secret again "   Type it again" || _ff_input_ended
+      [[ $again != "$FF_ADMIN_PASSWORD" ]] || return 0
+      say "   The two passwords did not match. Please type them again."
+    done
+  fi
+  FF_ADMIN_PASSWORD=$(gen_secret 12) || FF_ADMIN_PASSWORD=""
+  if [[ ! $FF_ADMIN_PASSWORD =~ ^[0-9a-f]{24}$ ]]; then
+    install_fail "Could not make up a password for the admin account." "check that openssl works (openssl rand -hex 12), or give one with FREEFRAME_ADMIN_PASSWORD."
+  fi
+  FF_PW_GENERATED=1
+}
+
+# _install_footage_hours: roughly how many hours of 1080p footage fit in the
+# free space Docker's volumes will use (about 20 GB an hour, counting the
+# original and the review copies FreeFrame makes).
+_install_footage_hours() {
+  local free
+  free=$(_ff_free_mb /var/lib/docker) || free=""
+  [[ $free =~ ^[0-9]+$ ]] || return 1
+  printf '%s' $((free / 20480))
+}
+
+_install_show_summary() {
+  local file=$1 scheme hours acme
+  scheme=$(_ff_scheme "$FF_MODE")
+  say ""
+  say "Ready to install FreeFrame:"
+  case $FF_MODE in
+    sslip) say "  Web address:  $scheme://$FF_HOST (a free temporary address)" ;;
+    off) say "  Web address:  $scheme://$FF_HOST (plain HTTP)" ;;
+    *) say "  Web address:  $scheme://$FF_HOST" ;;
+  esac
+  if [[ $FF_MODE != off ]]; then
+    acme=$(env_get "$file" ACME_EMAIL)
+    say "  Certificate notices go to: ${acme:-${FF_ACME_EMAIL:-}}"
+  fi
+  if [[ $FF_STORAGE == bundled ]]; then
+    if hours=$(_install_footage_hours); then
+      say "  Footage:      kept on this server; about $hours hours of 1080p footage fit in the free space (less for 4K or ProRes)"
+    else
+      say "  Footage:      kept on this server"
+    fi
+  else
+    say "  Footage:      in your S3 bucket ${FF_S3_BUCKET:-$(env_get "$file" S3_BUCKET)}"
+  fi
+  if [[ -n ${FF_SMTP_FROM_FILE:-} ]]; then
+    say "  Email:        as in the existing settings"
+  elif [[ -n ${FF_SMTP_HOST:-} ]]; then
+    say "  Email:        sent through $FF_SMTP_HOST, port $FF_SMTP_PORT, from $FF_SMTP_FROM"
+  else
+    say "  Email:        not set up"
+  fi
+  if [[ -n $FF_PW_GENERATED ]]; then
+    say "  Admin:        $FF_ADMIN_NAME <$FF_ADMIN_EMAIL>, with a password made for you (shown at the end)"
+  else
+    say "  Admin:        $FF_ADMIN_NAME <$FF_ADMIN_EMAIL>"
+  fi
+  # Interactive runs showed the note when email was skipped.
+  if [[ -z ${FF_SMTP_FROM_FILE:-} && -z ${FF_SMTP_HOST:-} ]] && ! _ff_interactive; then
+    say ""
+    _install_no_email_note
+  fi
+  say ""
+}
+
+_install_questions() {
+  local file=$1
+  FF_STEP="asking the questions"
+  _install_ask_channel "$file"
+  _install_ask_address "$file"
+  _install_ask_acme_email "$file"
+  _install_ask_storage "$file"
+  if [[ $FF_STORAGE == bundled ]]; then
+    _install_check_port 9000 minio "FreeFrame needs port 9000 to keep footage on this server."
+  fi
+  _install_ask_smtp "$file"
+  _install_ask_admin
+  _install_show_summary "$file"
+  if _ff_interactive && ! confirm "Install now?" Y; then
+    _ff_stop 1 "Install cancelled. Nothing was changed." "run sudo freeframe install again when you are ready."
+  fi
+}
+
+_install_docker_step() {
+  FF_STEP="installing Docker"
+  if [[ $FF_DOCKER == ok ]]; then
+    say "Docker is already installed; using it."
+    return 0
+  fi
+  say "Installing Docker from Docker's own repository (a few minutes)..."
+  if ! _ff_logged install_docker; then
+    install_fail "Docker could not be installed." "check the server's internet connection, then run sudo freeframe install again. The reason is at the end of the log."
+  fi
+  if [[ $(docker_status) != ok ]]; then
+    install_fail "Docker was installed but does not answer." "run: sudo systemctl start docker, then sudo freeframe install again."
+  fi
+  FF_STATE="Docker is installed; FreeFrame itself is not set up yet. Running sudo freeframe install again continues from here."
+}
+
+_install_swap_step() {
+  local ram free
+  ram=${FF_RAM_MB:-$(_ff_ram_mb)}
+  ((ram < 4096)) || return 0
+  ! swap_present || return 0
+  FF_STEP="adding a swap file"
+  free=$(_ff_free_mb /) || free=""
+  if [[ $free =~ ^[0-9]+$ ]] && ((free < 4096)); then
+    warn "This server has less than 4 GB of memory and no swap, and too little free disk space to add a swap file."
+    return 0
+  fi
+  say "Adding a 2 GB swap file, because this server has less than 4 GB of memory..."
+  if ! _ff_logged add_swap; then
+    warn "Could not add a swap file; continuing without one (the reason is in the log)."
+  fi
+}
+
+_install_ufw_step() {
+  ufw_active || return 0
+  FF_STEP="opening the firewall"
+  say "The ufw firewall is on: allowing web traffic (ports 80 and 443) and SSH."
+  if _ff_logged ufw app info OpenSSH; then
+    _ff_logged ufw allow OpenSSH || warn "Could not add the ufw rule for SSH."
+  fi
+  _ff_logged ufw allow 80/tcp || warn "Could not add the ufw rule for port 80."
+  _ff_logged ufw allow 443/tcp || warn "Could not add the ufw rule for port 443."
+  if [[ $FF_MODE == off && $FF_STORAGE == bundled ]]; then
+    say "Note: ports that Docker opens skip ufw's rules. FreeFrame opens only 80 and 443, and 9000 for uploads in plain HTTP mode."
+  else
+    say "Note: ports that Docker opens skip ufw's rules. FreeFrame opens only 80 and 443."
+  fi
+}
+
+_install_dns_ok() {
+  local n
+  for n in "$@"; do
+    dns_points_here "$n" "$FF_IP" || return 1
+  done
+}
+
+# For an own domain: show the DNS records, then wait until they point here,
+# so a typo never burns Let's Encrypt attempts. With a terminal the person
+# can switch to the automatic address or continue anyway.
+_install_dns_step() {
+  local -a names=()
+  local n waited=0 max=${FF_DNS_WAIT:-1800} answer rc interactive=0 can_switch=0
+  [[ $FF_MODE == own ]] || return 0
+  FF_STEP="checking the DNS records"
+  names=("$FF_HOST")
+  if [[ $FF_STORAGE == bundled ]]; then names+=("storage.$FF_HOST"); fi
+  if _install_dns_ok "${names[@]}"; then
+    say "The DNS records for $FF_HOST point at this server."
+    return 0
+  fi
+  say ""
+  say "Your web address must point at this server before HTTPS can be set up."
+  say "Add these DNS records where you manage your domain (at the company you bought it from,"
+  say "look for \"DNS\" or \"DNS records\"):"
+  for n in "${names[@]}"; do
+    say "  Add an A record with the name $(_ff_dns_label "$n") and the value $FF_IP   (for $n)"
+  done
+  say "If there is an AAAA record for these names, remove it unless it points at this server."
+  say "New records usually work within a few minutes, sometimes up to an hour."
+  if [[ -z ${FF_ADDR_FROM_FILE:-} ]] && is_public_ipv4 "$FF_IP"; then can_switch=1; fi
+  if _ff_interactive && _ff_tty_open; then
+    interactive=1
+    say ""
+    say "Checking every 15 seconds. Press Enter to check now, or type c and Enter to continue anyway."
+    if ((can_switch)); then
+      say "Or type s and Enter to use the free temporary address $(sslip_host "$FF_IP") instead."
+    fi
+  fi
+  while ! _install_dns_ok "${names[@]}"; do
+    if ((interactive)); then
+      answer=""
+      rc=0
+      IFS= read -r -t 15 -u "$_FF_TTY_FD" answer || rc=$?
+      ((rc <= 128)) || continue
+      if ((rc != 0)) && [[ -z $answer ]]; then
+        interactive=0
+        continue
+      fi
+      case ${answer,,} in
+        s)
+          if ((can_switch)); then
+            FF_HTTPS=sslip FF_MODE=sslip FF_DOMAIN="" FF_HOST=$(sslip_host "$FF_IP")
+            say "Using the temporary address $FF_HOST instead. Change it later with: sudo freeframe configure"
+            return 0
+          fi
+          ;;
+        c)
+          warn "Continuing before the records point here. The HTTPS certificate cannot be issued until they do."
+          return 0
+          ;;
+      esac
+    else
+      if ((waited >= max)); then
+        install_fail "The DNS records for $FF_HOST do not point at this server ($FF_IP) yet." \
+          "add the records shown above and run sudo freeframe install again once they work, or install now with the temporary address instead: leave out the domain and set FREEFRAME_HTTPS=sslip."
+      fi
+      ff_sleep 15
+      waited=$((waited + 15))
+    fi
+  done
+  say "The DNS records point at this server."
+}
+
+_install_fetch_step() {
+  local root f
+  root=$(ff_root)
+  FF_STEP="downloading the setup files"
+  say "Downloading the setup files for the $FF_CHANNEL channel..."
+  for f in docker-compose.prod.yml docker-compose.images.yml docker-compose.https.yml docker-compose.storage.yml; do
+    if ! _ff_logged fetch "$FF_CHANNEL" "$f" "$root/$f"; then
+      install_fail "Could not download $f for the $FF_CHANNEL channel." \
+        "check that this server can reach raw.githubusercontent.com, then run sudo freeframe install again. If it can, the $FF_CHANNEL channel may not have this file yet (the installer needs a release after v1.21.0): try --channel latest."
+    fi
+  done
+}
+
+# Fill the settings file. An existing file (copied from another server, or
+# an earlier attempt) is only completed, never changed, and it is backed up
+# first whenever something is added.
+_install_settings_step() {
+  local file=$1 tmp
+  FF_STEP="writing the settings"
+  if [[ -f $file ]]; then
+    tmp=$(mktemp "$file.new.XXXXXX") || install_fail "Cannot write next to $file." "check that the disk is not full, then run the installer again."
+    cp -p "$file" "$tmp"
+    if ! derive_env "$tmp"; then
+      rm -f "$tmp"
+      install_fail "The settings could not be completed." "fix what the message above says, then run sudo freeframe install again."
+    fi
+    if cmp -s "$file" "$tmp"; then
+      rm -f "$tmp"
+    else
+      env_backup "$file" >/dev/null || install_fail "Could not back up $file." "check that the disk is not full, then run the installer again."
+      mv -f "$tmp" "$file"
+    fi
+  elif ! derive_env "$file"; then
+    install_fail "The settings could not be written." "fix what the message above says, then run sudo freeframe install again."
+  fi
+  FF_STATE="Your settings are saved in $file. Running sudo freeframe install again keeps them and continues from here."
+}
+
+_install_wait_api() {
+  local max=${FF_API_WAIT:-600}
+  FF_STEP="waiting for FreeFrame to start"
+  say "Waiting for FreeFrame to finish starting (the first start prepares the database)..."
+  if ! _ff_wait_for "$max" 5 _ff_logged dc exec -T api curl -fsS http://localhost:8000/health; then
+    install_fail "FreeFrame did not finish starting within $(((max + 59) / 60)) minutes." \
+      "see why with: sudo freeframe logs, then run sudo freeframe install again."
+  fi
+}
+
+# Create the admin account through the API inside the compose network,
+# before Traefik makes anything reachable from outside. The answers go as
+# JSON on stdin, never on a command line, and the response (which holds
+# sign-in tokens) is never logged.
+_install_create_admin() {
+  local json out code="" body="" detail
+  FF_STEP="creating the admin account"
+  json="{\"email\":$(_ff_json_str "$FF_ADMIN_EMAIL"),\"name\":$(_ff_json_str "$FF_ADMIN_NAME"),\"password\":$(_ff_json_str "$FF_ADMIN_PASSWORD")}"
+  out=$(printf '%s' "$json" | dc exec -T api curl -sS -X POST -H 'Content-Type: application/json' \
+    --data-binary @- -w '\n%{http_code}' http://localhost:8000/setup/create-superadmin 2>>"$FF_LOG") || true
+  if [[ $out == *$'\n'* ]]; then
+    code=${out##*$'\n'}
+    body=${out%$'\n'*}
+  fi
+  case $code in
+    201) say "Admin account created for $FF_ADMIN_EMAIL." ;;
+    403)
+      FF_ADMIN_EXISTED=1
+      say "An admin account already exists, so no new one was made. Sign in with the existing admin account."
+      ;;
+    429)
+      install_fail "The admin account could not be created: too many tries in a short time." \
+        "wait 10 minutes, then run sudo freeframe install again."
+      ;;
+    *)
+      detail=$(_ff_api_detail "$body")
+      install_fail "The admin account could not be created${detail:+: $detail}." \
+        "check the admin email and password, then run sudo freeframe install again."
+      ;;
+  esac
+}
+
+_install_start_step() {
+  local out s
+  local -a all=() svcs=()
+  if [[ ${FF_SKIP_PULL:-} != 1 ]]; then
+    FF_STEP="downloading FreeFrame"
+    say "Downloading FreeFrame (about 2 GB; this can take a few minutes)..."
+    if ! _ff_logged dc pull; then
+      install_fail "FreeFrame could not be downloaded." "check that this server can reach ghcr.io, then run sudo freeframe install again."
+    fi
+  fi
+  FF_STEP="starting FreeFrame"
+  out=$(dc config --services 2>>"$FF_LOG") ||
+    install_fail "The setup files could not be read." "run sudo freeframe install again; the reason is at the end of the log."
+  mapfile -t all <<<"$out"
+  for s in "${all[@]}"; do
+    if [[ -n $s && $s != traefik ]]; then svcs+=("$s"); fi
+  done
+  say "Starting FreeFrame (not reachable from outside yet)..."
+  if ! _ff_logged dc up -d --no-build "${svcs[@]}"; then
+    install_fail "FreeFrame could not be started." "run sudo freeframe install again; the reason is at the end of the log."
+  fi
+  FF_STATE="FreeFrame is running but cannot be reached from outside yet. Running sudo freeframe install again keeps your settings and continues from here."
+  _install_wait_api
+  _install_create_admin
+  FF_STEP="opening FreeFrame to the outside"
+  if ! _ff_logged dc up -d --no-build traefik; then
+    install_fail "FreeFrame's web entrance (Traefik) could not be started." "run sudo freeframe install again; the reason is at the end of the log."
+  fi
+  FF_STATE="FreeFrame is running. Running sudo freeframe install again keeps your settings and finishes the remaining checks."
+}
+
+_install_verify_step() {
+  local file=$1 h ok=1
+  local -a hosts=()
+  FF_STEP="checking that FreeFrame answers"
+  say "Checking that FreeFrame answers at $(_ff_scheme "$FF_MODE")://$FF_HOST ..."
+  if ! _ff_wait_for "${FF_HEALTH_WAIT:-300}" 5 probe_health "$FF_MODE" "$FF_HOST"; then
+    install_fail "FreeFrame is running but does not answer on its web address." \
+      "see why with: sudo freeframe logs, then run sudo freeframe install again."
+  fi
+  [[ $FF_MODE != off ]] || return 0
+  FF_STEP="waiting for the HTTPS certificate"
+  hosts=("$FF_HOST")
+  if [[ $(env_get "$file" FREEFRAME_STORAGE) == bundled ]]; then hosts+=("storage.$FF_HOST"); fi
+  say "Waiting for the HTTPS certificate from Let's Encrypt (usually under a minute)..."
+  for h in "${hosts[@]}"; do
+    if ! _ff_wait_for "${FF_CERT_WAIT:-300}" 10 cert_issued "$h"; then
+      ok=0
+      break
+    fi
+  done
+  if ((ok)); then
+    say "The certificate is in place."
+    return 0
+  fi
+  if [[ $FF_MODE == sslip ]]; then
+    warn "The certificate for the temporary address $h did not arrive in time. This happens when the free sslip.io service or Let's Encrypt is busy."
+    say "Switching to plain HTTP on this server's IP address instead..."
+    FF_STEP="switching to plain HTTP"
+    if ! switch_to_http_mode "$file" "$FF_IP"; then
+      install_fail "Could not switch to plain HTTP." "run sudo freeframe install again; the reason is at the end of the log."
+    fi
+    FF_MODE=off FF_HOST=$FF_IP FF_FELL_BACK=1
+    if ! _ff_wait_for "${FF_HEALTH_WAIT:-300}" 5 probe_health off "$FF_IP"; then
+      install_fail "FreeFrame does not answer on http://$FF_IP." "see why with: sudo freeframe logs, then run sudo freeframe install again."
+    fi
+  else
+    FF_CERT_PENDING=$h
+  fi
+}
+
+# _install_summary_lines WITH_PASSWORD: the closing message (spec goal 8).
+# The generated password is only printed with WITH_PASSWORD=1 (the terminal),
+# never into install.log.
+_install_summary_lines() {
+  local file=$1 with_pw=$2 root url origin
+  root=$(ff_root)
+  url="$(_ff_scheme "$FF_MODE")://$FF_HOST"
+  say ""
+  say "============================================================"
+  if [[ -n ${FF_CERT_PENDING:-} ]]; then
+    say "FreeFrame is running at $url, but its HTTPS certificate has not arrived yet."
+  else
+    say "FreeFrame is ready: $url"
+  fi
+  if [[ -n ${FF_ADMIN_EXISTED:-} ]]; then
+    say "Sign in with the admin account that already existed."
+  else
+    say "Sign in as $FF_ADMIN_EMAIL"
+    if [[ -n ${FF_PW_GENERATED:-} ]]; then
+      if [[ $with_pw == 1 ]]; then
+        say "Password: $FF_ADMIN_PASSWORD"
+        say "(made for you and shown only this once: write it down now)"
+      else
+        say "Password: made for you and shown on the screen only, not in this log."
+      fi
+    fi
+  fi
+  say "============================================================"
+  if [[ -n ${FF_CERT_PENDING:-} ]]; then
+    say ""
+    say "The HTTPS certificate for $FF_CERT_PENDING has not arrived yet, so browsers show a warning until it does."
+    say "Check that the DNS records point at $FF_IP and that ports 80 and 443 are open to the internet,"
+    say "then run: sudo freeframe restart"
+  fi
+  if [[ $FF_MODE == sslip ]]; then
+    say ""
+    say "This is a free temporary address. For production, use your own domain: sudo freeframe configure"
+  fi
+  if [[ -n ${FF_FELL_BACK:-} ]]; then
+    say ""
+    say "HTTPS could not be set up for the temporary address, so FreeFrame uses plain HTTP for now and"
+    say "browsers mark it \"Not secure\". To use HTTPS, point a domain at this server and run: sudo freeframe configure"
+  fi
+  if [[ -z $(env_get "$file" SMTP_HOST) && $(env_get "$file" MAIL_PROVIDER) != ses ]]; then
+    say ""
+    say "Email is not set up. Without it, sign-in codes and invitation emails are not sent, and there is"
+    say "no other way to recover a forgotten password. Invitation links can still be copied from the admin"
+    say "page. To add email later, run: sudo freeframe configure"
+  fi
+  if [[ $FF_MODE == off && $(env_get "$file" FREEFRAME_STORAGE) == bundled ]]; then
+    say ""
+    say "Browsers upload footage to port 9000 on this server. If your provider has a firewall in front of"
+    say "the server, open ports 80 and 9000 there."
+  fi
+  if [[ $(env_get "$file" S3_STORAGE) == s3 ]]; then
+    origin=$url
+    say ""
+    say "Your AWS S3 bucket needs these CORS rules so browsers can upload to it (AWS does not get them"
+    say "set automatically). In the AWS console: the bucket, Permissions, Cross-origin resource sharing (CORS):"
+    say "[{\"AllowedOrigins\":[\"$origin\"],\"AllowedMethods\":[\"GET\",\"PUT\",\"POST\",\"HEAD\"],"
+    say " \"AllowedHeaders\":[\"Content-Type\",\"Content-MD5\",\"x-amz-content-sha256\",\"x-amz-date\",\"x-amz-decoded-content-length\"],"
+    say " \"ExposeHeaders\":[\"ETag\"],\"MaxAgeSeconds\":3000}]"
+  fi
+  say ""
+  say "Settings:     $file (private: it holds the passwords; keep a copy somewhere safe)"
+  say "Backups:      $root/backups"
+  say "Install log:  $root/install.log"
+  say ""
+  say "Commands you will need:"
+  say "  sudo freeframe status    see whether everything is running"
+  say "  sudo freeframe update    move to the newest release"
+  say "  sudo freeframe backup    save a copy of the database now"
+}
+
+_install_final_summary() {
+  local file=$1
+  _install_log_stop
+  _install_summary_lines "$file" 1
+  _install_summary_lines "$file" 0 >>"$FF_LOG" 2>&1
+}
+
+# cmd_install: `freeframe install` (spec goals 1 to 10).
+cmd_install() {
+  local root file
+  root=$(ff_root)
+  file="$root/.env.prod"
+  FF_STATE="Nothing on this server has been changed yet."
+  FF_LOG=""
+  FF_ADDR_FROM_FILE="" FF_SMTP_FROM_FILE="" FF_ADMIN_EXISTED="" FF_CERT_PENDING="" FF_FELL_BACK=""
+
+  # Refusals first: nothing is written before these pass.
+  _install_check_system
+  _install_check_foreign
+  if [[ -f $file && -f $root/.installed ]]; then
+    say "FreeFrame is already installed on this server, so nothing was changed."
+    say "Its settings are in $file."
+    say "To move to the newest release, run: sudo freeframe update"
+    say "To change the web address, email or storage, run: sudo freeframe configure"
+    return 0
+  fi
+  if [[ -z ${FF_YES:-} ]] && ! _ff_has_tty; then
+    _ff_stop 2 "There is no terminal here to answer the installer's questions." \
+      "add --yes and give the answers ahead of time, for example: FREEFRAME_ADMIN_EMAIL=you@yourstudio.com freeframe install --yes (see: freeframe help)."
+  fi
+
+  _install_log_start
+  trap _install_on_error ERR
+  install_preflight
+  _install_questions "$file"
+
+  _install_docker_step
+  _install_swap_step
+  _install_ufw_step
+  _install_dns_step
+  _install_fetch_step
+  _install_settings_step "$file"
+  _install_start_step
+  _install_verify_step "$file"
+
+  printf 'FreeFrame installed %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" >"$root/.installed"
+  trap - ERR
+  _install_final_summary "$file"
+}
+
+# ------------------------------------------------------------
 # Commands
 # ------------------------------------------------------------
 
@@ -822,7 +2157,8 @@ main() {
   parse_args "$@"
   case $FF_CMD in
     help) usage ;;
-    install | update | configure | backup | restore | status | logs | restart)
+    install) cmd_install ;;
+    update | configure | backup | restore | status | logs | restart)
       warn "freeframe $FF_CMD is not implemented yet."
       return 1
       ;;

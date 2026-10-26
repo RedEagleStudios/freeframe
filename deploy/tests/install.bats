@@ -1,0 +1,927 @@
+#!/usr/bin/env bats
+# `freeframe install` end to end, with every side effect stubbed
+# (install_stubs.bash), and the install.sh bootstrap.
+#
+# The flow runs in a fresh bash under the script's own strict mode, exactly
+# as `sudo freeframe install` would, with the stubs sourced on top. Answers
+# come from FREEFRAME_* variables, flags or a fake terminal file (FF_TTY).
+
+load helpers
+
+setup() {
+  common_setup
+  export STUB_DIR="$BATS_TEST_TMPDIR"
+  export CALLS="$BATS_TEST_TMPDIR/calls"
+  : >"$CALLS"
+  STUBS="${BATS_TEST_DIRNAME}/install_stubs.bash"
+  export FF_OS_RELEASE="$BATS_TEST_TMPDIR/os-release"
+  os_release ubuntu 24.04 noble
+  export FF_CORES=4 FF_RAM_MB=8192
+  ENV="$FF_ROOT/.env.prod"
+}
+
+os_release() {
+  printf 'PRETTY_NAME="%s %s"\nID=%s\nVERSION_ID="%s"\nVERSION_CODENAME=%s\n' \
+    "$1" "$2" "$1" "$2" "$3" >"$FF_OS_RELEASE"
+}
+
+# ff_install ARGS...: run `freeframe install ARGS` with the stubs.
+ff_install() {
+  run bash -c 'set -Eeuo pipefail; source "$1"; source "$2"; shift 2; main "$@"' \
+    ff-install "$FF_SCRIPT" "$STUBS" install "$@"
+}
+
+# The answers of a typical unattended run (plain HTTP, bundled storage).
+plain_answers() {
+  export FREEFRAME_HTTPS=off
+  export FREEFRAME_ADMIN_NAME="Ada Admin"
+  export FREEFRAME_ADMIN_EMAIL=admin@example.com
+  export FREEFRAME_ADMIN_PASSWORD=s3cret-pass
+}
+
+# assert_order PATTERN...: each fixed string appears in $CALLS, each on a
+# later line than the previous one.
+assert_order() {
+  local last=0 pat n
+  for pat in "$@"; do
+    n=$(grep -n -F -- "$pat" "$CALLS" | awk -F: -v l="$last" '$1 > l { print $1; exit }')
+    if [[ -z $n ]]; then
+      echo "not found after line $last: $pat"
+      echo "--- calls ---"
+      cat "$CALLS"
+      return 1
+    fi
+    last=$n
+  done
+}
+
+assert_not_called() {
+  if grep -q -F -- "$1" "$CALLS"; then
+    echo "unexpected call: $1"
+    cat "$CALLS"
+    return 1
+  fi
+}
+
+assert_out() {
+  if [[ $output != *"$1"* ]]; then
+    echo "expected output to contain: $1"
+    echo "--- output ---"
+    echo "$output"
+    return 1
+  fi
+}
+
+# FF_ROOT holds nothing at all.
+assert_root_untouched() {
+  local left
+  left=$(ls -A "$FF_ROOT")
+  if [[ -n $left ]]; then
+    echo "expected $FF_ROOT to be empty, found: $left"
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------- happy path
+
+@test "install: a fresh run does every step in order" {
+  plain_answers
+  ff_install --yes --channel latest
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_order detect_foreign_install docker_status "net_reachable https://ghcr.io" \
+    "net_reachable https://download.docker.com" install_docker \
+    "fetch latest docker-compose.prod.yml" "fetch latest docker-compose.images.yml" \
+    "fetch latest docker-compose.https.yml" "fetch latest docker-compose.storage.yml" \
+    derive_env "dc pull" "dc config --services" "dc up -d" \
+    "localhost:8000/health" "localhost:8000/setup/create-superadmin" \
+    "dc up -d --no-build traefik" "probe_health off 203.0.113.7"
+  [ -f "$ENV" ]
+  assert_has "$ENV" "FRONTEND_URL=http://203.0.113.7"
+  assert_has "$ENV" "FREEFRAME_CHANNEL=latest"
+  assert_out "FreeFrame is ready: http://203.0.113.7"
+  assert_out "Sign in as admin@example.com"
+}
+
+@test "install: the first start leaves traefik out, and starts every other service" {
+  plain_answers
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  local first
+  first=$(grep -m1 '^dc up -d' "$CALLS")
+  [[ " $first " != *" traefik "* ]] || { echo "$first"; false; }
+  local s
+  for s in postgres redis api worker email_worker maintenance_worker beat web minio minio-init; do
+    [[ " $first " == *" $s "* ]] || { echo "missing $s in: $first"; false; }
+  done
+}
+
+@test "install: traefik starts only after the admin account is created" {
+  plain_answers
+  ff_install --yes
+  [ "$status" -eq 0 ]
+  local admin traefik
+  admin=$(grep -n create-superadmin "$CALLS" | cut -d: -f1)
+  traefik=$(grep -n '^dc up -d --no-build traefik$' "$CALLS" | cut -d: -f1)
+  [ -n "$admin" ] && [ -n "$traefik" ]
+  ((traefik > admin))
+}
+
+@test "install: the admin answers go to the setup endpoint as JSON on stdin" {
+  plain_answers
+  ff_install --yes
+  [ "$status" -eq 0 ]
+  assert_eq "$(cat "$BATS_TEST_TMPDIR/superadmin.json")" \
+    '{"email":"admin@example.com","name":"Ada Admin","password":"s3cret-pass"}'
+  # The password never appears in a command line.
+  assert_not_called "s3cret-pass"
+  grep -q -- "dc exec -T api curl" "$CALLS"
+}
+
+@test "install: names and passwords with quotes and backslashes are escaped in the JSON" {
+  plain_answers
+  export FREEFRAME_ADMIN_NAME='Ada "The" Admin'
+  export FREEFRAME_ADMIN_PASSWORD='pa\ss"word'
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(cat "$BATS_TEST_TMPDIR/superadmin.json")" \
+    '{"email":"admin@example.com","name":"Ada \"The\" Admin","password":"pa\\ss\"word"}'
+}
+
+@test "install: docker 24 or newer with compose is used as is" {
+  plain_answers
+  export STUB_DOCKER=ok
+  ff_install --yes
+  [ "$status" -eq 0 ]
+  assert_not_called install_docker
+  assert_not_called "net_reachable https://download.docker.com"
+}
+
+@test "install: FF_SKIP_PULL=1 skips dc pull" {
+  plain_answers
+  export FF_SKIP_PULL=1
+  ff_install --yes
+  [ "$status" -eq 0 ]
+  assert_not_called "dc pull"
+  grep -q '^dc up -d' "$CALLS"
+}
+
+@test "install: the channel defaults to stable" {
+  plain_answers
+  ff_install --yes
+  [ "$status" -eq 0 ]
+  grep -q '^fetch stable docker-compose.prod.yml$' "$CALLS"
+  assert_has "$ENV" "FREEFRAME_CHANNEL=stable"
+}
+
+@test "install: install.log is private and never holds the password or the tokens" {
+  plain_answers
+  unset FREEFRAME_ADMIN_PASSWORD
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  local log="$FF_ROOT/install.log" pw
+  [ -f "$log" ]
+  [ "$(stat -c %a "$log" 2>/dev/null || stat -f %Lp "$log")" = 600 ]
+  pw=$(sed -n 's/.*"password":"\([^"]*\)".*/\1/p' "$BATS_TEST_TMPDIR/superadmin.json")
+  [[ $pw =~ ^[0-9a-f]{24}$ ]] || { echo "generated: $pw"; false; }
+  # Shown once on the terminal...
+  assert_out "$pw"
+  # ...but not in the log.
+  # (A bare `! grep` never fails a bats test, so these are spelled out.)
+  if grep -q -F "$pw" "$log"; then echo "password in the log"; false; fi
+  if grep -q -F "tok-SECRET" "$log"; then echo "token in the log"; false; fi
+  grep -q "FreeFrame is ready" "$log"
+}
+
+@test "install: marks the install complete only at the end" {
+  plain_answers
+  export STUB_HEALTH_FAIL=1 FF_HEALTH_WAIT=10
+  ff_install --yes
+  [ "$status" -eq 1 ]
+  [ ! -e "$FF_ROOT/.installed" ]
+  unset STUB_HEALTH_FAIL
+  ff_install --yes
+  [ "$status" -eq 0 ]
+  [ -f "$FF_ROOT/.installed" ]
+}
+
+@test "install: an unexpected failure says so in plain words and names the log" {
+  plain_answers
+  # The completion marker cannot be written: a folder is in its way.
+  mkdir "$FF_ROOT/.installed"
+  ff_install --yes
+  [ "$status" -eq 1 ]
+  assert_out "stopped unexpectedly"
+  assert_out "install.log"
+  assert_out "sudo freeframe install again"
+}
+
+# ---------------------------------------------------------------- re-runs
+
+@test "install: a second run changes nothing and points at freeframe update" {
+  plain_answers
+  ff_install --yes
+  [ "$status" -eq 0 ]
+  cp "$ENV" "$BATS_TEST_TMPDIR/env.before"
+  : >"$CALLS"
+  ff_install --yes --domain other.example.com --https own
+  [ "$status" -eq 0 ]
+  cmp "$ENV" "$BATS_TEST_TMPDIR/env.before"
+  assert_out "already installed"
+  assert_out "sudo freeframe update"
+  assert_not_called fetch
+  assert_not_called derive_env
+  assert_not_called "dc "
+}
+
+@test "install: settings copied from another server are kept byte for byte" {
+  plain_answers
+  ff_install --yes
+  [ "$status" -eq 0 ]
+  # A new server: only the settings file came across.
+  rm -f "$FF_ROOT/.installed" "$FF_ROOT"/docker-compose.*.yml "$FF_ROOT/install.log"
+  cp "$ENV" "$BATS_TEST_TMPDIR/env.before"
+  : >"$CALLS"
+  export FREEFRAME_HTTPS=sslip
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  cmp "$ENV" "$BATS_TEST_TMPDIR/env.before"
+  grep -q derive_env "$CALLS"
+  grep -q create-superadmin "$CALLS"
+  assert_out "from the existing settings"
+}
+
+@test "install: an admin that already exists is not an error" {
+  plain_answers
+  export STUB_ADMIN_CODE=403 STUB_ADMIN_BODY='{"detail":"Setup already completed. Superadmin already exists."}'
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "An admin account already exists"
+  grep -q "dc up -d --no-build traefik" "$CALLS"
+}
+
+@test "install: a refused admin account stops before traefik with the reason" {
+  plain_answers
+  export STUB_ADMIN_CODE=422 STUB_ADMIN_BODY='{"detail":[{"msg":"value is not a valid email address"}]}'
+  ff_install --yes
+  [ "$status" -eq 1 ]
+  assert_out "value is not a valid email address"
+  assert_not_called "dc up -d --no-build traefik"
+}
+
+@test "install: the API never answering stops before the admin and traefik" {
+  plain_answers
+  export STUB_API_DOWN=1 FF_API_WAIT=20
+  ff_install --yes
+  [ "$status" -eq 1 ]
+  assert_not_called create-superadmin
+  assert_not_called "dc up -d --no-build traefik"
+  assert_out "install.log"
+  assert_out "sudo freeframe install"
+}
+
+# ---------------------------------------------------------------- refusals
+
+@test "install: not root exits 2 and changes nothing" {
+  plain_answers
+  export STUB_NOT_ROOT=1
+  ff_install --yes
+  [ "$status" -eq 2 ]
+  assert_out "as root"
+  assert_root_untouched
+  [ ! -s "$CALLS" ]
+}
+
+@test "install: an unsupported OS exits 3 before any change" {
+  plain_answers
+  os_release debian 11 bullseye
+  ff_install --yes
+  [ "$status" -eq 3 ]
+  assert_out "not supported yet"
+  assert_out "debian 11"
+  assert_root_untouched
+  [ ! -s "$CALLS" ]
+}
+
+@test "install: no os-release at all is unsupported" {
+  plain_answers
+  rm -f "$FF_OS_RELEASE"
+  ff_install --yes
+  [ "$status" -eq 3 ]
+  assert_root_untouched
+}
+
+@test "install: an unsupported processor exits 3 before any change" {
+  plain_answers
+  export STUB_ARCH=armv7l
+  ff_install --yes
+  [ "$status" -eq 3 ]
+  assert_out "armv7l"
+  assert_root_untouched
+  [ ! -s "$CALLS" ]
+}
+
+@test "install: a foreign install exits 3 before any fetch and writes nothing" {
+  plain_answers
+  export STUB_FOREIGN=0
+  ff_install --yes
+  [ "$status" -eq 3 ]
+  assert_out "set up by hand"
+  assert_out "will not touch it"
+  assert_not_called fetch
+  assert_not_called install_docker
+  assert_root_untouched
+}
+
+@test "install: docker not answering is a failure, never read as no FreeFrame" {
+  plain_answers
+  export STUB_FOREIGN=2
+  ff_install --yes
+  [ "$status" -eq 1 ]
+  assert_not_called fetch
+  assert_root_untouched
+}
+
+@test "install: snap docker is refused with instructions" {
+  plain_answers
+  export STUB_DOCKER=snap
+  ff_install --yes
+  [ "$status" -eq 3 ]
+  assert_out "snap"
+  assert_not_called install_docker
+  assert_not_called fetch
+}
+
+@test "install: an old docker is refused" {
+  plain_answers
+  export STUB_DOCKER="old 20.10.24"
+  ff_install --yes
+  [ "$status" -eq 3 ]
+  assert_out "20.10.24"
+  assert_not_called install_docker
+}
+
+@test "install: too little memory is refused, 2 to 4 GB only warns" {
+  plain_answers
+  export FF_RAM_MB=1024
+  ff_install --yes
+  [ "$status" -eq 3 ]
+  assert_out "memory"
+  assert_not_called install_docker
+
+  export FF_RAM_MB=3900
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "4 GB"
+}
+
+@test "install: no outbound access to ghcr.io stops before any change" {
+  plain_answers
+  export STUB_NET_DOWN=ghcr.io
+  ff_install --yes
+  [ "$status" -eq 1 ]
+  assert_out "ghcr.io"
+  assert_not_called install_docker
+  assert_not_called fetch
+}
+
+@test "install: low disk space warns" {
+  plain_answers
+  export STUB_FREE_MB=10000
+  ff_install --yes
+  [ "$status" -eq 0 ]
+  assert_out "free disk space"
+}
+
+# ---------------------------------------------------------------- answers
+
+@test "install: with no terminal and no --yes it stops and names --yes" {
+  plain_answers
+  ff_install
+  [ "$status" -eq 2 ]
+  assert_out "--yes"
+  assert_not_called install_docker
+  assert_not_called fetch
+}
+
+@test "install: with no terminal a missing admin email names the variable" {
+  plain_answers
+  unset FREEFRAME_ADMIN_EMAIL
+  ff_install --yes
+  [ "$status" -eq 2 ]
+  assert_out "FREEFRAME_ADMIN_EMAIL"
+  assert_not_called install_docker
+  assert_not_called fetch
+  [ ! -e "$ENV" ]
+}
+
+@test "install: a bad web address given ahead of time exits 2 before any change" {
+  plain_answers
+  unset FREEFRAME_HTTPS
+  ff_install --yes --domain 'https://review.example.com:8443/x y'
+  [ "$status" -eq 2 ]
+  assert_not_called install_docker
+  [ ! -e "$ENV" ]
+}
+
+@test "install: a pasted https:// and trailing slash are forgiven" {
+  plain_answers
+  unset FREEFRAME_HTTPS
+  export FREEFRAME_ACME_EMAIL=certs@example.com
+  ff_install --yes --domain 'https://Review.Example.com/'
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_has "$ENV" "FRONTEND_URL=https://review.example.com"
+}
+
+@test "install: a too-short admin password given ahead of time exits 2" {
+  plain_answers
+  export FREEFRAME_ADMIN_PASSWORD=short
+  ff_install --yes
+  [ "$status" -eq 2 ]
+  assert_out "8"
+  assert_not_called install_docker
+}
+
+@test "install: HTTPS needs a certificate email; the admin email is the default" {
+  plain_answers
+  unset FREEFRAME_HTTPS
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_has "$ENV" "FREEFRAME_HTTPS=sslip"
+  assert_has "$ENV" "ACME_EMAIL=admin@example.com"
+}
+
+@test "install: own S3 bucket answers from the environment" {
+  plain_answers
+  export FREEFRAME_STORAGE=s3 FREEFRAME_S3_BUCKET=footage FREEFRAME_S3_ACCESS_KEY=AKIAX \
+    FREEFRAME_S3_SECRET_KEY='se$cret' FREEFRAME_S3_REGION=eu-west-1
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_has "$ENV" "S3_STORAGE=s3"
+  assert_eq "$(env_get "$ENV" S3_SECRET_KEY)" 'se$cret'
+  # AWS does not get CORS set automatically: the rules are printed.
+  assert_out "AllowedOrigins"
+  assert_out "http://203.0.113.7"
+  local first
+  first=$(grep -m1 '^dc up -d' "$CALLS")
+  [[ " $first " != *" minio "* ]]
+}
+
+@test "install: skipping email says plainly what does not work" {
+  plain_answers
+  ff_install --yes
+  [ "$status" -eq 0 ]
+  assert_out "forgotten password"
+  assert_has "$ENV" "MAIL_PROVIDER=smtp"
+}
+
+@test "install: interactive answers, hidden passwords typed twice" {
+  # Enter (automatic address), certificate email, storage 1, skip email,
+  # name, email, password twice, then confirm.
+  printf '%s\n' "" "certs@example.com" "1" "" "Grace Hopper" "grace@example.com" \
+    "long-password-1" "long-password-1" "y" >"$BATS_TEST_TMPDIR/tty"
+  export FF_TTY="$BATS_TEST_TMPDIR/tty"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_has "$ENV" "FRONTEND_URL=https://203-0-113-7.sslip.io"
+  assert_has "$ENV" "ACME_EMAIL=certs@example.com"
+  assert_has "$ENV" "FREEFRAME_STORAGE=bundled"
+  assert_eq "$(cat "$BATS_TEST_TMPDIR/superadmin.json")" \
+    '{"email":"grace@example.com","name":"Grace Hopper","password":"long-password-1"}'
+  assert_out "temporary"
+  assert_out "Install now?"
+}
+
+@test "install: interactive passwords that differ are asked again" {
+  printf '%s\n' "" "certs@example.com" "1" "" "Grace" "grace@example.com" \
+    "long-password-1" "long-password-2" "long-password-3" "long-password-3" "y" \
+    >"$BATS_TEST_TMPDIR/tty"
+  export FF_TTY="$BATS_TEST_TMPDIR/tty"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "did not match"
+  grep -q '"password":"long-password-3"' "$BATS_TEST_TMPDIR/superadmin.json"
+}
+
+@test "install: interactive Enter at the password makes one up" {
+  printf '%s\n' "" "certs@example.com" "1" "" "Grace" "grace@example.com" "" "y" \
+    >"$BATS_TEST_TMPDIR/tty"
+  export FF_TTY="$BATS_TEST_TMPDIR/tty"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -Eq '"password":"[0-9a-f]{24}"' "$BATS_TEST_TMPDIR/superadmin.json"
+  assert_out "write it down"
+}
+
+@test "install: answering no at Install now changes nothing" {
+  printf '%s\n' "" "certs@example.com" "1" "" "Grace" "grace@example.com" \
+    "long-password-1" "long-password-1" "n" >"$BATS_TEST_TMPDIR/tty"
+  export FF_TTY="$BATS_TEST_TMPDIR/tty"
+  ff_install
+  [ "$status" -eq 1 ]
+  assert_out "Nothing was changed"
+  assert_not_called install_docker
+  assert_not_called fetch
+  [ ! -e "$ENV" ]
+}
+
+@test "install: interactive SMTP answers" {
+  printf '%s\n' "" "certs@example.com" "1" "smtp.example.com" "465" "mailer@example.com" \
+    "mail-pass" "" "Grace" "grace@example.com" "long-password-1" "long-password-1" "y" \
+    >"$BATS_TEST_TMPDIR/tty"
+  export FF_TTY="$BATS_TEST_TMPDIR/tty"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_has "$ENV" "SMTP_HOST=smtp.example.com"
+  assert_has "$ENV" "SMTP_PORT=465"
+  assert_has "$ENV" "SMTP_USE_TLS=false"
+  assert_has "$ENV" "SMTP_PASSWORD=mail-pass"
+  assert_has "$ENV" "MAIL_FROM_ADDRESS=mailer@example.com"
+}
+
+@test "install: typing the server's IP at the address question means plain HTTP" {
+  printf '%s\n' "10.0.0.5" "1" "" "Grace" "grace@example.com" \
+    "long-password-1" "long-password-1" "y" >"$BATS_TEST_TMPDIR/tty"
+  export FF_TTY="$BATS_TEST_TMPDIR/tty" STUB_LOCAL_IP=10.0.0.5
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_has "$ENV" "FRONTEND_URL=http://10.0.0.5"
+  assert_has "$ENV" "FREEFRAME_HTTPS=off"
+  assert_has "$ENV" "S3_PUBLIC_ENDPOINT=http://10.0.0.5:9000"
+}
+
+@test "install: no public IP means plain HTTP on the server's address" {
+  plain_answers
+  unset FREEFRAME_HTTPS
+  export STUB_PUBLIC_IP="" STUB_LOCAL_IP=192.168.1.20
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_has "$ENV" "FRONTEND_URL=http://192.168.1.20"
+  assert_has "$ENV" "FREEFRAME_HTTPS=off"
+}
+
+# ---------------------------------------------------------------- server fixes
+
+@test "install: adds swap only when memory is under 4 GB and there is none" {
+  plain_answers
+  export FF_RAM_MB=3900
+  ff_install --yes
+  [ "$status" -eq 0 ]
+  grep -q '^add_swap$' "$CALLS"
+
+  : >"$CALLS"
+  rm -f "$FF_ROOT/.installed"
+  export STUB_SWAP=1
+  ff_install --yes
+  assert_not_called add_swap
+
+  : >"$CALLS"
+  rm -f "$FF_ROOT/.installed"
+  unset STUB_SWAP
+  export FF_RAM_MB=8192
+  ff_install --yes
+  assert_not_called add_swap
+}
+
+@test "install: ufw gets allow rules only when it is active" {
+  plain_answers
+  ff_install --yes
+  [ "$status" -eq 0 ]
+  assert_not_called "ufw "
+
+  : >"$CALLS"
+  rm -f "$FF_ROOT/.installed"
+  export STUB_UFW_ACTIVE=1
+  ff_install --yes
+  [ "$status" -eq 0 ]
+  grep -q '^ufw allow 80/tcp$' "$CALLS"
+  grep -q '^ufw allow 443/tcp$' "$CALLS"
+  assert_not_called "ufw enable"
+}
+
+@test "install: a program on port 80 is named, and --yes does not stop it" {
+  plain_answers
+  export STUB_SS='LISTEN 0 511 0.0.0.0:80 0.0.0.0:* users:(("nginx",pid=812,fd=6),("nginx",pid=813,fd=6))'
+  export STUB_UNIT=nginx.service
+  ff_install --yes
+  [ "$status" -eq 1 ]
+  assert_out "Port 80 is used by nginx"
+  assert_not_called "systemctl disable"
+  assert_not_called install_docker
+}
+
+@test "install: interactive yes stops the program holding port 443" {
+  printf '%s\n' "y" "" "certs@example.com" "1" "" "Grace" "grace@example.com" \
+    "long-password-1" "long-password-1" "y" >"$BATS_TEST_TMPDIR/tty"
+  export FF_TTY="$BATS_TEST_TMPDIR/tty"
+  export STUB_SS='LISTEN 0 511 [::]:443 [::]:* users:(("apache2",pid=900,fd=4))'
+  export STUB_UNIT=apache2.service STUB_SS_CLEARS=1
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -q '^systemctl disable --now apache2.service$' "$CALLS"
+}
+
+@test "install: our own traefik on 80 from an earlier attempt is not in the way" {
+  plain_answers
+  export STUB_HEALTH_FAIL=1 FF_HEALTH_WAIT=10
+  ff_install --yes
+  [ "$status" -eq 1 ]
+  unset STUB_HEALTH_FAIL
+  export STUB_SS='LISTEN 0 4096 0.0.0.0:80 0.0.0.0:* users:(("docker-proxy",pid=4242,fd=7))'
+  export STUB_OURS_RUNNING=1
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+}
+
+@test "install: another Docker app on port 80 stops the install" {
+  plain_answers
+  export STUB_SS='LISTEN 0 4096 0.0.0.0:80 0.0.0.0:* users:(("docker-proxy",pid=4242,fd=7))'
+  ff_install --yes
+  [ "$status" -eq 1 ]
+  assert_out "Docker"
+}
+
+# ---------------------------------------------------------------- DNS and HTTPS
+
+@test "install: own domain prints the records and waits until they point here" {
+  plain_answers
+  unset FREEFRAME_HTTPS
+  export FREEFRAME_ACME_EMAIL=certs@example.com STUB_DNS_FAILS=3
+  ff_install --yes --domain review.yourstudio.com
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "A record"
+  assert_out "review.yourstudio.com"
+  assert_out "storage.review.yourstudio.com"
+  assert_out "203.0.113.7"
+  assert_order "dns_points_here review.yourstudio.com 203.0.113.7" "sleep 15" \
+    "dns_points_here review.yourstudio.com 203.0.113.7" "fetch stable docker-compose.prod.yml"
+  assert_has "$ENV" "FRONTEND_URL=https://review.yourstudio.com"
+  assert_has "$ENV" "FREEFRAME_HTTPS=own"
+  grep -q "cert_issued review.yourstudio.com" "$CALLS"
+  grep -q "cert_issued storage.review.yourstudio.com" "$CALLS"
+}
+
+@test "install: DNS that never points here stops an unattended run before any fetch" {
+  plain_answers
+  unset FREEFRAME_HTTPS
+  export FREEFRAME_ACME_EMAIL=certs@example.com STUB_DNS_FAILS=1000 FF_DNS_WAIT=60
+  ff_install --yes --domain review.yourstudio.com
+  [ "$status" -eq 1 ]
+  assert_out "FREEFRAME_HTTPS=sslip"
+  assert_not_called fetch
+}
+
+@test "install: at the DNS wait, s switches to the automatic address" {
+  printf '%s\n' "review.yourstudio.com" "certs@example.com" "1" "" "Grace" "grace@example.com" \
+    "long-password-1" "long-password-1" "y" "s" >"$BATS_TEST_TMPDIR/tty"
+  export FF_TTY="$BATS_TEST_TMPDIR/tty" STUB_DNS_FAILS=1000
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_has "$ENV" "FRONTEND_URL=https://203-0-113-7.sslip.io"
+  assert_has "$ENV" "FREEFRAME_HTTPS=sslip"
+}
+
+@test "install: at the DNS wait, c continues anyway with the own domain" {
+  printf '%s\n' "review.yourstudio.com" "certs@example.com" "1" "" "Grace" "grace@example.com" \
+    "long-password-1" "long-password-1" "y" "c" >"$BATS_TEST_TMPDIR/tty"
+  export FF_TTY="$BATS_TEST_TMPDIR/tty" STUB_DNS_FAILS=1000
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_has "$ENV" "FRONTEND_URL=https://review.yourstudio.com"
+}
+
+@test "install: sslip certificate that never arrives falls back to plain HTTP" {
+  plain_answers
+  export FREEFRAME_HTTPS=sslip STUB_CERT_FAIL=1 FF_CERT_WAIT=30
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_has "$ENV" "FREEFRAME_HTTPS=off"
+  assert_has "$ENV" "FRONTEND_URL=http://203.0.113.7"
+  assert_has "$ENV" "S3_PUBLIC_ENDPOINT=http://203.0.113.7:9000"
+  assert_has "$ENV" "STORAGE_ROUTED=false"
+  assert_has "$ENV" "STORAGE_PORT_BIND=0.0.0.0:9000"
+  assert_out "plain HTTP"
+  assert_out "FreeFrame is ready: http://203.0.113.7"
+  # The old file was backed up, and no secret changed.
+  local backup
+  backup=$(ls "$ENV".2* | head -1)
+  [ -f "$backup" ]
+  local k
+  for k in POSTGRES_PASSWORD REDIS_PASSWORD JWT_SECRET S3_ACCESS_KEY S3_SECRET_KEY DATABASE_URL; do
+    assert_eq "$(env_get "$ENV" "$k")" "$(env_get "$backup" "$k")"
+  done
+  grep -q -- "--force-recreate" "$CALLS"
+  assert_order "cert_issued 203-0-113-7.sslip.io" "dc up -d --no-build --force-recreate" "probe_health off 203.0.113.7"
+}
+
+@test "install: sslip certificate issued keeps HTTPS" {
+  plain_answers
+  export FREEFRAME_HTTPS=sslip
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_has "$ENV" "FREEFRAME_HTTPS=sslip"
+  assert_out "FreeFrame is ready: https://203-0-113-7.sslip.io"
+  assert_out "temporary"
+}
+
+@test "install: own domain certificate that does not arrive is reported, not hidden" {
+  plain_answers
+  unset FREEFRAME_HTTPS
+  export FREEFRAME_ACME_EMAIL=certs@example.com STUB_CERT_FAIL=1 FF_CERT_WAIT=30
+  ff_install --yes --domain review.yourstudio.com
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_has "$ENV" "FREEFRAME_HTTPS=own"
+  assert_out "certificate"
+  assert_out "has not arrived"
+}
+
+@test "install: sslip mode without a public IP exits 2" {
+  plain_answers
+  export FREEFRAME_HTTPS=sslip STUB_PUBLIC_IP="" STUB_LOCAL_IP=192.168.1.20
+  ff_install --yes
+  [ "$status" -eq 2 ]
+  assert_not_called install_docker
+}
+
+@test "install: a failed download names the file and stops before derive" {
+  plain_answers
+  export STUB_FETCH_FAIL=docker-compose.https.yml
+  ff_install --yes
+  [ "$status" -eq 1 ]
+  assert_out "docker-compose.https.yml"
+  assert_not_called derive_env
+}
+
+# ---------------------------------------------------------------- real helpers
+
+@test "fetch copies from FF_FETCH_FROM_DIR instead of downloading" {
+  mkdir -p "$BATS_TEST_TMPDIR/src"
+  printf 'services:\n  api: {}\n' >"$BATS_TEST_TMPDIR/src/docker-compose.prod.yml"
+  FF_FETCH_FROM_DIR="$BATS_TEST_TMPDIR/src"
+  curl() { echo "curl must not run" >&2; return 99; }
+  fetch latest docker-compose.prod.yml "$FF_ROOT/docker-compose.prod.yml"
+  cmp "$BATS_TEST_TMPDIR/src/docker-compose.prod.yml" "$FF_ROOT/docker-compose.prod.yml"
+}
+
+@test "fetch downloads the file from the ref on GitHub" {
+  curl() {
+    local out="" a
+    while (($#)); do
+      a=$1
+      shift
+      case $a in
+        -o) out=$1; shift ;;
+        https://*) printf '%s\n' "$a" >"$BATS_TEST_TMPDIR/url" ;;
+      esac
+    done
+    printf 'downloaded\n' >"$out"
+  }
+  fetch latest deploy/freeframe "$FF_ROOT/x"
+  assert_eq "$(cat "$BATS_TEST_TMPDIR/url")" \
+    "https://raw.githubusercontent.com/Techiebutler/freeframe/latest/deploy/freeframe"
+  assert_eq "$(cat "$FF_ROOT/x")" "downloaded"
+}
+
+@test "fetch that fails leaves the old file in place" {
+  printf 'old\n' >"$FF_ROOT/x"
+  curl() { return 22; }
+  run fetch latest docker-compose.prod.yml "$FF_ROOT/x"
+  [ "$status" -ne 0 ]
+  assert_eq "$(cat "$FF_ROOT/x")" "old"
+  [ -z "$(ls "$FF_ROOT" | grep -v '^x$')" ]
+}
+
+@test "port_holder names the program and its pid" {
+  ss() { printf '%s\n' 'LISTEN 0 511 0.0.0.0:8080 0.0.0.0:* users:(("other",pid=1,fd=3))' \
+    'LISTEN 0 511 0.0.0.0:80 0.0.0.0:* users:(("nginx",pid=812,fd=6))'; }
+  assert_eq "$(port_holder 80)" "nginx 812"
+  assert_eq "$(port_holder 443)" ""
+}
+
+@test "port_holder matches IPv6 and wildcard listeners but not a longer port" {
+  ss() { printf '%s\n' 'LISTEN 0 511 [::]:4430 [::]:* users:(("a",pid=1,fd=3))' \
+    'LISTEN 0 511 *:443 *:* users:(("caddy",pid=77,fd=3))'; }
+  assert_eq "$(port_holder 443)" "caddy 77"
+}
+
+@test "docker_status reads the server version and the compose plugin" {
+  docker() {
+    case "$1" in
+      version) echo "${V:-27.3.1}" ;;
+      compose) [[ -z ${NOCOMPOSE:-} ]] ;;
+    esac
+  }
+  assert_eq "$(docker_status)" "ok"
+  V=23.0.6
+  assert_eq "$(docker_status)" "old 23.0.6"
+  V=24.0.0 NOCOMPOSE=1
+  assert_eq "$(docker_status)" "nocompose"
+}
+
+@test "docker_status says none without docker" {
+  PATH="$BATS_TEST_TMPDIR/empty" run docker_status
+  assert_eq "$output" "none"
+}
+
+@test "switch_to_http_mode changes only the address keys and restarts" {
+  FF_IP=203.0.113.7 FF_HTTPS=sslip FF_ACME_EMAIL=c@example.com derive_env "$ENV"
+  cp "$ENV" "$BATS_TEST_TMPDIR/before"
+  dc() { printf 'dc %s\n' "$*" >>"$CALLS"; }
+  probe_health() { :; }
+  run switch_to_http_mode "$ENV" 203.0.113.7
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -q -- "dc up -d --no-build --force-recreate" "$CALLS"
+  # Exactly these keys changed; everything else is byte for byte the same.
+  diff <(grep -vE '^(FREEFRAME_HTTPS|FRONTEND_URL|DOMAIN|S3_PUBLIC_ENDPOINT|STORAGE_DOMAIN|STORAGE_ROUTED|STORAGE_PORT_BIND)=' "$BATS_TEST_TMPDIR/before") \
+    <(grep -vE '^(FREEFRAME_HTTPS|FRONTEND_URL|DOMAIN|S3_PUBLIC_ENDPOINT|STORAGE_DOMAIN|STORAGE_ROUTED|STORAGE_PORT_BIND)=' "$ENV")
+  assert_has "$ENV" "FREEFRAME_HTTPS=off"
+  assert_has "$ENV" "FRONTEND_URL=http://203.0.113.7"
+  assert_has "$ENV" "DOMAIN="
+  assert_has "$ENV" "STORAGE_DOMAIN="
+  assert_has "$ENV" "ACME_EMAIL=c@example.com"
+  assert_eq "$(compose_files "$ENV")" "-f docker-compose.prod.yml -f docker-compose.images.yml -f docker-compose.storage.yml"
+  [ "$(ls "$ENV".2* | wc -l)" -eq 1 ]
+}
+
+# ---------------------------------------------------------------- install.sh
+
+bootstrap_setup() {
+  BIN="$BATS_TEST_TMPDIR/bin"
+  mkdir -p "$BIN" "$BATS_TEST_TMPDIR/dest"
+  export FF_BIN_DIR="$BATS_TEST_TMPDIR/dest"
+  # The script curl "downloads": it reports how it was run.
+  export DOWNLOAD="$BATS_TEST_TMPDIR/download"
+  printf '%s\n' '#!/usr/bin/env bash' 'echo "ran: $*"' >"$DOWNLOAD"
+  cat >"$BIN/curl" <<'EOF'
+#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do
+  case $1 in
+    -o) out=$2; shift ;;
+    https://*) echo "$1" >>"$CALLS" ;;
+  esac
+  shift
+done
+[ -n "${CURL_FAIL:-}" ] && exit 22
+cp "$DOWNLOAD" "$out"
+EOF
+  chmod +x "$BIN/curl"
+}
+
+run_bootstrap() {
+  run env PATH="$BIN:$PATH" sh "${BATS_TEST_DIRNAME}/../../install.sh" "$@"
+}
+
+@test "install.sh: installs freeframe and runs install on the latest channel" {
+  bootstrap_setup
+  run_bootstrap --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(cat "$CALLS")" \
+    "https://raw.githubusercontent.com/Techiebutler/freeframe/latest/deploy/freeframe"
+  [ -x "$FF_BIN_DIR/freeframe" ]
+  [ "$(stat -c %a "$FF_BIN_DIR/freeframe" 2>/dev/null || stat -f %Lp "$FF_BIN_DIR/freeframe")" = 755 ]
+  assert_out "ran: install --channel latest --yes"
+}
+
+@test "install.sh: FREEFRAME_CHANNEL picks the ref" {
+  bootstrap_setup
+  export FREEFRAME_CHANNEL=stable
+  run_bootstrap
+  [ "$status" -eq 0 ]
+  grep -q '/stable/deploy/freeframe$' "$CALLS"
+  assert_out "ran: install --channel stable"
+}
+
+@test "install.sh: a download that is not the script is refused" {
+  bootstrap_setup
+  printf '%s\n' '<html>404</html>' >"$DOWNLOAD"
+  run_bootstrap
+  [ "$status" -eq 1 ]
+  [ ! -e "$FF_BIN_DIR/freeframe" ]
+  assert_out "What to try"
+}
+
+@test "install.sh: a failed download says so" {
+  bootstrap_setup
+  export CURL_FAIL=1
+  run_bootstrap
+  [ "$status" -eq 1 ]
+  [ ! -e "$FF_BIN_DIR/freeframe" ]
+}
+
+@test "install.sh: a bad channel name exits 2" {
+  bootstrap_setup
+  export FREEFRAME_CHANNEL='x;rm'
+  run_bootstrap
+  [ "$status" -eq 2 ]
+  [ ! -s "$CALLS" ]
+}
+
+@test "install.sh: not root exits 2" {
+  bootstrap_setup
+  printf '%s\n' '#!/bin/sh' 'echo 1000' >"$BIN/id"
+  chmod +x "$BIN/id"
+  run_bootstrap
+  [ "$status" -eq 2 ]
+  assert_out "sudo"
+  [ ! -s "$CALLS" ]
+}
