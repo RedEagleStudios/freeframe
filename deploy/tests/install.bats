@@ -538,6 +538,71 @@ assert_root_untouched() {
   assert_out "free disk space"
 }
 
+@test "install: a refusal after the log exists names the log and does not claim nothing changed" {
+  plain_answers
+  export FF_RAM_MB=1024
+  ff_install --yes
+  [ "$status" -eq 3 ]
+  assert_out "$FF_ROOT/install.log"
+  if grep -qi "nothing was changed" <<<"$output"; then echo "$output"; false; fi
+}
+
+@test "install: an answer error after the log exists names the log" {
+  plain_answers
+  unset FREEFRAME_ADMIN_EMAIL
+  ff_install --yes
+  [ "$status" -eq 2 ]
+  assert_out "$FF_ROOT/install.log"
+  assert_out "set FREEFRAME_ADMIN_EMAIL (the admin account's email)"
+}
+
+@test "install: a missing answer is named without the prompt's indent" {
+  plain_answers
+  export FREEFRAME_STORAGE=s3 FREEFRAME_S3_ACCESS_KEY=a FREEFRAME_S3_SECRET_KEY=b
+  ff_install --yes
+  [ "$status" -eq 2 ]
+  assert_out "Missing answer: set FREEFRAME_S3_BUCKET (Bucket name)"
+}
+
+@test "install: the endpoint message matches what is accepted" {
+  plain_answers
+  export FREEFRAME_STORAGE=s3 FREEFRAME_S3_BUCKET=footage FREEFRAME_S3_ACCESS_KEY=a \
+    FREEFRAME_S3_SECRET_KEY=b FREEFRAME_S3_ENDPOINT=s3.example.com
+  ff_install --yes
+  [ "$status" -eq 2 ]
+  assert_out "starting with https:// (or http://"
+  export FREEFRAME_S3_ENDPOINT=http://nas.local:9000
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+}
+
+@test "install: cancelling after stopping a program says which one, and how to start it again" {
+  printf '%s\n' "y" "" "certs@example.com" "1" "" "Grace" "grace@example.com" \
+    "long-password-1" "long-password-1" "n" >"$BATS_TEST_TMPDIR/tty"
+  export FF_TTY="$BATS_TEST_TMPDIR/tty"
+  export STUB_SS='LISTEN 0 511 [::]:443 [::]:* users:(("apache2",pid=900,fd=4))'
+  export STUB_UNIT=apache2.service STUB_SS_CLEARS=1
+  ff_install
+  [ "$status" -eq 1 ]
+  assert_out "Install cancelled. Nothing was installed."
+  assert_out "stopped apache2"
+  assert_out "sudo systemctl enable --now apache2.service"
+  assert_out "install.log"
+}
+
+@test "install: an existing stricter FreeFrame folder keeps its mode; a new one is 755" {
+  plain_answers
+  chmod 700 "$FF_ROOT"
+  ff_install --yes
+  [ "$status" -eq 0 ]
+  [ "$(stat -c %a "$FF_ROOT" 2>/dev/null || stat -f %Lp "$FF_ROOT")" = 700 ]
+
+  export FF_ROOT="$BATS_TEST_TMPDIR/fresh/freeframe"
+  ff_install --yes
+  [ "$status" -eq 0 ]
+  [ "$(stat -c %a "$FF_ROOT" 2>/dev/null || stat -f %Lp "$FF_ROOT")" = 755 ]
+}
+
 # ---------------------------------------------------------------- answers
 
 @test "install: with no terminal and no --yes it stops and names --yes" {
@@ -664,7 +729,7 @@ assert_root_untouched() {
   export FF_TTY="$BATS_TEST_TMPDIR/tty"
   ff_install
   [ "$status" -eq 1 ]
-  assert_out "Nothing was changed"
+  assert_out "Nothing was installed"
   assert_not_called install_docker
   assert_not_called fetch
   [ ! -e "$ENV" ]

@@ -501,7 +501,7 @@ require_answer() {
     done
     [[ -n ${!var:-} ]] && return 0
   fi
-  warn "Missing answer: set $envname ($question)"
+  warn "Missing answer: set $envname (${question#"${question%%[![:space:]]*}"})"
   warn "What to try: run the command in a terminal so it can ask you, or set $envname=... before it."
   return 1
 }
@@ -1040,11 +1040,24 @@ say() { printf '%s\n' "$*"; }
 _ff_logged() { "$@" >>"${FF_LOG:-/dev/null}" 2>&1; }
 
 # _ff_stop CODE MESSAGE [WHAT_TO_TRY]: print the message and exit with CODE.
+# Once install.log exists, also say what was already done and where the log
+# is.
 _ff_stop() {
   warn ""
   warn "$2"
   if [[ -n ${3:-} ]]; then warn "What to try: $3"; fi
+  _ff_already_done
+  if [[ -n ${FF_LOG:-} ]]; then warn "Everything the installer did is written to $FF_LOG."; fi
   exit "$1"
+}
+
+# _ff_already_done: name each program the installer stopped to free a port,
+# with the command that starts it again.
+_ff_already_done() {
+  local entry
+  for entry in ${FF_STOPPED[@]+"${FF_STOPPED[@]}"}; do
+    warn "Already done: stopped ${entry%%|*} to free a port for FreeFrame. To start it again: sudo systemctl enable --now ${entry#*|}"
+  done
 }
 
 # _ff_term_say LINE...: print to the terminal only, never into install.log
@@ -1071,6 +1084,7 @@ install_fail() {
   warn "$1"
   if [[ -n ${2:-} ]]; then warn "What to try: $2"; fi
   if [[ -n ${FF_STATE:-} ]]; then warn "$FF_STATE"; fi
+  _ff_already_done
   if [[ -n ${FF_LOG:-} ]]; then warn "Everything the installer did is written to $FF_LOG."; fi
   if [[ -n ${FF_ADMIN_CREATED:-} && -n ${FF_PW_GENERATED:-} ]]; then
     _ff_term_say "" "The admin account for $FF_ADMIN_EMAIL was created, with the password made for you:" \
@@ -1082,6 +1096,15 @@ install_fail() {
 # _ff_answer_error MESSAGE WHAT_TO_TRY: an answer given ahead of time is not
 # usable (exit 2, like any other usage error).
 _ff_answer_error() { _ff_stop 2 "$1" "$2"; }
+
+# _ff_answer_missing: after require_answer has said which answer is
+# missing, exit 2 the same way as every other stop (log named, programs
+# already stopped listed).
+_ff_answer_missing() {
+  _ff_already_done
+  if [[ -n ${FF_LOG:-} ]]; then warn "Everything the installer did is written to $FF_LOG."; fi
+  exit 2
+}
 
 _ff_input_ended() {
   _ff_stop 2 "The answers ended before every question was answered, so nothing was installed." \
@@ -1258,7 +1281,9 @@ _install_check_foreign() {
 _install_log_start() {
   local root
   root=$(ff_root)
-  if ! { mkdir -p "$root" && chmod 755 "$root" && (umask 077 && : >>"$root/install.log") &&
+  # Created as 755; an existing folder keeps its own (possibly stricter) mode.
+  if ! { { [[ -d $root ]] || { mkdir -p "$(dirname "$root")" && mkdir -m 755 "$root"; }; } &&
+    (umask 077 && : >>"$root/install.log") &&
     chmod 600 "$root/install.log"; }; then
     _ff_stop 1 "Cannot create $root for FreeFrame's files." "check that the disk is not full or read-only, then run the installer again."
   fi
@@ -1321,6 +1346,7 @@ _install_check_port() {
   if [[ $unit == *.service ]] && _ff_interactive; then
     say "Port $port is used by $name ($unit). $need"
     if confirm "Stop $name now and keep it from starting again?" N; then
+      FF_STOPPED+=("$name|$unit")
       if ! _ff_logged systemctl disable --now "$unit"; then
         install_fail "Could not stop $name." "stop it yourself (sudo systemctl disable --now $unit), then run the installer again."
       fi
@@ -1344,7 +1370,7 @@ install_preflight() {
   cores=${FF_CORES:-$(_ff_cores)}
   ram=${FF_RAM_MB:-$(_ff_ram_mb)}
   if ((ram < 1800)); then
-    _ff_stop 3 "This server has $ram MB of memory. FreeFrame needs at least 2 GB (4 GB is recommended), so nothing was changed." \
+    _ff_stop 3 "This server has $ram MB of memory. FreeFrame needs at least 2 GB (4 GB is recommended), so the installer stopped before installing anything." \
       "choose a server with 4 GB of memory or more."
   elif ((ram < 3600)); then
     warn "This server has about $(((ram + 512) / 1024)) GB of memory. FreeFrame runs, but 4 GB or more is recommended: large videos will be slow to prepare."
@@ -1366,15 +1392,15 @@ install_preflight() {
   case $FF_DOCKER in
     ok | none) ;;
     snap)
-      _ff_stop 3 "Docker on this server was installed with snap, which FreeFrame cannot use, so nothing was changed." \
+      _ff_stop 3 "Docker on this server was installed with snap, which FreeFrame cannot use, so the installer stopped before installing anything." \
         "if nothing else on this server uses Docker, remove it with: sudo snap remove --purge docker. Then run the installer again: it installs Docker from Docker's own repository."
       ;;
     old*)
-      _ff_stop 3 "This server has Docker ${FF_DOCKER#old }, but FreeFrame needs Docker 24 or newer, so nothing was changed." \
+      _ff_stop 3 "This server has Docker ${FF_DOCKER#old }, but FreeFrame needs Docker 24 or newer, so the installer stopped before installing anything." \
         "update Docker (https://docs.docker.com/engine/install/), or if nothing else on this server uses it, remove it and run the installer again: it then installs a current Docker itself."
       ;;
     nocompose)
-      _ff_stop 3 "Docker is installed without its compose plugin, which FreeFrame needs, so nothing was changed." \
+      _ff_stop 3 "Docker is installed without its compose plugin, which FreeFrame needs, so the installer stopped before installing anything." \
         "install the plugin (sudo apt-get install docker-compose-plugin, or docker-compose-v2 for Ubuntu's own Docker), then run the installer again."
       ;;
     *)
@@ -1478,12 +1504,12 @@ _install_ask_address() {
       "choose one: --domain for your own address, or --https sslip for the automatic one."
   fi
   if [[ ${FF_HTTPS:-auto} == own && -z ${FF_DOMAIN:-} ]]; then
-    require_answer FF_DOMAIN FREEFRAME_DOMAIN "the web address, for example review.yourstudio.com" || exit 2
+    require_answer FF_DOMAIN FREEFRAME_DOMAIN "the web address, for example review.yourstudio.com" || _ff_answer_missing
     FF_DOMAIN=$(_ff_clean_host "$FF_DOMAIN")
     valid_hostname "$FF_DOMAIN" || _ff_answer_error "The web address '$FF_DOMAIN' is not a plain name like review.yourstudio.com." \
       "give only the name, without a port, a path or spaces."
   fi
-  FF_MODE=$(https_mode) || exit 2
+  FF_MODE=$(https_mode) || _ff_answer_missing
   case $FF_MODE in
     own) FF_HOST=$FF_DOMAIN ;;
     sslip)
@@ -1523,7 +1549,7 @@ _install_ask_acme_email() {
       _ff_ask_email FF_ACME_EMAIL "   Email" "${FF_ADMIN_EMAIL:-}"
     else
       FF_ACME_EMAIL=${FF_ADMIN_EMAIL:-}
-      require_answer FF_ACME_EMAIL FREEFRAME_ACME_EMAIL "the email for certificate notices" || exit 2
+      require_answer FF_ACME_EMAIL FREEFRAME_ACME_EMAIL "the email for certificate notices" || _ff_answer_missing
     fi
   fi
   if ! valid_email "$FF_ACME_EMAIL"; then
@@ -1542,22 +1568,22 @@ _install_ask_s3() {
       ask FF_S3_ENDPOINT "   Endpoint (press Enter for AWS S3)" "" || _ff_input_ended
     fi
   fi
-  require_answer FF_S3_BUCKET FREEFRAME_S3_BUCKET "   Bucket name" || exit 2
-  require_answer FF_S3_ACCESS_KEY FREEFRAME_S3_ACCESS_KEY "   Access key" || exit 2
+  require_answer FF_S3_BUCKET FREEFRAME_S3_BUCKET "   Bucket name" || _ff_answer_missing
+  require_answer FF_S3_ACCESS_KEY FREEFRAME_S3_ACCESS_KEY "   Access key" || _ff_answer_missing
   if [[ -z ${FF_S3_SECRET_KEY:-} ]]; then
     if ((interactive)); then
       while [[ -z ${FF_S3_SECRET_KEY:-} ]]; do
         ask_secret FF_S3_SECRET_KEY "   Secret key" || _ff_input_ended
       done
     else
-      require_answer FF_S3_SECRET_KEY FREEFRAME_S3_SECRET_KEY "the bucket's secret key" || exit 2
+      require_answer FF_S3_SECRET_KEY FREEFRAME_S3_SECRET_KEY "the bucket's secret key" || _ff_answer_missing
     fi
   fi
   if ((interactive)) && [[ -z ${FF_S3_REGION:-} ]]; then
     ask FF_S3_REGION "   Region (for Cloudflare R2 type auto)" us-east-1 || _ff_input_ended
   fi
   if [[ -n ${FF_S3_ENDPOINT:-} && ! $FF_S3_ENDPOINT =~ ^https?://[^[:space:]]+$ ]]; then
-    _ff_answer_error "The storage endpoint '$FF_S3_ENDPOINT' must start with https://." "copy the endpoint address exactly as your storage provider shows it."
+    _ff_answer_error "The storage endpoint '$FF_S3_ENDPOINT' must be a web address starting with https:// (or http:// for storage on your own network)." "copy the endpoint address exactly as your storage provider shows it."
   fi
   if [[ ! $FF_S3_BUCKET =~ $re_bucket ]]; then
     _ff_answer_error "The bucket name '$FF_S3_BUCKET' can only hold lowercase letters, digits, dots and hyphens." "check the bucket name at your storage provider."
@@ -1634,7 +1660,7 @@ _install_ask_smtp() {
     _ff_answer_error "The mail server port '$FF_SMTP_PORT' is not a port number." "use the port your email provider gives, usually 587 or 465."
   fi
   if [[ -z ${FF_SMTP_FROM:-} ]] && valid_email "${FF_SMTP_USER:-}"; then FF_SMTP_FROM=$FF_SMTP_USER; fi
-  require_answer FF_SMTP_FROM FREEFRAME_SMTP_FROM "the address emails are sent from" || exit 2
+  require_answer FF_SMTP_FROM FREEFRAME_SMTP_FROM "the address emails are sent from" || _ff_answer_missing
   if ! valid_email "$FF_SMTP_FROM"; then
     _ff_answer_error "'$FF_SMTP_FROM' does not look like an email address (the address emails are sent from)." "give an address such as noreply@yourstudio.com."
   fi
@@ -1649,7 +1675,7 @@ _install_ask_admin() {
   fi
   if [[ -z ${FF_ADMIN_NAME:-} ]]; then
     if _ff_interactive; then
-      require_answer FF_ADMIN_NAME FREEFRAME_ADMIN_NAME "   Your name" || exit 2
+      require_answer FF_ADMIN_NAME FREEFRAME_ADMIN_NAME "   Your name" || _ff_answer_missing
     else
       FF_ADMIN_NAME=Admin
     fi
@@ -1658,7 +1684,7 @@ _install_ask_admin() {
     if _ff_interactive; then
       _ff_ask_email FF_ADMIN_EMAIL "   Your email" ""
     else
-      require_answer FF_ADMIN_EMAIL FREEFRAME_ADMIN_EMAIL "the admin account's email" || exit 2
+      require_answer FF_ADMIN_EMAIL FREEFRAME_ADMIN_EMAIL "the admin account's email" || _ff_answer_missing
     fi
   fi
   if ! valid_email "$FF_ADMIN_EMAIL"; then
@@ -1758,7 +1784,7 @@ _install_questions() {
   _install_ask_admin
   _install_show_summary "$file"
   if _ff_interactive && ! confirm "Install now?" Y; then
-    _ff_stop 1 "Install cancelled. Nothing was changed." "run the install command again when you are ready."
+    _ff_stop 1 "Install cancelled. Nothing was installed." "run the install command again when you are ready."
   fi
 }
 
@@ -2165,6 +2191,7 @@ cmd_install() {
   file="$root/.env.prod"
   FF_STATE="Nothing on this server has been changed yet."
   FF_LOG=""
+  FF_STOPPED=()
   FF_ADDR_FROM_FILE="" FF_SMTP_FROM_FILE="" FF_ADMIN_EXISTED="" FF_CERT_PENDING="" FF_FELL_BACK=""
   FF_ADMIN_CREATED="" FF_PW_GENERATED="" FF_RERUN="the install command"
 
@@ -2184,6 +2211,7 @@ cmd_install() {
   fi
 
   _install_log_start
+  FF_STATE="Nothing has been installed yet; the installer has only written its log."
   trap _install_on_error ERR
   install_preflight
   _install_questions "$file"
