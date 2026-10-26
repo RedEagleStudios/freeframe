@@ -207,3 +207,14 @@ $(ctr freeframe /home/u/freeframe api freeframe-api)"
   run ff_strict detect_foreign_install
   [ "$status" -eq 1 ]
 }
+
+@test "valid_hostname" {
+  local n
+  for n in review.example.com Review-1.Example.com nas 203.0.113.7 a.b-c.d; do
+    run valid_hostname "$n"; [ "$status" -eq 0 ] || { echo "rejected $n"; return 1; }
+  done
+  for n in "" https://a.com a.com:80 a.com/x "a b.com" "a\`b.com" -a.com a-.com a..b a.com. \
+    "a_b.com" ".a.com" "a.com " "$(printf 'x%.0s' {1..64}).com"; do
+    run valid_hostname "$n"; [ "$status" -eq 1 ] || { echo "accepted [$n]"; return 1; }
+  done
+}

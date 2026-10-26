@@ -242,6 +242,17 @@ is_public_ipv4() {
   return 0
 }
 
+# valid_hostname NAME: 0 for a plain host name such as review.yourstudio.com:
+# labels of letters, digits and hyphens (1 to 63 characters, no hyphen at
+# either end) joined by single dots, at most 253 characters in all. No scheme,
+# port, path, spaces, backticks or trailing dot. An IPv4 address also passes.
+# The one validator for every host a person types (derive_env, prompts).
+valid_hostname() {
+  local name=${1:-} label='[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+  ((${#name} >= 1 && ${#name} <= 253)) || return 1
+  [[ $name =~ ^$label(\.$label)*$ ]]
+}
+
 # sslip_host IP: the free automatic address for IP, 1-2-3-4.sslip.io.
 sslip_host() { printf '%s.sslip.io\n' "${1//./-}"; }
 
@@ -578,6 +589,19 @@ derive_env() {
       warn "The server's IP address is not known, so the web address cannot be worked out."
     fi
     return 1
+  fi
+  # Check what was typed (a host already in the file is left as it is).
+  if [[ -z $url ]]; then
+    if [[ $mode == sslip ]] && ! is_public_ipv4 "$ip"; then
+      warn "The automatic sslip.io address needs a public IPv4 address, and '$ip' is not one."
+      warn "What to try: use your own domain (FREEFRAME_DOMAIN), or plain HTTP (FREEFRAME_HTTPS=off) on a local network."
+      return 1
+    fi
+    if ! valid_hostname "$host"; then
+      warn "The web address '$host' is not a plain name like review.yourstudio.com."
+      warn "What to try: type only the name, without http://, a port, a path or spaces."
+      return 1
+    fi
   fi
 
   storage=$(env_get "$file" FREEFRAME_STORAGE)

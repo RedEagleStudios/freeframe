@@ -355,3 +355,46 @@ derive_with_secret() {
   assert_eq "$(grep -c 'JWT_SECRET' "$F")" "1"
   assert_has "$F" "export JWT_SECRET=x"
 }
+
+@test "derive_env refuses a web address that is not a plain host name, naming it" {
+  local long d
+  long=$(printf 'a%.0s' {1..63}).$(printf 'b%.0s' {1..63}).$(printf 'c%.0s' {1..63}).$(printf 'd%.0s' {1..62})
+  [ "${#long}" -eq 254 ]
+  for d in https://review.example.com review.example.com:8443 review.example.com/x \
+    'review example.com' 'a`b.example.com' -bad.example.com bad-.example.com a..b \
+    review.example.com. 'review.example.com ' "$long" 'r_v.example.com' 'review.exa$mple.com'; do
+    rm -f "$F"
+    run derive FF_HTTPS=own FF_DOMAIN="$d" FF_ACME_EMAIL=ops@example.com FF_IP=203.0.113.7
+    if [ "$status" -eq 0 ] || [[ "$output" != *"'$d'"* ]] || [ -s "$F" ]; then
+      echo "accepted or not named: [$d] status=$status output=$output"
+      return 1
+    fi
+  done
+}
+
+@test "derive_env accepts plain host names" {
+  local ok
+  ok=$(printf 'a%.0s' {1..63}).$(printf 'b%.0s' {1..63}).$(printf 'c%.0s' {1..63}).$(printf 'd%.0s' {1..61})
+  [ "${#ok}" -eq 253 ]
+  for d in Review-1.Example.com nas "$ok" xn--bcher-kva.example; do
+    rm -f "$F"
+    run derive FF_HTTPS=own FF_DOMAIN="$d" FF_ACME_EMAIL=ops@example.com FF_IP=203.0.113.7
+    [ "$status" -eq 0 ] || { echo "rejected: $d: $output"; return 1; }
+  done
+}
+
+@test "HTTP mode checks a typed host name too" {
+  run derive FF_HTTPS=off FF_DOMAIN='http://nas.local'
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"'http://nas.local'"* ]]
+}
+
+@test "sslip mode needs a public IPv4 and names the address it got" {
+  run derive FF_HTTPS=sslip FF_IP=192.168.1.20
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"'192.168.1.20'"* ]]
+  [ ! -s "$F" ]
+  run derive FF_HTTPS=sslip FF_IP=999.1.1.1
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"'999.1.1.1'"* ]]
+}
