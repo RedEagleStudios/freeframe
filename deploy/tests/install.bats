@@ -17,6 +17,8 @@ setup() {
   export FF_OS_RELEASE="$BATS_TEST_TMPDIR/os-release"
   os_release ubuntu 24.04 noble
   export FF_CORES=4 FF_RAM_MB=8192
+  # Where `install` puts the freeframe command (never the real /usr/local/bin).
+  export FF_BIN_DIR="$BATS_TEST_TMPDIR/bin-dir"
   ENV="$FF_ROOT/.env.prod"
 }
 
@@ -213,6 +215,52 @@ assert_root_untouched() {
   assert_out "stopped unexpectedly"
   assert_out "install.log"
   assert_out "sudo freeframe install again"
+}
+
+@test "install: installs the freeframe command (mode 755) once it goes ahead" {
+  plain_answers
+  ff_install --yes
+  [ "$status" -eq 0 ]
+  cmp "$FF_SCRIPT" "$FF_BIN_DIR/freeframe"
+  [ "$(stat -c %a "$FF_BIN_DIR/freeframe" 2>/dev/null || stat -f %Lp "$FF_BIN_DIR/freeframe")" = 755 ]
+}
+
+@test "install: refused, cancelled and already-installed runs leave the command alone" {
+  plain_answers
+  os_release debian 11 bullseye
+  ff_install --yes
+  [ "$status" -eq 3 ]
+  [ ! -e "$FF_BIN_DIR/freeframe" ]
+
+  os_release ubuntu 24.04 noble
+  export FF_RAM_MB=1024
+  ff_install --yes
+  [ "$status" -eq 3 ]
+  [ ! -e "$FF_BIN_DIR/freeframe" ]
+  export FF_RAM_MB=8192
+
+  unset FREEFRAME_ADMIN_EMAIL
+  ff_install --yes
+  [ "$status" -eq 2 ]
+  [ ! -e "$FF_BIN_DIR/freeframe" ]
+  export FREEFRAME_ADMIN_EMAIL=admin@example.com
+
+  unset FREEFRAME_HTTPS FREEFRAME_ADMIN_NAME FREEFRAME_ADMIN_EMAIL FREEFRAME_ADMIN_PASSWORD
+  printf '%s\n' "" "certs@example.com" "1" "" "Grace" "grace@example.com" \
+    "long-password-1" "long-password-1" "n" >"$BATS_TEST_TMPDIR/tty"
+  FF_TTY="$BATS_TEST_TMPDIR/tty" ff_install
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  assert_out "Install cancelled"
+  [ ! -e "$FF_BIN_DIR/freeframe" ]
+
+  plain_answers
+  mkdir -p "$FF_BIN_DIR"
+  printf 'old copy\n' >"$FF_BIN_DIR/freeframe"
+  : >"$ENV"
+  : >"$FF_ROOT/.installed"
+  ff_install --yes
+  [ "$status" -eq 0 ]
+  assert_eq "$(cat "$FF_BIN_DIR/freeframe")" "old copy"
 }
 
 # ---------------------------------------------------------------- re-runs
@@ -902,11 +950,12 @@ assert_root_untouched() {
 
 bootstrap_setup() {
   BIN="$BATS_TEST_TMPDIR/bin"
-  mkdir -p "$BIN" "$BATS_TEST_TMPDIR/dest"
-  export FF_BIN_DIR="$BATS_TEST_TMPDIR/dest"
+  mkdir -p "$BIN" "$BATS_TEST_TMPDIR/tmp"
+  # Where mktemp puts the download, so a test can see it is cleaned up.
+  export TMPDIR="$BATS_TEST_TMPDIR/tmp"
   # The script curl "downloads": it reports how it was run.
   export DOWNLOAD="$BATS_TEST_TMPDIR/download"
-  printf '%s\n' '#!/usr/bin/env bash' 'echo "ran: $*"' >"$DOWNLOAD"
+  printf '%s\n' '#!/usr/bin/env bash' 'echo "ran: $*"' 'exit "${FAKE_RC:-0}"' >"$DOWNLOAD"
   cat >"$BIN/curl" <<'EOF'
 #!/bin/sh
 out=""
@@ -920,22 +969,33 @@ done
 [ -n "${CURL_FAIL:-}" ] && exit 22
 cp "$DOWNLOAD" "$out"
 EOF
-  chmod +x "$BIN/curl"
+  # A Docker with nothing on it, for runs of the real script.
+  printf '%s\n' '#!/bin/sh' 'exit 0' >"$BIN/docker"
+  chmod +x "$BIN/curl" "$BIN/docker"
 }
 
 run_bootstrap() {
   run env PATH="$BIN:$PATH" sh "${BATS_TEST_DIRNAME}/../../install.sh" "$@"
 }
 
-@test "install.sh: installs freeframe and runs install on the latest channel" {
+@test "install.sh: runs the downloaded install on the latest channel and writes nothing" {
   bootstrap_setup
   run_bootstrap --yes
   [ "$status" -eq 0 ] || { echo "$output"; false; }
   assert_eq "$(cat "$CALLS")" \
     "https://raw.githubusercontent.com/Techiebutler/freeframe/latest/deploy/freeframe"
-  [ -x "$FF_BIN_DIR/freeframe" ]
-  [ "$(stat -c %a "$FF_BIN_DIR/freeframe" 2>/dev/null || stat -f %Lp "$FF_BIN_DIR/freeframe")" = 755 ]
   assert_out "ran: install --channel latest --yes"
+  [ ! -e "$FF_BIN_DIR/freeframe" ]
+  # The temporary download is gone afterwards.
+  [ -z "$(ls -A "$TMPDIR")" ]
+}
+
+@test "install.sh: passes on the exit code of freeframe install" {
+  bootstrap_setup
+  export FAKE_RC=3
+  run_bootstrap --yes
+  [ "$status" -eq 3 ]
+  [ -z "$(ls -A "$TMPDIR")" ]
 }
 
 @test "install.sh: FREEFRAME_CHANNEL picks the ref" {
@@ -947,13 +1007,36 @@ run_bootstrap() {
   assert_out "ran: install --channel stable"
 }
 
+@test "install.sh: --channel picks the ref the script is downloaded from" {
+  bootstrap_setup
+  export FREEFRAME_CHANNEL=stable
+  run_bootstrap --yes --channel v1.22.0
+  [ "$status" -eq 0 ]
+  grep -q '/v1.22.0/deploy/freeframe$' "$CALLS"
+  assert_out "ran: install --channel v1.22.0 --yes --channel v1.22.0"
+  : >"$CALLS"
+  run_bootstrap --channel=latest
+  [ "$status" -eq 0 ]
+  grep -q '/latest/deploy/freeframe$' "$CALLS"
+}
+
 @test "install.sh: a download that is not the script is refused" {
   bootstrap_setup
   printf '%s\n' '<html>404</html>' >"$DOWNLOAD"
   run_bootstrap
   [ "$status" -eq 1 ]
-  [ ! -e "$FF_BIN_DIR/freeframe" ]
   assert_out "What to try"
+  assert_out "sudo FREEFRAME_CHANNEL=latest bash"
+  [ -z "$(ls -A "$TMPDIR")" ]
+}
+
+@test "install.sh: a cut-off download (bash -n fails) is refused and not run" {
+  bootstrap_setup
+  printf '%s\n' '#!/usr/bin/env bash' 'echo "ran: $*"' 'main() {' '  if true; then' >"$DOWNLOAD"
+  run_bootstrap
+  [ "$status" -eq 1 ]
+  if grep -q "ran:" <<<"$output"; then echo "$output"; false; fi
+  assert_out "not a complete freeframe command"
 }
 
 @test "install.sh: a failed download says so" {
@@ -961,7 +1044,7 @@ run_bootstrap() {
   export CURL_FAIL=1
   run_bootstrap
   [ "$status" -eq 1 ]
-  [ ! -e "$FF_BIN_DIR/freeframe" ]
+  assert_out "sudo FREEFRAME_CHANNEL=latest bash"
 }
 
 @test "install.sh: a bad channel name exits 2" {
@@ -972,12 +1055,37 @@ run_bootstrap() {
   [ ! -s "$CALLS" ]
 }
 
-@test "install.sh: not root exits 2" {
+@test "install.sh: not root exits 2 and shows the sudo form that keeps the channel" {
   bootstrap_setup
   printf '%s\n' '#!/bin/sh' 'echo 1000' >"$BIN/id"
   chmod +x "$BIN/id"
   run_bootstrap
   [ "$status" -eq 2 ]
-  assert_out "sudo"
+  assert_out "| sudo FREEFRAME_CHANNEL=latest bash"
   [ ! -s "$CALLS" ]
+}
+
+@test "install.sh with the real script: a refused run leaves no freeframe command" {
+  bootstrap_setup
+  cp "$FF_SCRIPT" "$DOWNLOAD"
+  os_release debian 11 bullseye
+  run_bootstrap --yes
+  [ "$status" -eq 3 ] || { echo "$output"; false; }
+  assert_out "not supported yet"
+  [ ! -e "$FF_BIN_DIR/freeframe" ]
+  assert_root_untouched
+}
+
+@test "install.sh with the real script: an installed server keeps its freeframe command" {
+  bootstrap_setup
+  cp "$FF_SCRIPT" "$DOWNLOAD"
+  mkdir -p "$FF_BIN_DIR"
+  printf '%s\n' '#!/usr/bin/env bash' '# the installed copy' >"$FF_BIN_DIR/freeframe"
+  cp "$FF_BIN_DIR/freeframe" "$BATS_TEST_TMPDIR/bin.before"
+  : >"$ENV"
+  : >"$FF_ROOT/.installed"
+  run_bootstrap --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "already installed"
+  cmp "$FF_BIN_DIR/freeframe" "$BATS_TEST_TMPDIR/bin.before"
 }

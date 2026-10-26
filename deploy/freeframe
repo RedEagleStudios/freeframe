@@ -830,6 +830,8 @@ backup_prune() {
 #   FF_FETCH_FROM_DIR=DIR  copy the compose files from DIR instead of
 #                          downloading them
 #   FF_OS_RELEASE=FILE     read FILE instead of /etc/os-release
+#   FF_BIN_DIR=DIR         install the freeframe command into DIR instead
+#                          of /usr/local/bin
 # Waits, in seconds (also for unusually slow servers): FF_API_WAIT (600),
 # FF_HEALTH_WAIT (300), FF_CERT_WAIT (300 per name), FF_DNS_WAIT (1800,
 # unattended runs only; with a terminal the installer waits until told).
@@ -1093,7 +1095,7 @@ _install_on_error() {
   if ((BASH_SUBSHELL > 0)); then exit "$code"; fi
   trap - ERR
   install_fail "The installer stopped unexpectedly while ${FF_STEP:-checking the server} (error $code)." \
-    "look at the end of ${FF_LOG:-the output above} for the reason, then run sudo freeframe install again."
+    "look at the end of ${FF_LOG:-the output above} for the reason, then run ${FF_RERUN:-the install command} again."
 }
 
 _ff_interactive() { [[ -z ${FF_YES:-} ]] && _ff_has_tty; }
@@ -1202,6 +1204,20 @@ switch_to_http_mode() {
 # ------------------------------------------------------------
 # Install: the steps, in the order cmd_install runs them
 # ------------------------------------------------------------
+
+# _install_self: put this script at /usr/local/bin/freeframe (mode 755), so
+# the other commands exist afterwards. install.sh runs a downloaded copy and
+# writes nothing itself; this runs only once the install is going ahead, so
+# a refused or cancelled run leaves no command behind, and an installed
+# server's command is replaced only by `freeframe update`.
+_install_self() {
+  local src=${BASH_SOURCE[0]} dir=${FF_BIN_DIR:-/usr/local/bin}
+  [[ -f $src ]] || install_fail "Cannot find the freeframe script that is running ($src)." "run the install command again."
+  if [[ -e $dir/freeframe ]] && cmp -s "$src" "$dir/freeframe"; then return 0; fi
+  if ! { mkdir -p "$dir" && install -m 755 "$src" "$dir/freeframe"; }; then
+    install_fail "Could not install the freeframe command into $dir." "check that the disk is not full or read-only, then run the install command again."
+  fi
+}
 
 _install_check_system() {
   local id ver pretty arch
@@ -1742,7 +1758,7 @@ _install_questions() {
   _install_ask_admin
   _install_show_summary "$file"
   if _ff_interactive && ! confirm "Install now?" Y; then
-    _ff_stop 1 "Install cancelled. Nothing was changed." "run sudo freeframe install again when you are ready."
+    _ff_stop 1 "Install cancelled. Nothing was changed." "run the install command again when you are ready."
   fi
 }
 
@@ -2123,7 +2139,7 @@ cmd_install() {
   FF_STATE="Nothing on this server has been changed yet."
   FF_LOG=""
   FF_ADDR_FROM_FILE="" FF_SMTP_FROM_FILE="" FF_ADMIN_EXISTED="" FF_CERT_PENDING="" FF_FELL_BACK=""
-  FF_ADMIN_CREATED="" FF_PW_GENERATED=""
+  FF_ADMIN_CREATED="" FF_PW_GENERATED="" FF_RERUN="the install command"
 
   # Refusals first: nothing is written before these pass.
   _install_check_system
@@ -2145,6 +2161,9 @@ cmd_install() {
   install_preflight
   _install_questions "$file"
 
+  # From here on the server is changed.
+  _install_self
+  FF_RERUN="sudo freeframe install"
   _install_docker_step
   _install_swap_step
   _install_ufw_step
