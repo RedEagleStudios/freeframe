@@ -1365,3 +1365,17 @@ run_bootstrap() {
   assert_out "already installed"
   cmp "$FF_BIN_DIR/freeframe" "$BATS_TEST_TMPDIR/bin.before"
 }
+
+# ---------------------------------------------------------------- hints and state lines
+
+@test "install: a program is listed as stopped only when stopping it worked" {
+  printf '%s\n' "y" "" "certs@example.com" "1" "" "Grace" "grace@example.com" \
+    "long-password-1" "long-password-1" "y" >"$BATS_TEST_TMPDIR/tty"
+  export FF_TTY="$BATS_TEST_TMPDIR/tty"
+  export STUB_SS='LISTEN 0 511 [::]:443 [::]:* users:(("apache2",pid=900,fd=4))'
+  export STUB_UNIT=apache2.service STUB_SYSTEMCTL_FAIL=1
+  ff_install
+  [ "$status" -eq 1 ]
+  assert_out "Could not stop apache2."
+  if [[ $output == *"Already done: stopped apache2"* ]]; then echo "$output"; false; fi
+}

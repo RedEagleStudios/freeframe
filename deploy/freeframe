@@ -1410,10 +1410,12 @@ _install_check_port() {
   if [[ $unit == *.service ]] && _ff_interactive; then
     say "Port $port is used by $name ($unit). $need"
     if confirm "Stop $name now and keep it from starting again?" N; then
-      FF_STOPPED+=("$name|$unit")
       if ! _ff_logged systemctl disable --now "$unit"; then
         install_fail "Could not stop $name." "stop it yourself (sudo systemctl disable --now $unit), then run the installer again."
       fi
+      # Listed as stopped (with the command that starts it again) only once
+      # it really was.
+      FF_STOPPED+=("$name|$unit")
       if [[ -n $(port_holder "$port") ]]; then
         install_fail "Port $port is still in use after stopping $name." "find what holds it with: sudo ss -ltnp, stop it, then run the installer again."
       fi

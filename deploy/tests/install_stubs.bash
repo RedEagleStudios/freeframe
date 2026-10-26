@@ -50,6 +50,8 @@ ss() {
 _ff_unit_of_pid() { printf '%s\n' "${STUB_UNIT:-}"; }
 systemctl() {
   _stub_log "systemctl $*"
+  # STUB_SYSTEMCTL_FAIL: stopping a program fails (it keeps the port).
+  [[ -z ${STUB_SYSTEMCTL_FAIL:-} ]] || return 1
   [[ -n ${STUB_SS_CLEARS:-} ]] && STUB_SS=""
   return 0
 }
