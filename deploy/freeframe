@@ -1979,6 +1979,26 @@ _install_create_admin() {
   esac
 }
 
+# _install_traefik_closed: make sure Traefik is not running before the admin
+# account is created, so the setup endpoint is never reachable from outside.
+# An earlier attempt may have left it running: stop it. Fails closed when
+# that cannot be confirmed.
+_install_traefik_closed() {
+  local running
+  FF_STEP="checking that FreeFrame is still closed to the outside"
+  running=$(dc ps -q traefik 2>>"$FF_LOG") ||
+    install_fail "Could not check whether FreeFrame's web entrance (Traefik) is running, so the installer stopped before creating the admin account." \
+      "run sudo freeframe install again; the reason is at the end of the log."
+  [[ -n $running ]] || return 0
+  say "Closing FreeFrame to the outside until the admin account exists (an earlier attempt left it open)..."
+  _ff_logged dc stop traefik || true
+  running=$(dc ps -q traefik 2>>"$FF_LOG") || running=unknown
+  if [[ -n $running ]]; then
+    install_fail "FreeFrame's web entrance (Traefik) is still running, so the installer stopped before creating the admin account, to keep the setup page private." \
+      "run: sudo docker compose --project-name freeframe stop traefik (in /opt/freeframe), then run sudo freeframe install again."
+  fi
+}
+
 _install_start_step() {
   local out s
   local -a all=() svcs=()
@@ -1996,12 +2016,19 @@ _install_start_step() {
   for s in "${all[@]}"; do
     if [[ -n $s && $s != traefik ]]; then svcs+=("$s"); fi
   done
+  # Fail closed: the first start must include the API and must not include
+  # Traefik, whatever the downloaded compose files say.
+  if ((${#svcs[@]} == 0)) || [[ " ${svcs[*]} " != *" api "* || " ${svcs[*]} " == *" traefik "* ]]; then
+    install_fail "The downloaded setup files do not describe FreeFrame as expected (services: ${all[*]:-none})." \
+      "run sudo freeframe install again to download them again. If it keeps happening, report it at https://github.com/Techiebutler/freeframe/issues"
+  fi
   say "Starting FreeFrame (not reachable from outside yet)..."
   if ! _ff_logged dc up -d --no-build "${svcs[@]}"; then
     install_fail "FreeFrame could not be started." "run sudo freeframe install again; the reason is at the end of the log."
   fi
   FF_STATE="FreeFrame is running but cannot be reached from outside yet. Running sudo freeframe install again keeps your settings and continues from here."
   _install_wait_api
+  _install_traefik_closed
   _install_create_admin
   FF_STEP="opening FreeFrame to the outside"
   if ! _ff_logged dc up -d --no-build traefik; then

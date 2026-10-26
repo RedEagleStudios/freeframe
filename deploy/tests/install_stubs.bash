@@ -91,6 +91,10 @@ dc() {
   _stub_log "dc $*"
   case "$*" in
     "config --services")
+      if [[ -n ${STUB_SERVICES+x} ]]; then
+        [[ -z $STUB_SERVICES ]] || printf '%s\n' $STUB_SERVICES
+        return 0
+      fi
       printf '%s\n' traefik postgres redis api worker email_worker maintenance_worker beat web
       if [[ $(env_get "$(ff_root)/.env.prod" FREEFRAME_STORAGE) == bundled ]]; then
         printf '%s\n' minio minio-init
@@ -105,7 +109,14 @@ dc() {
       ;;
     "up -d --no-build traefik") [[ -z ${STUB_TRAEFIK_FAIL:-} ]] ;;
     *"localhost:8000/health"*) [[ -z ${STUB_API_DOWN:-} ]] ;;
+    # Our own containers from an earlier attempt (STUB_OURS_RUNNING).
+    # `stop traefik` stops it, unless STUB_TRAEFIK_STUCK.
+    "ps -q traefik")
+      [[ -n ${STUB_OURS_RUNNING:-} && ! -e $STUB_DIR/traefik-stopped ]] || return 0
+      echo 0123456789ab
+      ;;
     "ps -q "*) [[ -z ${STUB_OURS_RUNNING:-} ]] || echo 0123456789ab ;;
+    "stop traefik") [[ -n ${STUB_TRAEFIK_STUCK:-} ]] || : >"$STUB_DIR/traefik-stopped" ;;
     pull*) [[ -z ${STUB_PULL_FAIL:-} ]] ;;
     *) return 0 ;;
   esac

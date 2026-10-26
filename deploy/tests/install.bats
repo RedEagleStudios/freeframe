@@ -128,6 +128,48 @@ assert_root_untouched() {
   ((traefik > admin))
 }
 
+@test "install: fails closed when the setup files have no api service" {
+  plain_answers
+  export STUB_SERVICES="traefik postgres redis web"
+  ff_install --yes
+  [ "$status" -eq 1 ]
+  assert_out "do not describe FreeFrame as expected"
+  assert_not_called "dc up -d"
+  assert_not_called create-superadmin
+}
+
+@test "install: fails closed when the setup files list no services" {
+  plain_answers
+  export STUB_SERVICES=""
+  ff_install --yes
+  [ "$status" -eq 1 ]
+  assert_not_called "dc up -d"
+}
+
+@test "install: a traefik left running by an earlier attempt is stopped before the admin call" {
+  plain_answers
+  export STUB_HEALTH_FAIL=1 FF_HEALTH_WAIT=10
+  ff_install --yes
+  [ "$status" -eq 1 ]
+  unset STUB_HEALTH_FAIL
+  : >"$CALLS"
+  export STUB_OURS_RUNNING=1
+  export STUB_SS='LISTEN 0 4096 0.0.0.0:80 0.0.0.0:* users:(("docker-proxy",pid=4242,fd=7))'
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_order "dc up -d --no-build postgres" "dc ps -q traefik" "dc stop traefik" "dc ps -q traefik" \
+    create-superadmin "dc up -d --no-build traefik"
+}
+
+@test "install: a traefik that will not stop stops the install before the admin call" {
+  plain_answers
+  export STUB_OURS_RUNNING=1 STUB_TRAEFIK_STUCK=1
+  ff_install --yes
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  assert_out "keep the setup page private"
+  assert_not_called create-superadmin
+}
+
 @test "install: the admin answers go to the setup endpoint as JSON on stdin" {
   plain_answers
   ff_install --yes
