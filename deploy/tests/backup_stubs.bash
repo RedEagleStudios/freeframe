@@ -32,6 +32,16 @@ fi
 _stub_db() { cat "$STUB_DIR/dbstate" 2>/dev/null || printf '%s' "${STUB_DB_STATE:-data}"; }
 _stub_db_set() { printf '%s' "$1" >"$STUB_DIR/dbstate"; }
 
+# STUB_UNDO_SET_HANG: hang right after the undo record is written, before the
+# drop (for the signal tests). Wraps the real function.
+if [[ -n ${STUB_UNDO_SET_HANG:-} ]]; then
+  eval "_real_restore_undo_set() $(declare -f _restore_undo_set | tail -n +2)"
+  _restore_undo_set() {
+    _real_restore_undo_set "$@" || return 1
+    _stub_hang undo-set
+  }
+fi
+
 # _stub_hang NAME: for the signal tests. Note this process group (the test
 # signals all of it, as systemctl stop and Ctrl-C do), say the long step has
 # started, and wait.
@@ -92,6 +102,7 @@ dc() {
       if [[ $(_stub_db) == empty ]]; then echo 0; else echo 42; fi
       ;;
     "exec -T postgres dropdb "*)
+      [[ -z ${STUB_DROP_HANG:-} ]] || _stub_hang dropdb
       [[ -z ${STUB_DROP_FAIL:-} ]] || return 1
       _stub_db_set absent
       ;;
@@ -108,7 +119,10 @@ dc() {
     *"localhost:8000/health"*) [[ -z ${STUB_API_DOWN:-} ]] ;;
     "up -d --no-build postgres") [[ -z ${STUB_PG_DOWN:-} ]] ;;
     "up -d"*) [[ -z ${STUB_UP_FAIL:-} ]] ;;
-    "stop "*) [[ -z ${STUB_STOP_FAIL:-} ]] ;;
+    "stop "*)
+      [[ -z ${STUB_STOP_HANG:-} ]] || _stub_hang stop
+      [[ -z ${STUB_STOP_FAIL:-} ]]
+      ;;
     *) return 0 ;;
   esac
 }

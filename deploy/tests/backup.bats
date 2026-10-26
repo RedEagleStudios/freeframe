@@ -528,23 +528,97 @@ dumps() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null) || true; }
   if [[ $output == *"to go back to it"* ]]; then echo "$output"; false; fi
 }
 
-@test "restore: a retry over a database with data copies it too, but the undo stays the first copy" {
+@test "restore: a retry over a database with data takes a new copy and offers it as the undo" {
   old_backup 20261020-030000
   export STUB_API_DOWN=1 FF_API_WAIT=10
-  # Attempt 1 puts the backup back but FreeFrame does not come up: not done.
+  # Attempt 1 puts the backup back but FreeFrame does not come up.
   ff restore --yes "$BK/freeframe-20261020-030000.dump"
   [ "$status" -eq 1 ]
   local safety1
   safety1=$(dumps | tail -1)
-  [ -e "$FF_ROOT/.restore-undo" ]
   unset STUB_API_DOWN
   sleep 1
   ff restore --yes "$BK/freeframe-20261020-030000.dump"
   [ "$status" -eq 0 ] || { echo "$output"; false; }
-  grep -q 'pg_dump' "$CALLS"
-  assert_out "is kept too: $BK/$safety1"
-  assert_out "to go back to it, run: sudo freeframe restore --yes '$BK/$safety1'"
+  local safety2
+  safety2=$(dumps | tail -1)
+  [[ $safety2 != "$safety1" ]]
+  assert_out "to go back to it, run: sudo freeframe restore --yes '$BK/$safety2'"
+  if [[ $output == *"$safety1"* ]]; then echo "$output"; false; fi
   [ ! -e "$FF_ROOT/.restore-undo" ]
+}
+
+@test "restore: FreeFrame not starting after the backup is back leaves no undo record" {
+  old_backup 20261020-030000
+  export STUB_UP_FAIL=1
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  assert_out "The backup has been put back, but FreeFrame could not be started again."
+  local safety
+  safety=$(dumps | tail -1)
+  # This run's copy is still named as the way back.
+  assert_out "to go back to it, run: sudo freeframe restore --yes '$BK/$safety'"
+  [ ! -e "$FF_ROOT/.restore-undo" ]
+}
+
+@test "restore: a health timeout after the backup is back leaves no undo record" {
+  old_backup 20261020-030000
+  export STUB_API_DOWN=1 FF_API_WAIT=10
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  assert_out "did not finish starting"
+  [ ! -e "$FF_ROOT/.restore-undo" ]
+}
+
+@test "restore: stopped after the copy is recorded but before the drop, the record is dropped too" {
+  # The database still has its data, so a record would only mislead a later
+  # restore (and a retry takes a fresh copy anyway).
+  old_backup 20261020-030000
+  export STUB_UNDO_SET_HANG=1
+  ff_signal TERM undo-set restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  assert_not_called dropdb
+  [ ! -e "$FF_ROOT/.restore-undo" ]
+  assert_out "the database has not been changed"
+}
+
+@test "restore: a stale record over a database with data is replaced by a fresh copy" {
+  old_backup 20261001-030000 "weeks old"
+  old_backup 20261020-030000
+  printf '%s\n' "$BK/freeframe-20261001-030000.dump" >"$FF_ROOT/.restore-undo"
+  # Stop after the drop, so the record can be looked at mid-way.
+  export STUB_RESTORE_FAIL=1
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  local fresh
+  fresh=$(dumps | tail -1)
+  assert_eq "$(cat "$BK/$fresh")" "PGDMP current database v2"
+  assert_eq "$(cat "$FF_ROOT/.restore-undo")" "$BK/$fresh"
+  assert_out "its copy ($BK/freeframe-20261001-030000.dump) is an ordinary backup again"
+  assert_out "run: sudo freeframe restore --yes '$BK/$fresh'"
+  if [[ $output == *"restore --yes '$BK/freeframe-20261001-030000.dump'"* ]]; then echo "$output"; false; fi
+  # A successful run then offers the fresh copy and clears the record.
+  unset STUB_RESTORE_FAIL
+  printf '%s\n' "$BK/freeframe-20261001-030000.dump" >"$FF_ROOT/.restore-undo"
+  rm -f "$STUB_DIR/dbstate"
+  sleep 1
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  fresh=$(dumps | tail -1)
+  assert_out "The database as it was before is saved; to go back to it, run: sudo freeframe restore --yes '$BK/$fresh'"
+  [ ! -e "$FF_ROOT/.restore-undo" ]
+}
+
+@test "restore: putting the recorded copy back over data offers the new copy, not the file itself" {
+  old_backup 20261020-030000
+  printf '%s\n' "$BK/freeframe-20261020-030000.dump" >"$FF_ROOT/.restore-undo"
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  if [[ $output == *"kept too"* || $output == *"ordinary backup again"* ]]; then echo "$output"; false; fi
+  local s2
+  s2=$(dumps | tail -1)
+  [[ $s2 != freeframe-20261020-030000.dump ]]
+  assert_out "to go back to it, run: sudo freeframe restore --yes '$BK/$s2'"
 }
 
 @test "restore: a recorded copy that was deleted is said, and the record dropped" {

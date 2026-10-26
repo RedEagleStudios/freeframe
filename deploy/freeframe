@@ -2691,10 +2691,13 @@ _restore_resolve() {
 }
 
 # The undo record ($FF_ROOT/.restore-undo, mode 600): the path of the safety
-# copy taken by a restore that has not finished yet. A retry keeps pointing
-# at it instead of copying the empty database the failed attempt left, and
-# backup_create keeps it out of pruning and the size rule. Cleared when a
-# restore succeeds.
+# copy taken by a restore whose database may now be empty or gone. A retry
+# over an absent or empty database keeps pointing at it instead of copying
+# that empty database; over a database with data a retry takes a fresh copy,
+# which replaces the record. backup_create keeps the recorded copy out of
+# pruning and the size rule. Cleared as soon as pg_restore succeeds (the
+# database is whole again), and when the run that wrote it stops before the
+# drop began.
 _restore_undo_file() { printf '%s/.restore-undo' "$(ff_root)"; }
 
 # _restore_undo_path: the recorded safety copy, when it still exists.
@@ -2714,6 +2717,14 @@ _restore_undo_set() {
 }
 
 _restore_undo_clear() { rm -f "$(_restore_undo_file)"; }
+
+# _restore_forget_new_record: this run recorded its own copy, then stopped
+# before dropping the database. The database still has its data, so the
+# record would only mislead a later restore.
+_restore_forget_new_record() {
+  if [[ -n ${FF_RECORD_NEW:-} && -z ${FF_DROP_STARTED:-} ]]; then _restore_undo_clear; fi
+  return 0
+}
 
 # _restore_db_state: what is in FreeFrame's database now, asked through the
 # maintenance database: absent, empty (no tables, as a failed restore leaves
@@ -2759,6 +2770,7 @@ _restore_on_error() {
   if ((BASH_SUBSHELL > 0)); then exit "$code"; fi
   trap - ERR
   _ff_backup_cleanup
+  _restore_forget_new_record
   _restore_report "The restore stopped unexpectedly while ${FF_STEP:-restoring} (error $code)." \
     "look at the end of ${FF_LOG:-the output above} for the reason."
 }
@@ -2783,6 +2795,7 @@ _restore_on_signal() {
   trap '' INT TERM HUP
   trap - ERR
   _ff_backup_cleanup
+  _restore_forget_new_record
   _restore_report "The restore was stopped (SIG$1) while ${FF_STEP:-restoring}, before it finished." \
     "to finish it, run: $FF_RERUN"
 }
@@ -2839,6 +2852,7 @@ cmd_restore() {
   FF_ADMIN_CREATED="" FF_PW_GENERATED=""
   FF_RERUN="sudo freeframe restore --yes $(_ff_q "$dump")"
   FF_STATE="Nothing has been changed."
+  FF_RECORD_NEW="" FF_DROP_STARTED=""
   _install_log_start restore
   trap _restore_on_error ERR
   trap '_restore_on_signal INT' INT
@@ -2889,17 +2903,20 @@ cmd_restore() {
       _restore_fail "$(_restore_restart)" "No copy of the current database could be saved, so the restore stopped before changing anything." \
         "fix what the message above says, then run: $FF_RERUN"
     fi
-    if [[ -n $recorded ]]; then
-      say "Saved the current database as $FF_BACKUP_MADE"
-      say "The copy from before the earlier restore that did not finish is kept too: $recorded"
-    else
-      recorded=$FF_BACKUP_MADE
-      if ! _restore_undo_set "$recorded"; then
-        _restore_fail "$(_restore_restart)" "The copy of the current database ($recorded) could not be recorded, so the restore stopped before changing anything." \
-          "check that the disk is not full, then run: $FF_RERUN"
-      fi
-      say "Saved the current database as $recorded"
+    # The database has data, so this copy is the way back: it replaces any
+    # record left by an earlier restore (whose database is no longer the
+    # one there now). Flagged first: a signal while it is written must
+    # still drop it.
+    FF_RECORD_NEW=1
+    if ! _restore_undo_set "$FF_BACKUP_MADE"; then
+      _restore_fail "$(_restore_restart)" "The copy of the current database ($FF_BACKUP_MADE) could not be recorded, so the restore stopped before changing anything." \
+        "check that the disk is not full, then run: $FF_RERUN"
     fi
+    say "Saved the current database as $FF_BACKUP_MADE"
+    if [[ -n $recorded && $recorded != "$dump" ]]; then
+      say "An earlier restore had not finished; its copy ($recorded) is an ordinary backup again."
+    fi
+    recorded=$FF_BACKUP_MADE
   elif [[ -n $recorded ]]; then
     say "The database is empty after an earlier restore that did not finish, so there is nothing new to save."
     say "The copy from before that restore is kept: $recorded"
@@ -2915,7 +2932,11 @@ cmd_restore() {
 
   FF_STEP="removing the current database"
   say "Replacing the database with the backup..."
+  FF_DROP_STARTED=1
   if ! _ff_logged dc exec -T postgres dropdb -U "$FF_PG_USER" --if-exists --force "$FF_PG_DB"; then
+    # DROP DATABASE either happens or not: the database is unchanged.
+    FF_DROP_STARTED=""
+    _restore_forget_new_record
     _restore_fail "$(_restore_restart)" "The current database could not be removed, so it is unchanged." \
       "the reason is at the end of $FF_LOG. Then run: $FF_RERUN"
   fi
@@ -2930,6 +2951,9 @@ cmd_restore() {
     _restore_fail "The database is empty now: the backup goes back in one piece or not at all, so nothing from it was half applied. FreeFrame is stopped, so nothing can write to it. To try again, run: $FF_RERUN${undo:+. To go back to the data as it was before this restore instead, run: $undo_cmd}" \
       "The backup could not be put back into the database." "the reason is at the end of $FF_LOG."
   fi
+  # The database is whole again: the record has done its job. The messages
+  # below still name this run's copy as the way back.
+  _restore_undo_clear
 
   FF_STATE="The backup has been put back${undo:+ (the database as it was before is saved; to go back to it, run: $undo_cmd)}."
   FF_STEP="starting FreeFrame again"
@@ -2943,7 +2967,6 @@ cmd_restore() {
       "see why with: sudo freeframe logs, then run: sudo freeframe restart"
   fi
   trap - ERR INT TERM HUP
-  _restore_undo_clear
   say ""
   say "The database is back as it was in $dump${when:+ (made $when)}."
   if [[ -n $undo ]]; then say "The database as it was before is saved; to go back to it, run: $undo_cmd"; fi
