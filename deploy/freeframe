@@ -1045,14 +1045,35 @@ _ff_stop() {
   exit "$1"
 }
 
+# _ff_term_say LINE...: print to the terminal only, never into install.log
+# (for the generated admin password). Waits a moment first so tee has
+# written what came before.
+_ff_term_say() {
+  local fd=${FF_TERM_ERR:-2}
+  sleep 0.2 2>/dev/null || true
+  printf '%s\n' "$@" >&"$fd"
+}
+
+# _install_tell_password: the generated admin password, on the terminal.
+_install_tell_password() {
+  _ff_term_say "" "The admin password made for you: $FF_ADMIN_PASSWORD" \
+    "Write it down now: it is shown on the screen only and saved nowhere." ""
+}
+
 # install_fail MESSAGE WHAT_TO_TRY: a step failed. Says what state the
-# server is in and where the log is, then exits 1.
+# server is in and where the log is, then exits 1. When this run created the
+# admin account with a generated password, the password is repeated (on the
+# terminal only), because a re-run cannot create the account again.
 install_fail() {
   warn ""
   warn "$1"
   if [[ -n ${2:-} ]]; then warn "What to try: $2"; fi
   if [[ -n ${FF_STATE:-} ]]; then warn "$FF_STATE"; fi
   if [[ -n ${FF_LOG:-} ]]; then warn "Everything the installer did is written to $FF_LOG."; fi
+  if [[ -n ${FF_ADMIN_CREATED:-} && -n ${FF_PW_GENERATED:-} ]]; then
+    _ff_term_say "" "The admin account for $FF_ADMIN_EMAIL was created, with the password made for you:" \
+      "  $FF_ADMIN_PASSWORD" "Write it down now: it is shown on the screen only and saved nowhere."
+  fi
   exit 1
 }
 
@@ -1911,13 +1932,24 @@ _install_create_admin() {
     body=${out%$'\n'*}
   fi
   case $code in
-    201) say "Admin account created for $FF_ADMIN_EMAIL." ;;
+    201)
+      FF_ADMIN_CREATED=1
+      say "Admin account created for $FF_ADMIN_EMAIL."
+      # Shown right away, on the terminal only: if a later step fails, a
+      # re-run cannot create the account again (403), so this must not wait
+      # for the closing summary.
+      if [[ -n ${FF_PW_GENERATED:-} ]]; then _install_tell_password; fi
+      ;;
+    "" | 000)
+      install_fail "FreeFrame's API could not be reached to create the admin account." \
+        "the reason is at the end of $FF_LOG. Then run sudo freeframe install again."
+      ;;
     403)
       FF_ADMIN_EXISTED=1
       say "An admin account already exists, so no new one was made. Sign in with the existing admin account."
       ;;
     429)
-      install_fail "The admin account could not be created: too many tries in a short time." \
+      install_fail "The admin account could not be created yet: FreeFrame allows only 3 tries in 10 minutes." \
         "wait 10 minutes, then run sudo freeframe install again."
       ;;
     *)
@@ -2088,6 +2120,7 @@ cmd_install() {
   FF_STATE="Nothing on this server has been changed yet."
   FF_LOG=""
   FF_ADDR_FROM_FILE="" FF_SMTP_FROM_FILE="" FF_ADMIN_EXISTED="" FF_CERT_PENDING="" FF_FELL_BACK=""
+  FF_ADMIN_CREATED="" FF_PW_GENERATED=""
 
   # Refusals first: nothing is written before these pass.
   _install_check_system

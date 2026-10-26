@@ -99,8 +99,11 @@ dc() {
     *create-superadmin*)
       local body='{"message":"Superadmin created","access_token":"tok-SECRET"}'
       cat >"$STUB_DIR/superadmin.json"
+      # STUB_ADMIN_EXEC_FAIL: docker compose exec itself fails (no HTTP code).
+      [[ -z ${STUB_ADMIN_EXEC_FAIL:-} ]] || return 1
       printf '%s\n%s' "${STUB_ADMIN_BODY:-$body}" "${STUB_ADMIN_CODE:-201}"
       ;;
+    "up -d --no-build traefik") [[ -z ${STUB_TRAEFIK_FAIL:-} ]] ;;
     *"localhost:8000/health"*) [[ -z ${STUB_API_DOWN:-} ]] ;;
     "ps -q "*) [[ -z ${STUB_OURS_RUNNING:-} ]] || echo 0123456789ab ;;
     pull*) [[ -z ${STUB_PULL_FAIL:-} ]] ;;

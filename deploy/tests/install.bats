@@ -268,6 +268,49 @@ assert_root_untouched() {
   assert_not_called "dc up -d --no-build traefik"
 }
 
+@test "install: a generated password reaches the terminal even when a later step fails" {
+  plain_answers
+  unset FREEFRAME_ADMIN_PASSWORD
+  export STUB_TRAEFIK_FAIL=1
+  ff_install --yes
+  [ "$status" -eq 1 ]
+  local pw log="$FF_ROOT/install.log"
+  pw=$(sed -n 's/.*"password":"\([^"]*\)".*/\1/p' "$BATS_TEST_TMPDIR/superadmin.json")
+  [[ $pw =~ ^[0-9a-f]{24}$ ]] || { echo "generated: $pw"; false; }
+  assert_out "Traefik"
+  # Shown right after the account was made, and again with the failure.
+  [ "$(grep -c -F "$pw" <<<"$output")" -ge 2 ] || { echo "$output"; false; }
+  if grep -q -F "$pw" "$log"; then echo "password in the log"; false; fi
+}
+
+@test "install: a typed password is never echoed back when a later step fails" {
+  plain_answers
+  export STUB_TRAEFIK_FAIL=1
+  ff_install --yes
+  [ "$status" -eq 1 ]
+  if grep -q -F "s3cret-pass" <<<"$output"; then echo "$output"; false; fi
+}
+
+@test "install: the API not reachable for the admin call says so, not a bad password" {
+  plain_answers
+  export STUB_ADMIN_EXEC_FAIL=1
+  ff_install --yes
+  [ "$status" -eq 1 ]
+  assert_out "API could not be reached"
+  assert_out "install.log"
+  if grep -q "email and password" <<<"$output"; then echo "$output"; false; fi
+  assert_not_called "dc up -d --no-build traefik"
+}
+
+@test "install: too many admin tries (429) says to wait 10 minutes" {
+  plain_answers
+  export STUB_ADMIN_CODE=429 STUB_ADMIN_BODY='{"detail":"Too many requests"}'
+  ff_install --yes
+  [ "$status" -eq 1 ]
+  assert_out "wait 10 minutes"
+  assert_not_called "dc up -d --no-build traefik"
+}
+
 @test "install: the API never answering stops before the admin and traefik" {
   plain_answers
   export STUB_API_DOWN=1 FF_API_WAIT=20
