@@ -246,6 +246,38 @@ dumps() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null) || true; }
   if grep -q '_backup_on_error' "$FF_SCRIPT"; then false; fi
 }
 
+@test "backup: refusals and failures are written to install.log too" {
+  export STUB_FREE_MB=500
+  ff backup
+  [ "$status" -eq 1 ]
+  grep -q "not enough free disk space" "$FF_ROOT/install.log"
+  grep -q "No new backup was made" "$FF_ROOT/install.log"
+  export STUB_FREE_MB="" STUB_DUMP_FAIL=1
+  ff backup --quiet
+  [ "$status" -eq 1 ]
+  grep -q "could not be backed up" "$FF_ROOT/install.log"
+  # Settings values never reach the log.
+  if grep -q "pw" "$FF_ROOT/install.log"; then cat "$FF_ROOT/install.log"; false; fi
+}
+
+@test "backup: a lock refusal is written to install.log" {
+  command -v flock >/dev/null || skip "no flock"
+  exec 8>>"$FF_ROOT/.freeframe.lock"
+  flock -n 8
+  ff backup --quiet
+  exec 8>&-
+  [ "$status" -eq 1 ]
+  grep -q "Another backup or restore is running" "$FF_ROOT/install.log"
+}
+
+@test "restore: a failed safety copy is in install.log once, not twice" {
+  old_backup 20261020-030000
+  export STUB_DUMP_FAIL=1
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  assert_eq "$(grep -c "No new backup was made" "$FF_ROOT/install.log")" 1
+}
+
 @test "backup: the log records the run" {
   ff backup
   [ "$status" -eq 0 ]
