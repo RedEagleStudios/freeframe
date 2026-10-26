@@ -310,7 +310,7 @@ dumps() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null) || true; }
   ((a < b && b < c)) || { echo "$output"; false; }
   [[ $(sed -n "${a}p" <<<"$output") == *"2026-10-26 03:00:01"*"KB"* ]] || { echo "$output"; false; }
   [[ $(sed -n "${c}p" <<<"$output") == *"2026-10-24 03:05:12"*"bytes"* ]] || { echo "$output"; false; }
-  assert_out "sudo freeframe restore $BK/freeframe-20261026-030001.dump"
+  assert_out "sudo freeframe restore '$BK/freeframe-20261026-030001.dump'"
   assert_not_called "dc "
 }
 
@@ -378,6 +378,35 @@ dumps() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null) || true; }
   assert_out "sudo freeframe restore"
 }
 
+@test "restore: every printed command quotes its path, so it can be pasted" {
+  # A backup copied in under a folder whose name has spaces and a quote.
+  local d="$BATS_TEST_TMPDIR/old server's backups"
+  mkdir -p "$d"
+  printf 'PGDMP old\n' >"$d/freeframe-20261020-030000.dump"
+  export STUB_RESTORE_FAIL=1
+  ff restore --yes "$d/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  local q="'$BATS_TEST_TMPDIR/old server'\\''s backups/freeframe-20261020-030000.dump'"
+  assert_out "To try again, run: sudo freeframe restore --yes $q"
+  # The printed command, run through a shell, gives back the exact path.
+  local cmd
+  cmd=${output#*To try again, run: sudo freeframe restore --yes }
+  cmd="${cmd%%.dump\'*}.dump'"
+  eval "set -- $cmd"
+  assert_eq "$#" 1
+  assert_eq "$1" "$d/freeframe-20261020-030000.dump"
+  # The undo command is quoted too, and so is the no-terminal hint.
+  local safety
+  safety=$(dumps | tail -1)
+  assert_out "run: sudo freeframe restore --yes '$BK/$safety'"
+  unset STUB_RESTORE_FAIL
+  rm -f "$FF_ROOT/.restore-undo"
+  export FF_YES=""
+  ff restore "$d/freeframe-20261020-030000.dump"
+  [ "$status" -eq 2 ]
+  assert_out "add --yes: sudo freeframe restore --yes $q"
+}
+
 @test "restore: two files is a usage error" {
   ff restore a.dump b.dump
   [ "$status" -eq 2 ]
@@ -419,7 +448,7 @@ dumps() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null) || true; }
   [[ $safety != freeframe-20261020-030000.dump ]]
   assert_eq "$(cat "$BK/$safety")" "PGDMP current database v2"
   [ -e "$BK/${safety%.dump}.env.prod" ]
-  assert_out "sudo freeframe restore --yes $BK/$safety"
+  assert_out "sudo freeframe restore --yes '$BK/$safety'"
   assert_eq "$(cat "$STUB_DIR/restored")" "PGDMP old 20261014-030000"
 }
 
@@ -486,7 +515,7 @@ dumps() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null) || true; }
   [ "$status" -eq 1 ]
   assert_not_called pg_dump
   assert_out "nothing new to save"
-  assert_out "sudo freeframe restore --yes $BK/$safety1"
+  assert_out "sudo freeframe restore --yes '$BK/$safety1'"
   assert_eq "$(dumps | tail -1)" "$safety1"
   assert_eq "$(cat "$FF_ROOT/.restore-undo")" "$BK/$safety1"
   # The undo itself then works, puts the first copy back and clears the record.
@@ -512,7 +541,7 @@ dumps() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null) || true; }
   [ "$status" -eq 0 ] || { echo "$output"; false; }
   grep -q 'pg_dump' "$CALLS"
   assert_out "is kept too: $BK/$safety1"
-  assert_out "to go back to it, run: sudo freeframe restore --yes $BK/$safety1"
+  assert_out "to go back to it, run: sudo freeframe restore --yes '$BK/$safety1'"
   [ ! -e "$FF_ROOT/.restore-undo" ]
 }
 
@@ -556,7 +585,7 @@ dumps() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null) || true; }
   ff restore
   [ "$status" -eq 0 ]
   assert_out "A restore did not finish"
-  assert_out "sudo freeframe restore --yes $BK/freeframe-20261020-030000.dump"
+  assert_out "sudo freeframe restore --yes '$BK/freeframe-20261020-030000.dump'"
 }
 
 @test "restore: a failed safety copy changes nothing and starts FreeFrame again" {
@@ -635,7 +664,7 @@ dumps() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null) || true; }
   # setup page to anyone.
   [ "$(grep -c '^dc up -d' "$CALLS")" -eq 1 ]
   assert_out "The database has been removed"
-  assert_out "sudo freeframe restore --yes $BK/freeframe-20261020-030000.dump"
+  assert_out "sudo freeframe restore --yes '$BK/freeframe-20261020-030000.dump'"
   assert_out "install.log"
 }
 
@@ -647,10 +676,10 @@ dumps() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null) || true; }
   [ "$(grep -c '^dc up -d' "$CALLS")" -eq 1 ]
   assert_out "The database is empty now"
   assert_out "FreeFrame is stopped"
-  assert_out "sudo freeframe restore --yes $BK/freeframe-20261020-030000.dump"
+  assert_out "sudo freeframe restore --yes '$BK/freeframe-20261020-030000.dump'"
   local safety
   safety=$(dumps | tail -1)
-  assert_out "sudo freeframe restore --yes $BK/$safety"
+  assert_out "sudo freeframe restore --yes '$BK/$safety'"
   assert_out "install.log"
   assert_eq "$(cat "$FF_ROOT/.restore-undo")" "$BK/$safety"
 }
@@ -729,10 +758,10 @@ ff_signal() {
   [ "$status" -eq 1 ]
   assert_out "The restore was stopped (SIGTERM) while putting the backup back"
   assert_out "The database is empty now"
-  assert_out "sudo freeframe restore --yes $BK/freeframe-20261020-030000.dump"
+  assert_out "sudo freeframe restore --yes '$BK/freeframe-20261020-030000.dump'"
   local safety
   safety=$(dumps | tail -1)
-  assert_out "sudo freeframe restore --yes $BK/$safety"
+  assert_out "sudo freeframe restore --yes '$BK/$safety'"
   assert_out "install.log"
   # FreeFrame was not started on the empty database, and the undo is kept.
   [ "$(grep -c '^dc up -d' "$CALLS")" -eq 1 ]

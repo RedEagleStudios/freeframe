@@ -2357,6 +2357,14 @@ cmd_install() {
 
 FF_BACKUP_KEEP=7
 
+# _ff_q PATH: PATH in single quotes, for a command printed for the reader to
+# copy and paste: a space or other special character in the path then
+# cannot split or change it.
+_ff_q() {
+  local q="'\\''"
+  printf "'%s'" "${1//\'/$q}"
+}
+
 # _ff_size_bytes FILE: the size of FILE in bytes.
 _ff_size_bytes() { wc -c <"$1" | tr -d '[:space:]'; }
 
@@ -2522,7 +2530,7 @@ backup_create() {
   free=$(_ff_free_mb "$root") || free=""
   if [[ ! $free =~ ^[0-9]+$ ]]; then
     _ff_backup_refused "Could not check the free disk space under $root, so no backup was made." \
-      "What to try: check the disk (df -h $root), then run: $retry"
+      "What to try: check the disk (df -h $(_ff_q "$root")), then run: $retry"
     return 1
   fi
   if ((free < need)); then
@@ -2651,13 +2659,13 @@ restore_list() {
   done
   say ""
   say "To put one back, run for example (this replaces the current database, after saving a copy of it):"
-  say "  sudo freeframe restore ${dumps[-1]}"
+  say "  sudo freeframe restore $(_ff_q "${dumps[-1]}")"
   say "A backup copied from another server can be given by its path."
   undo=$(_restore_undo_path)
   if [[ -n $undo ]]; then
     say ""
     say "A restore did not finish. The copy of the database from before it is kept: $undo"
-    say "To go back to it, run: sudo freeframe restore --yes $undo"
+    say "To go back to it, run: sudo freeframe restore --yes $(_ff_q "$undo")"
   fi
 }
 
@@ -2794,7 +2802,7 @@ cmd_restore() {
   local -a all=() svcs=()
   root=$(ff_root)
   if ((${#FF_ARGS[@]} > 1)); then
-    _ff_bad_usage "freeframe restore takes one backup file, for example: sudo freeframe restore $root/backups/freeframe-20261026-030000.dump"
+    _ff_bad_usage "freeframe restore takes one backup file, for example: sudo freeframe restore $(_ff_q "$root/backups/freeframe-20261026-030000.dump")"
   fi
   _ff_need_root restore
   _ff_need_install
@@ -2809,7 +2817,7 @@ cmd_restore() {
   if [[ -z ${FF_YES:-} ]]; then
     if ! _ff_has_tty; then
       _ff_stop 2 "Restoring replaces everything in FreeFrame's database, so it needs a yes, and there is no terminal here to ask." \
-        "run it in a terminal, or add --yes: sudo freeframe restore --yes $dump"
+        "run it in a terminal, or add --yes: sudo freeframe restore --yes $(_ff_q "$dump")"
     fi
     say "This replaces everything in FreeFrame's database with the backup${when:+ made $when}:"
     say "  $dump"
@@ -2829,7 +2837,7 @@ cmd_restore() {
   FF_ACTOR="the restore"
   FF_STOPPED=()
   FF_ADMIN_CREATED="" FF_PW_GENERATED=""
-  FF_RERUN="sudo freeframe restore --yes $dump"
+  FF_RERUN="sudo freeframe restore --yes $(_ff_q "$dump")"
   FF_STATE="Nothing has been changed."
   _install_log_start restore
   trap _restore_on_error ERR
@@ -2900,7 +2908,7 @@ cmd_restore() {
   fi
   if [[ -n $recorded ]]; then
     undo=$recorded
-    undo_cmd="sudo freeframe restore --yes $undo"
+    undo_cmd="sudo freeframe restore --yes $(_ff_q "$undo")"
   fi
 
   FF_STEP="removing the current database"
