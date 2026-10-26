@@ -29,8 +29,9 @@ ff_root() { printf '%s' "${FF_ROOT:-/opt/freeframe}"; }
 # docker compose would change when it reads the file: compose expands $NAME,
 # drops " #..." as a comment and trims spaces in unquoted values. Such a value
 # (typically a typed SMTP or storage password) is written single-quoted, or
-# double-quoted with \ " $ escaped when it contains a single quote, so compose
-# hands the container exactly what was typed.
+# double-quoted with \ " $ escaped when it contains ' or \, so compose hands
+# the container exactly what was typed (deploy/tests/compose.bats proves it
+# against the real docker compose).
 # ------------------------------------------------------------
 
 _env_key_ok() { [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; }
@@ -67,9 +68,12 @@ _env_decode() {
   esac
 }
 
-# _env_encode VALUE: the text to write after "KEY=". Fails (2) for a value
-# that contains both a single quote and a backtick, which no quoting keeps
-# literal for both compose and a shell.
+# _env_encode VALUE: the text to write after "KEY=". Single quotes are used
+# only when the value has neither ' nor \: compose reads \' as an escaped
+# quote even inside single quotes, so 'end\' would be unterminated. Anything
+# with ' or \ is double-quoted with \ " $ escaped. Fails (2) for a value
+# that also contains a backtick: compose keeps \` as two characters, so no
+# escaping keeps it literal for both compose and a shell.
 _env_encode() {
   local v=$1
   case $v in
@@ -79,7 +83,7 @@ _env_encode() {
       return 0
       ;;
   esac
-  if [[ $v != *\'* ]]; then
+  if [[ $v != *\'* && $v != *\\* ]]; then
     printf "'%s'" "$v"
     return 0
   fi
@@ -120,8 +124,8 @@ _env_write() {
     return 1
   fi
   if ! enc=$(_env_encode "$value"); then
-    warn "Cannot save $key: the value contains both ' and \`, which the settings file cannot hold safely."
-    warn "What to try: choose a value without one of those two characters."
+    warn "Cannot save $key: the value contains a backtick (\`) together with ' or \\, which the settings file cannot hold safely."
+    warn "What to try: choose a value without the backtick."
     return 1
   fi
   if [[ $mode == missing ]]; then

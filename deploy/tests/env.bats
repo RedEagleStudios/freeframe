@@ -132,7 +132,8 @@ X
 
 @test "values compose would change are quoted and read back unchanged" {
   local v
-  for v in 'pa$word' 'two words' 'a#b' "it's \$x" 'back\slash' 'q"uote' "'lead"; do
+  for v in 'pa$word' 'two words' 'a#b' 'a #b' "it's \$x" 'back\slash' 'q"uote' "'lead" \
+    'end\' "it's\\" '${HOME}' '$$' ' lead' 'trail ' 'a=b' "O'Brien" 'tab\tx' 'a`b'; do
     : > "$F"
     env_set "$F" SMTP_PASSWORD "$v"
     assert_eq "$(env_get "$F" SMTP_PASSWORD)" "$v"
@@ -140,6 +141,23 @@ X
   : > "$F"
   env_set "$F" SMTP_PASSWORD 'pa$word'
   assert_has "$F" "SMTP_PASSWORD='pa\$word'"
+}
+
+@test "a value ending in a backslash is double-quoted so compose can read it" {
+  env_set "$F" V 'end\'
+  assert_has "$F" 'V="end\\"'
+  env_set "$F" W "it's\\"
+  assert_has "$F" 'W="it'"'"'s\\"'
+}
+
+@test "a backtick together with a backslash or a single quote is rejected" {
+  printf 'A=1\n' > "$F"
+  run env_set "$F" A 'a\`b'
+  [ "$status" -ne 0 ]
+  [[ "$output" == *backtick* ]]
+  run env_set "$F" A "it's \`x\`"
+  [ "$status" -ne 0 ]
+  assert_has "$F" "A=1"
 }
 
 @test "plain values are written unquoted" {
