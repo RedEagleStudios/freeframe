@@ -1053,6 +1053,28 @@ assert_root_untouched() {
   [ "$(ls "$ENV".2* | wc -l)" -eq 1 ]
 }
 
+@test "_ff_json_str escapes every control character as \\u00XX" {
+  local in
+  in=$(printf 'a\tb\001c\037d"e\\f')
+  in+=$'\n'"g"$'\r'
+  assert_eq "$(_ff_json_str "$in")" '"a\u0009b\u0001c\u001fd\"e\\f\u000ag\u000d"'
+  assert_eq "$(_ff_json_str 'plain')" '"plain"'
+}
+
+@test "ufw_active reads ufw in the C locale" {
+  ufw() {
+    if [[ ${LC_ALL:-} == C ]]; then echo "Status: active"; else echo "Statut : actif"; fi
+  }
+  LC_ALL=fr_FR.UTF-8 ufw_active
+}
+
+@test "help steers passwords to FREEFRAME_ variables and warns that flags show in ps" {
+  run bash "$FF_SCRIPT" help
+  [ "$status" -eq 0 ]
+  assert_out "FREEFRAME_ADMIN_PASSWORD"
+  assert_out "ps"
+}
+
 # ---------------------------------------------------------------- install.sh
 
 bootstrap_setup() {

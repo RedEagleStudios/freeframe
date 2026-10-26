@@ -920,7 +920,8 @@ add_swap() {
   return 1
 }
 
-ufw_active() { command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; }
+# LC_ALL=C: ufw translates "Status: active" on servers set to another language.
+ufw_active() { command -v ufw >/dev/null 2>&1 && LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active'; }
 
 # docker_status: one word for the Docker on this server: none, snap,
 # "old VERSION", nocompose, down (installed but not answering) or ok
@@ -1147,14 +1148,19 @@ _ff_clean_host() {
   printf '%s' "$h"
 }
 
-# _ff_json_str TEXT: TEXT as a JSON string.
+# _ff_json_str TEXT: TEXT as a JSON string: \ and " escaped, and every
+# control character below 0x20 written as \u00XX, so the result is always
+# valid JSON.
 _ff_json_str() {
-  local s=$1
+  local s=$1 c rep i
   s=${s//\\/\\\\}
   s=${s//\"/\\\"}
-  s=${s//$'\t'/\\t}
-  s=${s//$'\r'/\\r}
-  s=${s//$'\n'/\\n}
+  for ((i = 1; i < 32; i++)); do
+    printf -v c '%b' "\\0$(printf '%o' "$i")"
+    [[ $s == *"$c"* ]] || continue
+    printf -v rep '\\u%04x' "$i"
+    s=${s//"$c"/"$rep"}
+  done
   printf '"%s"' "$s"
 }
 
@@ -2260,6 +2266,12 @@ Options: --domain --https --acme-email --storage --s3-endpoint --s3-bucket
   --s3-access-key --s3-secret-key --s3-region --smtp-host --smtp-port
   --smtp-user --smtp-password --smtp-from --admin-name --admin-email
   --admin-password --channel --yes
+
+Passwords and keys (--admin-password, --smtp-password, --s3-secret-key) are
+better given as FREEFRAME_ADMIN_PASSWORD, FREEFRAME_SMTP_PASSWORD and
+FREEFRAME_S3_SECRET_KEY, or typed when asked: options on the command line can
+be seen by other users of this server (for example with ps), and variables
+cannot.
 EOF
 }
 
