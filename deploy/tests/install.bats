@@ -1379,3 +1379,47 @@ run_bootstrap() {
   assert_out "Could not stop apache2."
   if [[ $output == *"Already done: stopped apache2"* ]]; then echo "$output"; false; fi
 }
+
+@test "install: before the command is installed, a bad option points at the one-line install command" {
+  # No freeframe command in FF_BIN_DIR: the person ran the bootstrap.
+  run bash -c 'source "$1"; main install --channel stable --bogus' ff "$FF_SCRIPT"
+  [ "$status" -eq 2 ]
+  assert_out "Unknown option: --bogus"
+  assert_out "curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/stable/install.sh | sudo bash -s -- --help"
+  if [[ $output == *"run 'freeframe help'"* ]]; then echo "$output"; false; fi
+  # Without a channel: latest, like install.sh.
+  run bash -c 'source "$1"; main install --bogus' ff "$FF_SCRIPT"
+  assert_out "/freeframe/latest/install.sh | sudo bash -s -- --help"
+  # Once the command is installed, it is named.
+  mkdir -p "$FF_BIN_DIR"
+  printf '#!/usr/bin/env bash\n' >"$FF_BIN_DIR/freeframe"
+  chmod 755 "$FF_BIN_DIR/freeframe"
+  run bash -c 'source "$1"; main install --bogus' ff "$FF_SCRIPT"
+  [ "$status" -eq 2 ]
+  assert_out "run 'freeframe help'"
+  if [[ $output == *"install.sh"* ]]; then echo "$output"; false; fi
+}
+
+@test "install: with no terminal before the command is installed, the hint is the one-line install command" {
+  plain_answers
+  ff_install --channel stable
+  [ "$status" -eq 2 ]
+  assert_out "curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/stable/install.sh | sudo bash -s -- --yes --admin-email you@yourstudio.com"
+  if [[ $output == *" freeframe install --yes"* ]]; then echo "$output"; false; fi
+  mkdir -p "$FF_BIN_DIR"
+  printf '#!/usr/bin/env bash\n' >"$FF_BIN_DIR/freeframe"
+  chmod 755 "$FF_BIN_DIR/freeframe"
+  ff_install --channel stable
+  [ "$status" -eq 2 ]
+  assert_out "sudo freeframe install --yes --admin-email you@yourstudio.com"
+}
+
+@test "install: answers ending before the command is installed point at the one-line install command" {
+  printf '%s\n' "" >"$BATS_TEST_TMPDIR/tty"
+  export FF_TTY="$BATS_TEST_TMPDIR/tty"
+  ff_install --channel stable
+  [ "$status" -eq 2 ]
+  assert_out "The answers ended before every question was answered"
+  assert_out "/freeframe/stable/install.sh | sudo bash -s -- --help"
+  if [[ $output == *"see: freeframe help"* ]]; then echo "$output"; false; fi
+}

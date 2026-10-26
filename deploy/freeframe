@@ -356,8 +356,26 @@ _ff_answer_names() {
 
 _ff_bad_usage() {
   warn "$1"
-  warn "What to try: run 'freeframe help' to see the commands and options."
+  warn "What to try: run $(_ff_help_cmd) to see the commands and options."
   exit 2
+}
+
+# _ff_cmd_installed: 0 when the freeframe command is on this server (after
+# an install went ahead). Before that the person is running the one-line
+# install command, and hints must name that instead.
+_ff_cmd_installed() { [[ -x ${FF_BIN_DIR:-/usr/local/bin}/freeframe ]]; }
+
+# _ff_bootstrap_cmd ARGS: the one-line install command for this channel,
+# passing ARGS on to freeframe install.
+_ff_bootstrap_cmd() {
+  local ch=${FF_CHANNEL:-latest}
+  if [[ ! $ch =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ || $ch == *..* ]]; then ch=latest; fi
+  printf 'curl -fsSL %s/%s/install.sh | sudo bash -s -- %s' "$FF_RAW_BASE" "$ch" "$*"
+}
+
+# _ff_help_cmd: the command that lists the commands and options.
+_ff_help_cmd() {
+  if _ff_cmd_installed; then printf "'freeframe help'"; else printf '%s' "$(_ff_bootstrap_cmd --help)"; fi
 }
 
 # FF_YES and the other answers are read by the subcommands, not here.
@@ -1154,7 +1172,7 @@ _ff_answer_missing() {
 
 _ff_input_ended() {
   _ff_stop 2 "The answers ended before every question was answered, so nothing was installed." \
-    "run the installer in a terminal, or give every answer ahead of time with --yes (see: freeframe help)."
+    "run the installer in a terminal, or give every answer ahead of time with --yes (to see them all, run: $(_ff_help_cmd))."
 }
 
 # _install_on_error: the ERR trap. A command failed that the installer did
@@ -2315,8 +2333,10 @@ cmd_install() {
     return 0
   fi
   if [[ -z ${FF_YES:-} ]] && ! _ff_has_tty; then
+    local example="sudo freeframe install --yes --admin-email you@yourstudio.com"
+    _ff_cmd_installed || example=$(_ff_bootstrap_cmd --yes --admin-email you@yourstudio.com)
     _ff_stop 2 "There is no terminal here to answer the installer's questions." \
-      "add --yes and give the answers ahead of time, for example: FREEFRAME_ADMIN_EMAIL=you@yourstudio.com freeframe install --yes (see: freeframe help)."
+      "add --yes and give the answers ahead of time, for example: $example (to see every option, run: $(_ff_help_cmd))."
   fi
 
   _install_log_start
@@ -3040,7 +3060,7 @@ main() {
       ;;
     *)
       warn "Unknown command: $FF_CMD"
-      warn "What to try: run 'freeframe help' to see the commands."
+      warn "What to try: run $(_ff_help_cmd) to see the commands."
       return 2
       ;;
   esac
