@@ -3,6 +3,8 @@
 # freeframe: install and look after FreeFrame on this server.
 #
 #   sudo freeframe install     set up FreeFrame on a fresh server
+#   sudo freeframe update      move to the newest release (backs up first)
+#   sudo freeframe status      see whether everything is running
 #   sudo freeframe help        list every command
 #
 # Everything lives in /opt/freeframe: the compose files, the settings file
@@ -1212,6 +1214,10 @@ _ff_answer_missing() {
 }
 
 _ff_input_ended() {
+  if [[ ${FF_CMD:-install} == configure ]]; then
+    _ff_stop 2 "The answers ended before every question was answered, so nothing was changed." \
+      "run sudo freeframe configure in a terminal, or give the new answers as options with --yes (to see them all, run: $(_ff_help_cmd))."
+  fi
   _ff_stop 2 "The answers ended before every question was answered, so nothing was installed." \
     "run the installer in a terminal, or give every answer ahead of time with --yes (to see them all, run: $(_ff_help_cmd))."
 }
@@ -2054,6 +2060,10 @@ _install_dns_step() {
       esac
     else
       if ((waited >= max)); then
+        if [[ ${FF_CMD:-install} == configure ]]; then
+          install_fail "The DNS records for $FF_HOST do not point at this server ($FF_IP) yet, so the web address was not changed." \
+            "add the records shown above, then run sudo freeframe configure again once they work."
+        fi
         install_fail "The DNS records for $FF_HOST do not point at this server ($FF_IP) yet." \
           "add the records shown above and run sudo freeframe install again once they work, or install now with the temporary address instead: leave out the domain and set FREEFRAME_HTTPS=sslip."
       fi
@@ -3117,6 +3127,1096 @@ cmd_restore() {
 }
 
 # ------------------------------------------------------------
+# Shared by update, configure, status, logs and restart
+# ------------------------------------------------------------
+
+# _ff_version_in TEXT: the version an images compose file runs by default
+# (1.21.0 for ${FREEFRAME_VERSION:-1.21.0}).
+_ff_version_in() {
+  local re='\$\{FREEFRAME_VERSION:-([^}]+)\}'
+  [[ $1 =~ $re ]] || return 1
+  printf '%s' "${BASH_REMATCH[1]}"
+}
+
+# ff_version: the version FreeFrame on this server runs (from its next start
+# on): FREEFRAME_VERSION in .env.prod when it is pinned there, otherwise the
+# default in the images compose file. "unknown" when neither says.
+ff_version() {
+  local root v="" f
+  root=$(ff_root)
+  v=$(env_get "$root/.env.prod" FREEFRAME_VERSION)
+  f="$root/docker-compose.images.yml"
+  if [[ -z $v && -f $f ]]; then v=$(_ff_version_in "$(<"$f")") || v=""; fi
+  printf '%s' "${v:-unknown}"
+}
+
+# _ff_version_gt A B: 0 when version A is newer than B (1.22.0 > 1.9.3; a
+# leading v is ignored).
+_ff_version_gt() {
+  local a=${1#v} b=${2#v} i x y
+  local -a pa=() pb=()
+  IFS=.- read -ra pa <<<"$a"
+  IFS=.- read -ra pb <<<"$b"
+  for ((i = 0; i < ${#pa[@]} || i < ${#pb[@]}; i++)); do
+    x=${pa[i]:-0} y=${pb[i]:-0}
+    if [[ $x =~ ^[0-9]+$ && $y =~ ^[0-9]+$ ]]; then
+      ((10#$x == 10#$y)) && continue
+      ((10#$x > 10#$y))
+      return
+    fi
+    [[ $x == "$y" ]] && continue
+    [[ $x > $y ]]
+    return
+  done
+  return 1
+}
+
+# remote_version CHANNEL: the version `freeframe update` would move to: the
+# default in the images compose file at the channel's ref. Fails without a
+# network answer.
+remote_version() {
+  local out
+  out=$(curl -fsSL --max-time 10 "$FF_RAW_BASE/$1/docker-compose.images.yml" 2>/dev/null) || return 1
+  _ff_version_in "$out"
+}
+
+# cert_expiry HOST: when the certificate Traefik serves for HOST ends. Fails
+# when there is none, or only Traefik's own self-signed one.
+cert_expiry() {
+  local host=$1 out
+  out=$({ timeout 20 openssl s_client -connect 127.0.0.1:443 -servername "$host" </dev/null 2>/dev/null || true; } |
+    openssl x509 -noout -issuer -enddate 2>/dev/null) || return 1
+  [[ $out == *notAfter=* && $out != *"TRAEFIK DEFAULT CERT"* ]] || return 1
+  printf '%s\n' "${out##*notAfter=}"
+}
+
+# _ff_url_host URL: the host part of a web address.
+_ff_url_host() {
+  local h=${1#*://}
+  h=${h%%/*}
+  printf '%s' "${h%%:*}"
+}
+
+# _ff_need_finished_install COMMAND: these commands start FreeFrame, Traefik
+# included. Before install has created the admin account that would open the
+# setup page to anyone, so they wait for install to finish.
+_ff_need_finished_install() {
+  if [[ ! -f $(ff_root)/.installed ]]; then
+    _ff_stop 1 "The install of FreeFrame did not finish on this server, so freeframe $1 did not run." \
+      "run sudo freeframe install again: it keeps your settings and continues where it stopped."
+  fi
+}
+
+# _ff_refuse_unfinished_restore COMMAND: while a restore's undo record
+# stands, the database may be empty; FreeFrame started on it would offer its
+# setup page to anyone. The record is left as it is.
+_ff_refuse_unfinished_restore() {
+  local undo
+  undo=$(_restore_undo_path)
+  [[ -n $undo ]] || return 0
+  _ff_stop 1 "A restore of the database did not finish, so the database may be empty. Starting FreeFrame on it would open its setup page to anyone, so freeframe $1 did not run." \
+    "finish the restore by running it again, or go back to the database as it was before it: sudo freeframe restore --yes $(_ff_q "$undo")"
+}
+
+# _ff_wait_healthy MODE HOST: wait for the API inside the compose network,
+# then for an answer through Traefik on the web address.
+_ff_wait_healthy() {
+  _ff_wait_for "${FF_API_WAIT:-600}" 5 _ff_logged dc exec -T api curl -fsS http://localhost:8000/health &&
+    _ff_wait_for "${FF_HEALTH_WAIT:-300}" 5 probe_health "$1" "$2"
+}
+
+# _ff_cmd_on_error / _ff_cmd_on_signal SIG: the traps of update and
+# configure: say in plain words what stopped and the state it left.
+_ff_cmd_on_error() {
+  local code=$?
+  if ((BASH_SUBSHELL > 0)); then exit "$code"; fi
+  trap - ERR
+  _ff_backup_cleanup
+  rm -rf "$(ff_root)"/.download.??????
+  _restore_report "The ${FF_CMD:-command} stopped unexpectedly while ${FF_STEP:-working} (error $code)." \
+    "look at the end of ${FF_LOG:-the output above} for the reason."
+}
+
+_ff_cmd_on_signal() {
+  trap '' INT TERM HUP
+  trap - ERR
+  _ff_backup_cleanup
+  rm -rf "$(ff_root)"/.download.??????
+  _restore_report "The ${FF_CMD:-command} was stopped (SIG$1) while ${FF_STEP:-working}, before it finished." \
+    "to finish it, run: ${FF_RERUN:-the command} again"
+}
+
+_ff_cmd_traps() {
+  trap _ff_cmd_on_error ERR
+  trap '_ff_cmd_on_signal INT' INT
+  trap '_ff_cmd_on_signal TERM' TERM
+  trap '_ff_cmd_on_signal HUP' HUP
+}
+
+# _ff_given_answers: the answer options given to this run, apart from
+# --channel, as --name words (nothing when none was given).
+_ff_given_answers() {
+  local n v out=""
+  while IFS= read -r n; do
+    [[ $n != CHANNEL ]] || continue
+    v="FF_$n"
+    if [[ -n ${!v:-} ]]; then
+      n=${n,,}
+      out+="${out:+ }--${n//_/-}"
+    fi
+  done < <(_ff_answer_names)
+  printf '%s' "$out"
+}
+
+# ------------------------------------------------------------
+# Update (spec goals 12 and 12b)
+# ------------------------------------------------------------
+
+# _ff_reexec PATH ARGS...: replace this process with PATH (the new freeframe
+# command) run with ARGS. FF_SELF_UPDATED=1 stops it from updating itself
+# again, so this happens once.
+_ff_reexec() {
+  local path=$1
+  shift
+  export FF_SELF_UPDATED=1
+  exec bash "$path" "$@"
+}
+
+# update_self CHANNEL: download deploy/freeframe from CHANNEL. When it is not
+# the command running now, put it at ${FF_BIN_DIR:-/usr/local/bin}/freeframe
+# (written beside it, then renamed over it, so the command is never half
+# written) and run the new copy with this run's arguments instead. Stops,
+# with nothing changed, when the download fails or is not a complete
+# freeframe command.
+update_self() {
+  local ch=$1 dir=${FF_BIN_DIR:-/usr/local/bin} self=${BASH_SOURCE[0]} target new running=0
+  [[ -z ${FF_SELF_UPDATED:-} ]] || return 0
+  target="$dir/freeframe"
+  new="$dir/.freeframe.new"
+  say "Checking for a newer freeframe command on the $ch channel..."
+  if ! { mkdir -p "$dir" && fetch "$ch" deploy/freeframe "$new" 2>/dev/null; }; then
+    rm -f "$new"
+    _ff_stop 1 "Could not download the freeframe command for the $ch channel, so nothing was changed." \
+      "check that this server can reach raw.githubusercontent.com, then run sudo freeframe update again."
+  fi
+  if [[ $(head -n 1 "$new") != '#!/usr/bin/env bash' ]] || ! bash -n "$new" 2>/dev/null; then
+    rm -f "$new"
+    _ff_stop 1 "What was downloaded for the $ch channel is not a complete freeframe command, so nothing was changed." \
+      "run sudo freeframe update again in a few minutes. If it keeps happening, report it at https://github.com/Techiebutler/freeframe/issues"
+  fi
+  # Compared before the command is replaced: the script running now is
+  # usually that very file.
+  if cmp -s "$new" "$self"; then running=1; fi
+  if [[ -f $target ]] && cmp -s "$new" "$target"; then
+    rm -f "$new"
+  else
+    if ! { chmod 755 "$new" && mv -f "$new" "$target"; }; then
+      rm -f "$new"
+      _ff_stop 1 "The freeframe command could not be replaced in $dir, so nothing was changed." \
+        "check that the disk is not full or read-only, then run sudo freeframe update again."
+    fi
+    say "The freeframe command was updated; continuing with the new one."
+  fi
+  if ((!running)); then
+    _ff_reexec "$target" ${FF_ORIG_ARGS[@]+"${FF_ORIG_ARGS[@]}"}
+  fi
+}
+
+# _update_way_back OLD FILE BACKUP: the lines that take the server back to
+# version OLD with the database from BACKUP (pin first, then restore, which
+# starts the old version on the restored database).
+_update_way_back() {
+  local old=$1 file=$2 backup=$3
+  if [[ $old =~ ^[A-Za-z0-9._-]+$ && $old != unknown ]]; then
+    printf '%s\n  %s\n%s' \
+      "To go back to the version you had ($old), with the database as it was just before the update, run this line:" \
+      "printf '\\nFREEFRAME_VERSION=$old\\n' | sudo tee -a $(_ff_q "$file") >/dev/null && sudo freeframe restore --yes $(_ff_q "$backup")" \
+      "That keeps this server on $old. To follow the channel again later, delete the FREEFRAME_VERSION line from $file and run sudo freeframe update."
+  else
+    printf '%s\n  %s' "The version from before is not known. To put the database back as it was just before the update, run:" \
+      "sudo freeframe restore --yes $(_ff_q "$backup")"
+  fi
+}
+
+# cmd_update: `freeframe update`. Updates the freeframe command itself first
+# (and runs the new one), then: a database backup, the channel's setup files
+# and backup units, the fill-missing settings merge, the new images, a
+# restart and the health checks. If the new version does not come up, it
+# prints the line that goes back, rather than guessing.
+cmd_update() {
+  local root file ch old new answers pinned url mode host
+  root=$(ff_root)
+  file="$root/.env.prod"
+  if ((${#FF_ARGS[@]})); then
+    _ff_bad_usage "freeframe update takes no other words. To use another channel, add for example: --channel stable"
+  fi
+  _ff_need_root update
+  _ff_need_install
+  answers=$(_ff_given_answers)
+  if [[ -n $answers ]]; then
+    _ff_stop 2 "freeframe update keeps the answers you gave when installing ($answers was given), so nothing was changed." \
+      "to change the web address, email or storage, run: sudo freeframe configure"
+  fi
+  _ff_need_finished_install update
+  _ff_refuse_unfinished_restore update
+  ch=$(ff_channel "$file")
+  _ff_check_channel "$ch"
+
+  # Spec goal 12b: the newest freeframe command does the rest.
+  update_self "$ch"
+
+  if ! _ff_lock; then
+    _ff_stop 1 "Another backup or restore is running right now, so the update did not start. Nothing was changed." \
+      "wait a few minutes for it to finish, then run sudo freeframe update again."
+  fi
+  FF_ACTOR="the update"
+  FF_STOPPED=()
+  FF_ADMIN_CREATED="" FF_PW_GENERATED=""
+  FF_RERUN="sudo freeframe update"
+  FF_STATE="Nothing has been changed; FreeFrame is running as before."
+  _install_log_start update
+  _ff_cmd_traps
+  old=$(ff_version)
+
+  FF_STEP="backing up the database"
+  say "Saving a backup of the database first..."
+  if ! backup_create prune; then
+    install_fail "The update stopped before changing anything, because the database could not be backed up first." \
+      "fix what the message above says, then run sudo freeframe update again."
+  fi
+  FF_UPDATE_BACKUP=$FF_BACKUP_MADE
+  say "Saved the backup: $FF_UPDATE_BACKUP"
+  FF_STATE="Nothing has been changed; FreeFrame is running as before. The backup taken first is $FF_UPDATE_BACKUP"
+
+  # An explicit --channel is saved now, so a re-run without it keeps it.
+  FF_STEP="saving the channel"
+  if ! ff_save_channel "$file" "$ch"; then
+    install_fail "The channel could not be saved in $file." \
+      "check that the disk is not full, then run sudo freeframe update --channel $ch again."
+  fi
+
+  FF_STEP="downloading the setup files"
+  say "Downloading the setup files for the $ch channel..."
+  if ! fetch_setup_files "$ch"; then
+    install_fail "Could not download ${FF_FETCH_FAILED:-the setup files} for the $ch channel, so none of the setup files was replaced." \
+      "check that this server can reach raw.githubusercontent.com, then run sudo freeframe update again."
+  fi
+  new=$(ff_version)
+  FF_STATE="The setup files for $new are in place, but FreeFrame is still running the version it had ($old). Running sudo freeframe update again finishes the move."
+
+  FF_STEP="refreshing the nightly backups"
+  if ! _ff_logged install_backup_timer; then
+    warn "The nightly backup timer could not be refreshed; the one set up before keeps running. The reason is at the end of $FF_LOG."
+  fi
+
+  FF_STEP="adding the settings the new release needs"
+  if ! fill_settings "$file"; then
+    install_fail "The settings could not be completed for the new release." \
+      "fix what the message above says, then run sudo freeframe update again."
+  fi
+  pinned=$(env_get "$file" FREEFRAME_VERSION)
+  if [[ -n $pinned ]]; then
+    say "This server is pinned to version $pinned (FREEFRAME_VERSION in $file), so it stays on that version."
+    say "To follow the $ch channel again, delete that line, then run sudo freeframe update."
+  fi
+
+  if [[ ${FF_SKIP_PULL:-} != 1 ]]; then
+    FF_STEP="downloading FreeFrame $new"
+    say "Downloading FreeFrame $new (this can take a few minutes)..."
+    if ! _ff_logged dc pull; then
+      install_fail "FreeFrame $new could not be downloaded." \
+        "check that this server can reach ghcr.io, then run sudo freeframe update again."
+    fi
+  fi
+
+  url=$(env_get "$file" FRONTEND_URL)
+  host=$(_ff_url_host "$url")
+  mode=$(env_get "$file" FREEFRAME_HTTPS)
+  FF_STEP="starting FreeFrame $new"
+  FF_STATE="FreeFrame has been moved to $new. $(_update_way_back "$old" "$file" "$FF_UPDATE_BACKUP")"
+  say "Starting FreeFrame $new..."
+  if ! _ff_logged dc up -d --no-build; then
+    install_fail "FreeFrame $new could not be started." "see why with: sudo freeframe logs"
+  fi
+  FF_STEP="waiting for FreeFrame to answer"
+  say "Waiting for FreeFrame to finish starting (a new release may first update the database)..."
+  if ! _ff_wait_healthy "${mode:-off}" "$host"; then
+    install_fail "FreeFrame did not come back after the update to $new." \
+      "see why with: sudo freeframe logs (the API's messages: sudo freeframe logs api)."
+  fi
+  trap - ERR INT TERM HUP
+  say ""
+  if [[ $old == "$new" ]]; then
+    say "FreeFrame is already on the newest release of the $ch channel ($new); its setup files and images were refreshed."
+  else
+    say "FreeFrame was updated from $old to $new."
+  fi
+  say "It answers at $url."
+  say "The database as it was just before the update is saved in $FF_UPDATE_BACKUP"
+  _install_log_stop
+}
+
+# ------------------------------------------------------------
+# Configure (spec goal 12c)
+#
+# Asks the install questions again with the current answers as defaults (or
+# takes new answers as options with --yes), then changes only the keys tied
+# to the answers that changed, after backing up .env.prod. Generated secrets
+# are never written; footage is never moved between storage places.
+# ------------------------------------------------------------
+
+# Keys configure never writes: the generated secrets and what is built from
+# them. The bundled storage's S3 keys are generated too and join the list
+# there.
+FF_PROTECTED_KEYS="POSTGRES_PASSWORD REDIS_PASSWORD JWT_SECRET DATABASE_URL REDIS_URL POSTGRES_USER POSTGRES_DB"
+
+# _cfg_set KEY VALUE: KEY is to become VALUE (only noted when that is a
+# change).
+_cfg_set() {
+  local key=$1 value=$2 i
+  if [[ $(env_get "$FF_CFG_FILE" "$key") == "$value" ]]; then
+    for i in "${!FF_CFG_KEYS[@]}"; do
+      if [[ ${FF_CFG_KEYS[i]} == "$key" ]]; then unset 'FF_CFG_KEYS[i]'; fi
+    done
+    unset 'FF_CFG_NEW[$key]'
+    return 0
+  fi
+  [[ -n ${FF_CFG_NEW[$key]+x} ]] || FF_CFG_KEYS+=("$key")
+  FF_CFG_NEW[$key]=$value
+}
+
+# _cfg_address MODE HOST: the web address keys for MODE (own, sslip, off)
+# on HOST, as install writes them.
+_cfg_address() {
+  local mode=$1 host=$2
+  FF_CFG_MODE=$mode FF_CFG_HOST=$host
+  _cfg_set FREEFRAME_HTTPS "$mode"
+  if [[ $mode == off ]]; then
+    _cfg_set FRONTEND_URL "http://$host"
+    _cfg_set DOMAIN ""
+  else
+    _cfg_set FRONTEND_URL "https://$host"
+    _cfg_set DOMAIN "$host"
+  fi
+  [[ $FF_CFG_STORAGE == bundled ]] || return 0
+  if [[ $mode == off ]]; then
+    _cfg_set S3_PUBLIC_ENDPOINT "http://$host:9000"
+    _cfg_set STORAGE_DOMAIN ""
+    _cfg_set STORAGE_ROUTED false
+    _cfg_set STORAGE_PORT_BIND 0.0.0.0:9000
+  else
+    _cfg_set S3_PUBLIC_ENDPOINT "https://storage.$host"
+    _cfg_set STORAGE_DOMAIN "storage.$host"
+    _cfg_set STORAGE_ROUTED true
+    _cfg_set STORAGE_PORT_BIND 127.0.0.1:9000
+  fi
+}
+
+# _cfg_address_from_options: --domain / --https given ahead of time.
+_cfg_address_from_options() {
+  local mode=${FF_HTTPS:-auto} host=""
+  case $mode in
+    auto | own | sslip | off) ;;
+    *) _ff_answer_error "FREEFRAME_HTTPS (--https) must be own, sslip or off; it is '$FF_HTTPS'." "use one of those words." ;;
+  esac
+  install_find_ip
+  if [[ -n ${FF_DOMAIN:-} ]]; then
+    host=$(_ff_clean_host "$FF_DOMAIN")
+    if ! valid_hostname "$host"; then
+      _ff_answer_error "The web address '$host' is not a plain name like review.yourstudio.com." \
+        "give only the name, without a port, a path or spaces."
+    fi
+    if _ff_is_ipv4 "$host"; then
+      [[ $mode == auto || $mode == off ]] ||
+        _ff_answer_error "A certificate needs a name, not an IP address ($host)." "use a domain name, or plain HTTP with --https off."
+      mode=off
+    elif [[ $mode == sslip ]]; then
+      _ff_answer_error "Both a domain ($host) and the automatic sslip.io address were asked for." \
+        "choose one: --domain for your own address, or --https sslip for the automatic one."
+    elif [[ $mode == auto ]]; then
+      mode=own
+    fi
+  else
+    case $mode in
+      sslip)
+        if ! is_public_ipv4 "$FF_IP"; then
+          _ff_answer_error "The automatic sslip.io address needs a public IPv4 address, and this server's is '$FF_IP'." \
+            "use your own domain (--domain), or plain HTTP (--https off)."
+        fi
+        host=$(sslip_host "$FF_IP")
+        ;;
+      off)
+        if [[ $FF_CFG_CUR_MODE == off ]]; then host=$FF_CFG_CUR_HOST; else host=$(_install_http_ip); fi
+        ;;
+      own)
+        if [[ $FF_CFG_CUR_MODE != sslip ]] && ! _ff_is_ipv4 "$FF_CFG_CUR_HOST"; then
+          host=$FF_CFG_CUR_HOST
+        else
+          _ff_answer_error "HTTPS on your own domain needs the domain." "add it, for example: --domain review.yourstudio.com"
+        fi
+        ;;
+      *) return 0 ;;
+    esac
+  fi
+  _cfg_address "$mode" "$host"
+}
+
+# _cfg_address_ask: the web address question, the current one as default.
+_cfg_address_ask() {
+  local answer="" label="" http_ip
+  install_find_ip
+  http_ip=$(_install_http_ip)
+  case $FF_CFG_CUR_MODE in
+    sslip) label=" (a free temporary address)" ;;
+    off) label=" (plain HTTP)" ;;
+  esac
+  say ""
+  say "1. Web address"
+  say "   Now: $FF_CFG_CUR_URL$label"
+  say "   Press Enter to keep it, or type your own domain (for example review.yourstudio.com)."
+  if is_public_ipv4 "$FF_IP" && [[ $FF_CFG_CUR_MODE != sslip ]]; then
+    say "   Or type temporary for the free address with HTTPS, $(sslip_host "$FF_IP")."
+  fi
+  if [[ $FF_CFG_CUR_MODE != off ]]; then
+    say "   Or type http for plain HTTP on this server's address, http://$http_ip (for use inside your office network)."
+  fi
+  while :; do
+    ask answer "   Web address" "" || _ff_input_ended
+    answer=$(_ff_clean_host "$answer")
+    case $answer in
+      "") return 0 ;;
+      temporary | sslip | automatic)
+        if is_public_ipv4 "$FF_IP"; then
+          _cfg_address sslip "$(sslip_host "$FF_IP")"
+          return 0
+        fi
+        say "   The free temporary address needs a public IP address, and this server's is $FF_IP."
+        continue
+        ;;
+      http | local)
+        if [[ $FF_CFG_CUR_MODE != off ]]; then _cfg_address off "$http_ip"; fi
+        return 0
+        ;;
+    esac
+    if _ff_is_ipv4 "$answer"; then
+      _cfg_address off "$answer"
+      return 0
+    fi
+    if valid_hostname "$answer"; then
+      _cfg_address own "$answer"
+      return 0
+    fi
+    say "   '$answer' is not a plain name like review.yourstudio.com. Type only the name, without a port, a path or spaces."
+  done
+}
+
+# _cfg_acme: HTTPS needs an email for certificate notices.
+_cfg_acme() {
+  local cur
+  cur=$(env_get "$FF_CFG_FILE" ACME_EMAIL)
+  if [[ -n ${FF_ACME_EMAIL:-} ]]; then
+    valid_email "$FF_ACME_EMAIL" ||
+      _ff_answer_error "'$FF_ACME_EMAIL' does not look like an email address (the email for certificate notices)." "give an address such as you@yourstudio.com."
+    _cfg_set ACME_EMAIL "$FF_ACME_EMAIL"
+    return 0
+  fi
+  [[ -n ${FF_CFG_NEW[FRONTEND_URL]:-} && ${FF_CFG_MODE:-off} != off && -z $cur ]] || return 0
+  if _ff_interactive; then
+    say ""
+    say "   Let's Encrypt, who issue the free HTTPS certificate, write to this address if it needs attention."
+    _ff_ask_email FF_ACME_EMAIL "   Email for certificate notices" ""
+  else
+    require_answer FF_ACME_EMAIL FREEFRAME_ACME_EMAIL "the email for certificate notices" || _ff_answer_missing
+    valid_email "$FF_ACME_EMAIL" ||
+      _ff_answer_error "'$FF_ACME_EMAIL' does not look like an email address (the email for certificate notices)." "give an address such as you@yourstudio.com."
+  fi
+  _cfg_set ACME_EMAIL "$FF_ACME_EMAIL"
+}
+
+# _cfg_smtp HOST PORT USER PASSWORD FROM: the email keys for these answers.
+_cfg_smtp() {
+  local host=$1 port=$2 user=$3 pw=$4 from=$5 cur_port
+  host=$(_ff_clean_host "$host")
+  if ! valid_hostname "$host"; then
+    _ff_answer_error "The mail server '$host' is not a plain name like smtp.postmarkapp.com." "give only the server's name."
+  fi
+  if [[ ! $port =~ ^[0-9]{1,5}$ ]] || ((10#$port < 1 || 10#$port > 65535)); then
+    _ff_answer_error "The mail server port '$port' is not a port number." "use the port your email provider gives, usually 587 or 465."
+  fi
+  if [[ -z $from ]] && valid_email "$user"; then from=$user; fi
+  FF_SMTP_FROM=$from
+  require_answer FF_SMTP_FROM FREEFRAME_SMTP_FROM "the address emails are sent from" || _ff_answer_missing
+  if ! valid_email "$FF_SMTP_FROM"; then
+    _ff_answer_error "'$FF_SMTP_FROM' does not look like an email address (the address emails are sent from)." "give an address such as noreply@yourstudio.com."
+  fi
+  cur_port=$(env_get "$FF_CFG_FILE" SMTP_PORT)
+  _cfg_set MAIL_PROVIDER smtp
+  _cfg_set SMTP_HOST "$host"
+  _cfg_set SMTP_PORT "$port"
+  # Port 465 is TLS from the first byte; anything else upgrades with
+  # STARTTLS. Only recomputed when the port changes.
+  if [[ $port != "$cur_port" || -z $(env_get "$FF_CFG_FILE" SMTP_USE_TLS) ]]; then
+    if [[ $port == 465 ]]; then _cfg_set SMTP_USE_TLS false; else _cfg_set SMTP_USE_TLS true; fi
+  fi
+  _cfg_set SMTP_USER "$user"
+  _cfg_set SMTP_PASSWORD "$pw"
+  _cfg_set MAIL_FROM_ADDRESS "$FF_SMTP_FROM"
+}
+
+_cfg_email() {
+  local f=$FF_CFG_FILE host port user pw from answer="" def
+  host=$(env_get "$f" SMTP_HOST)
+  port=$(env_get "$f" SMTP_PORT)
+  user=$(env_get "$f" SMTP_USER)
+  pw=$(env_get "$f" SMTP_PASSWORD)
+  from=$(env_get "$f" MAIL_FROM_ADDRESS)
+  if [[ -n ${FF_SMTP_HOST:-}${FF_SMTP_PORT:-}${FF_SMTP_USER:-}${FF_SMTP_PASSWORD:-}${FF_SMTP_FROM:-} ]]; then
+    if [[ -z ${FF_SMTP_HOST:-$host} ]]; then
+      _ff_answer_error "To set up email, the mail server is needed." "add it, for example: --smtp-host smtp.postmarkapp.com"
+    fi
+    _cfg_smtp "${FF_SMTP_HOST:-$host}" "${FF_SMTP_PORT:-${port:-587}}" "${FF_SMTP_USER:-$user}" \
+      "${FF_SMTP_PASSWORD:-$pw}" "${FF_SMTP_FROM:-$from}"
+    return 0
+  fi
+  _ff_interactive || return 0
+  say ""
+  say "2. Sending email (sign-in codes and invitations)"
+  if [[ -n $host ]]; then
+    say "   Now: through $host, port ${port:-587}, from ${from:-(no address)}"
+    say "   Press Enter to keep it, or type the mail server's address to change it."
+  else
+    say "   Now: not set up, so sign-in codes and invitation emails are not sent."
+    say "   Type your mail server's address (SMTP host, for example smtp.postmarkapp.com), or press Enter to leave it."
+  fi
+  while :; do
+    ask answer "   Mail server" "" || _ff_input_ended
+    answer=$(_ff_clean_host "$answer")
+    [[ -n $answer ]] || return 0
+    valid_hostname "$answer" && break
+    say "   '$answer' is not a plain name like smtp.postmarkapp.com. Type only the server's name."
+  done
+  while :; do
+    ask port "   Port" "${port:-587}" || _ff_input_ended
+    [[ $port =~ ^[0-9]{1,5}$ ]] && ((10#$port >= 1 && 10#$port <= 65535)) && break
+    say "   Type a port number, usually 587 or 465."
+  done
+  ask user "   User name" "$user" || _ff_input_ended
+  if [[ -n $pw ]]; then
+    ask_secret FF_SMTP_PASSWORD "   Password (press Enter to keep the current one)" || _ff_input_ended
+  else
+    ask_secret FF_SMTP_PASSWORD "   Password" || _ff_input_ended
+  fi
+  pw=${FF_SMTP_PASSWORD:-$pw}
+  def=$from
+  if [[ -z $def ]] && valid_email "$user"; then def=$user; fi
+  _ff_ask_email from "   Send emails from (address)" "$def"
+  _cfg_smtp "$answer" "$port" "$user" "$pw" "$from"
+}
+
+# _cfg_storage_refuse WANTED: configure does not move footage.
+_cfg_storage_refuse() {
+  local where="on this server" in=""
+  [[ $FF_CFG_STORAGE == bundled ]] || where="in the S3 bucket $(env_get "$FF_CFG_FILE" S3_BUCKET)"
+  if _ff_interactive; then in="   "; fi
+  say "${in}configure does not move footage between this server and an S3 bucket, so footage stays where it is ($where)."
+  say "${in}Footage already uploaded would be left behind and stop showing in FreeFrame. Moving it is done by hand; the guide explains how: $FF_GUIDE_URL"
+}
+
+# _cfg_s3_set ENDPOINT BUCKET ACCESS SECRET REGION: your own bucket's keys.
+_cfg_s3_set() {
+  local endpoint=$1 bucket=$2 access=$3 secret=$4 region=$5 v old_bucket re_bucket='^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+  if [[ -n $endpoint && ! $endpoint =~ ^https?://[^[:space:]]+$ ]]; then
+    _ff_answer_error "The storage endpoint '$endpoint' must be a web address starting with https:// (or http:// for storage on your own network)." "copy the endpoint address exactly as your storage provider shows it."
+  fi
+  if [[ ! $bucket =~ $re_bucket ]]; then
+    _ff_answer_error "The bucket name '$bucket' can only hold lowercase letters, digits, dots and hyphens." "check the bucket name at your storage provider."
+  fi
+  if [[ -z $access || -z $secret ]]; then
+    _ff_answer_error "Your bucket's access key and secret key are both needed." "give them as FREEFRAME_S3_ACCESS_KEY and FREEFRAME_S3_SECRET_KEY."
+  fi
+  v=${endpoint#*://}
+  v=${v%%[/:]*}
+  v=${v,,}
+  if [[ -z $endpoint || $v == amazonaws.com || $v == *.amazonaws.com ]]; then
+    _cfg_set S3_STORAGE s3
+  else
+    _cfg_set S3_STORAGE minio
+  fi
+  _cfg_set S3_ENDPOINT "$endpoint"
+  old_bucket=$(env_get "$FF_CFG_FILE" S3_BUCKET)
+  _cfg_set S3_BUCKET "$bucket"
+  _cfg_set S3_ACCESS_KEY "$access"
+  _cfg_set S3_SECRET_KEY "$secret"
+  _cfg_set S3_REGION "$region"
+  if [[ -n ${FF_CFG_NEW[S3_BUCKET]+x} ]]; then
+    FF_CFG_NOTES+=("Footage already uploaded stays in $old_bucket; configure does not move it to $bucket.")
+  fi
+}
+
+_cfg_storage() {
+  local f=$FF_CFG_FILE s3 answer="" cur_n=1 endpoint bucket access secret region
+  local given=${FF_S3_ENDPOINT:-}${FF_S3_BUCKET:-}${FF_S3_ACCESS_KEY:-}${FF_S3_SECRET_KEY:-}${FF_S3_REGION:-}
+  if [[ -n ${FF_STORAGE:-} && $FF_STORAGE != "$FF_CFG_STORAGE" ]]; then
+    _cfg_storage_refuse >&2
+    _ff_stop 2 "Nothing was changed." "keep --storage out, or set up a new FreeFrame with the other storage."
+  fi
+  if [[ $FF_CFG_STORAGE == bundled ]]; then
+    if [[ -n $given ]]; then
+      _cfg_storage_refuse >&2
+      _ff_stop 2 "This server keeps footage on itself, and the keys of that storage are made by FreeFrame, so they cannot be set. Nothing was changed." \
+        "leave the --s3-... options and FREEFRAME_S3_... variables out."
+    fi
+  fi
+  endpoint=$(env_get "$f" S3_ENDPOINT)
+  bucket=$(env_get "$f" S3_BUCKET)
+  access=$(env_get "$f" S3_ACCESS_KEY)
+  secret=$(env_get "$f" S3_SECRET_KEY)
+  region=$(env_get "$f" S3_REGION)
+  if [[ $FF_CFG_STORAGE == s3 && -n $given ]]; then
+    _cfg_s3_set "${FF_S3_ENDPOINT:-$endpoint}" "${FF_S3_BUCKET:-$bucket}" "${FF_S3_ACCESS_KEY:-$access}" \
+      "${FF_S3_SECRET_KEY:-$secret}" "${FF_S3_REGION:-$region}"
+    return 0
+  fi
+  _ff_interactive || return 0
+  [[ $FF_CFG_STORAGE == bundled ]] || cur_n=2
+  say ""
+  say "3. Where uploaded footage is kept"
+  if [[ $FF_CFG_STORAGE == bundled ]]; then
+    say "   Now: on this server"
+  else
+    say "   Now: in your S3 bucket $bucket${endpoint:+ at $endpoint}"
+  fi
+  say "   1) On this server  2) In an S3 bucket"
+  while :; do
+    ask answer "   Choose 1 or 2" "$cur_n" || _ff_input_ended
+    case ${answer,,} in
+      1 | bundled) s3=1 ;;
+      2 | s3) s3=2 ;;
+      *)
+        say "   Type 1 or 2."
+        continue
+        ;;
+    esac
+    break
+  done
+  if [[ $s3 != "$cur_n" ]]; then
+    _cfg_storage_refuse
+    return 0
+  fi
+  [[ $FF_CFG_STORAGE == s3 ]] || return 0
+  confirm "   Change the bucket's details (address, name, keys or region)?" N || return 0
+  ask endpoint "   Endpoint (empty for AWS S3)" "$endpoint" || _ff_input_ended
+  ask bucket "   Bucket name" "$bucket" || _ff_input_ended
+  ask access "   Access key" "$access" || _ff_input_ended
+  ask_secret answer "   Secret key (press Enter to keep the current one)" || _ff_input_ended
+  secret=${answer:-$secret}
+  ask region "   Region" "$region" || _ff_input_ended
+  _cfg_s3_set "$endpoint" "$bucket" "$access" "$secret" "$region"
+}
+
+# _cfg_show: the changes, before anything is written. Passwords and keys are
+# never shown.
+_cfg_show() {
+  local k old new
+  say ""
+  say "These settings will change:"
+  for k in "${FF_CFG_KEYS[@]}"; do
+    case $k in
+      SMTP_PASSWORD | S3_ACCESS_KEY | S3_SECRET_KEY) say "  $k: (changed; not shown)" ;;
+      *)
+        old=$(env_get "$FF_CFG_FILE" "$k")
+        new=${FF_CFG_NEW[$k]}
+        say "  $k: ${old:-(empty)} -> ${new:-(empty)}"
+        ;;
+    esac
+  done
+  for k in ${FF_CFG_NOTES[@]+"${FF_CFG_NOTES[@]}"}; do say "$k"; done
+  if [[ -n ${FF_CFG_NEW[FRONTEND_URL]:-} ]]; then
+    say ""
+    say "The web address changes from $FF_CFG_CUR_URL to ${FF_CFG_NEW[FRONTEND_URL]}."
+    say "Links already sent by email (invitations, sign-in links and shared review links) point at the old"
+    say "address and stop working. Send them again from FreeFrame once it runs at the new address."
+    say "Everyone signs in again there."
+  fi
+}
+
+# cmd_configure: `freeframe configure` (spec goal 12c).
+cmd_configure() {
+  local root file k backup="" restart=0 http_switch=0 protected hosts h url ok
+  root=$(ff_root)
+  file="$root/.env.prod"
+  if ((${#FF_ARGS[@]})); then
+    _ff_bad_usage "freeframe configure takes no other words; give new answers as options, for example: sudo freeframe configure --yes --domain review.yourstudio.com"
+  fi
+  _ff_need_root configure
+  _ff_need_install
+  _ff_need_finished_install configure
+  _ff_refuse_unfinished_restore configure
+  if [[ -z ${FF_YES:-} ]] && ! _ff_has_tty; then
+    _ff_stop 2 "There is no terminal here to ask configure's questions." \
+      "add --yes and give the new answers as options, for example: sudo freeframe configure --yes --domain review.yourstudio.com"
+  fi
+  FF_CFG_FILE=$file
+  FF_CFG_KEYS=()
+  FF_CFG_NOTES=()
+  declare -gA FF_CFG_NEW=()
+  FF_CFG_STORAGE=$(env_get "$file" FREEFRAME_STORAGE)
+  FF_CFG_STORAGE=${FF_CFG_STORAGE:-bundled}
+  FF_CFG_CUR_URL=$(env_get "$file" FRONTEND_URL)
+  FF_CFG_CUR_HOST=$(_ff_url_host "$FF_CFG_CUR_URL")
+  FF_CFG_CUR_MODE=$(env_get "$file" FREEFRAME_HTTPS)
+  if [[ -z $FF_CFG_CUR_MODE ]]; then
+    if [[ $FF_CFG_CUR_URL == https://* ]]; then FF_CFG_CUR_MODE=own; else FF_CFG_CUR_MODE=off; fi
+  fi
+  FF_CFG_MODE=$FF_CFG_CUR_MODE FF_CFG_HOST=$FF_CFG_CUR_HOST
+  FF_ACTOR="freeframe configure"
+  FF_STOPPED=()
+  FF_ADMIN_CREATED="" FF_PW_GENERATED=""
+  FF_RERUN="sudo freeframe configure"
+  FF_STATE="Nothing has been changed."
+
+  if [[ -n ${FF_CHANNEL:-} ]]; then
+    _ff_check_channel "$FF_CHANNEL"
+    _cfg_set FREEFRAME_CHANNEL "$FF_CHANNEL"
+  fi
+  # Storage first: a refused switch stops before any question is asked.
+  if [[ -n ${FF_STORAGE:-}${FF_S3_ENDPOINT:-}${FF_S3_BUCKET:-}${FF_S3_ACCESS_KEY:-}${FF_S3_SECRET_KEY:-}${FF_S3_REGION:-} ]]; then
+    _cfg_storage
+  fi
+  if [[ -n ${FF_DOMAIN:-} || ( -n ${FF_HTTPS:-} && $FF_HTTPS != auto ) ]]; then
+    _cfg_address_from_options
+  elif _ff_interactive; then
+    _cfg_address_ask
+  fi
+  _cfg_acme
+  _cfg_email
+  if [[ -z ${FF_STORAGE:-}${FF_S3_ENDPOINT:-}${FF_S3_BUCKET:-}${FF_S3_ACCESS_KEY:-}${FF_S3_SECRET_KEY:-}${FF_S3_REGION:-} ]]; then
+    _cfg_storage
+  fi
+
+  if ((${#FF_CFG_KEYS[@]} == 0)); then
+    say ""
+    say "Nothing to change; the settings are as they were."
+    return 0
+  fi
+  # Belt and braces: the generated secrets are never written.
+  protected=$FF_PROTECTED_KEYS
+  [[ $FF_CFG_STORAGE != bundled ]] || protected+=" S3_ACCESS_KEY S3_SECRET_KEY"
+  for k in "${FF_CFG_KEYS[@]}"; do
+    if [[ " $protected " == *" $k "* ]]; then
+      _ff_stop 1 "configure was about to change $k, which it never changes, so it stopped. Nothing was changed." \
+        "report this at https://github.com/Techiebutler/freeframe/issues"
+    fi
+    [[ $k == FREEFRAME_CHANNEL ]] || restart=1
+  done
+  _cfg_show
+  if _ff_interactive; then
+    local question="Save these changes and restart FreeFrame?"
+    ((restart)) || question="Save this change?"
+    if ! confirm "$question" Y; then
+      say "Nothing was changed."
+      exit 1
+    fi
+  fi
+
+  _install_log_start configure
+  _ff_cmd_traps
+  # A new own domain must point here before a certificate is asked for.
+  if [[ -n ${FF_CFG_NEW[FRONTEND_URL]:-} && $FF_CFG_MODE == own ]]; then
+    FF_MODE=own FF_HOST=$FF_CFG_HOST FF_STORAGE=$FF_CFG_STORAGE FF_ADDR_FROM_FILE="" FF_HTTPS=own FF_DOMAIN=$FF_CFG_HOST
+    _install_dns_step
+    if [[ $FF_MODE == sslip ]]; then
+      _cfg_address sslip "$FF_HOST"
+      if ((${#FF_CFG_KEYS[@]} == 0)); then
+        say "Nothing to change; the settings are as they were."
+        trap - ERR INT TERM HUP
+        _install_log_stop
+        return 0
+      fi
+    fi
+  fi
+  if ! _ff_lock; then
+    install_fail "Another backup or restore is running right now, so the settings were not changed." \
+      "wait a few minutes for it to finish, then run sudo freeframe configure again."
+  fi
+
+  FF_STEP="saving the settings"
+  # Plain HTTP goes through switch_to_http_mode, which writes the address
+  # keys (after its own backup) and restarts FreeFrame.
+  if [[ -n ${FF_CFG_NEW[FRONTEND_URL]:-} && $FF_CFG_MODE == off ]]; then http_switch=1; fi
+  backup=$(env_backup "$file") ||
+    install_fail "Could not back up $file, so nothing was changed." "check that the disk is not full, then run sudo freeframe configure again."
+  for k in "${FF_CFG_KEYS[@]}"; do
+    if ((http_switch)); then
+      case $k in
+        FREEFRAME_HTTPS | FRONTEND_URL | DOMAIN | S3_PUBLIC_ENDPOINT | STORAGE_DOMAIN | STORAGE_ROUTED | STORAGE_PORT_BIND) continue ;;
+      esac
+    fi
+    if ! env_set "$file" "$k" "${FF_CFG_NEW[$k]}"; then
+      install_fail "The setting $k could not be saved." \
+        "put the settings from before back with: sudo cp $(_ff_q "$backup") $(_ff_q "$file"), then run sudo freeframe configure again."
+    fi
+  done
+  say "Saved. The settings from before are in $backup"
+  FF_STATE="The new settings are saved. To put the ones from before back, run: sudo cp $(_ff_q "$backup") $(_ff_q "$file") && sudo freeframe restart"
+  if ((!restart)); then
+    say "The $(env_get "$file" FREEFRAME_CHANNEL) channel is used from the next sudo freeframe update."
+    trap - ERR INT TERM HUP
+    _install_log_stop
+    return 0
+  fi
+
+  FF_STEP="restarting FreeFrame"
+  if ((http_switch)); then
+    if ! switch_to_http_mode "$file" "$FF_CFG_HOST"; then
+      install_fail "FreeFrame could not be switched to plain HTTP." "see why with: sudo freeframe logs"
+    fi
+  else
+    say "Restarting FreeFrame with the new settings..."
+    if ! _ff_logged dc up -d --no-build --force-recreate; then
+      install_fail "FreeFrame could not be restarted with the new settings." "see why with: sudo freeframe logs"
+    fi
+  fi
+  url=$(env_get "$file" FRONTEND_URL)
+  FF_STEP="waiting for FreeFrame to answer"
+  if ! _ff_wait_healthy "$FF_CFG_MODE" "$FF_CFG_HOST"; then
+    install_fail "FreeFrame did not answer at $url after the change." "see why with: sudo freeframe logs"
+  fi
+  if [[ -n ${FF_CFG_NEW[FRONTEND_URL]:-} && $FF_CFG_MODE != off ]]; then
+    FF_STEP="waiting for the HTTPS certificate"
+    say "Waiting for the HTTPS certificate from Let's Encrypt (usually under a minute)..."
+    hosts=("$FF_CFG_HOST")
+    [[ $FF_CFG_STORAGE != bundled ]] || hosts+=("storage.$FF_CFG_HOST")
+    ok=1
+    for h in "${hosts[@]}"; do
+      if ! _ff_wait_for "${FF_CERT_WAIT:-300}" 10 cert_issued "$h"; then
+        ok=0
+        break
+      fi
+    done
+    if ((ok)); then
+      say "The certificate is in place."
+    else
+      warn "The HTTPS certificate for $h has not arrived yet, so browsers show a warning until it does."
+      warn "Check that the DNS records point at ${FF_IP:-this server} and that ports 80 and 443 are open to the internet,"
+      warn "then run: sudo freeframe restart"
+    fi
+  fi
+  trap - ERR INT TERM HUP
+  say ""
+  say "FreeFrame runs at $url with the new settings."
+  _install_log_stop
+}
+
+# ------------------------------------------------------------
+# Status, logs and restart (spec goal 14)
+# ------------------------------------------------------------
+
+# _ff_disk_line LABEL PATH: used, total and free space of the filesystem
+# holding PATH (or its nearest existing parent).
+_ff_disk_line() {
+  local label=$1 p=$2 u t a
+  while [[ ! -e $p && $p != / ]]; do p=$(dirname "$p"); done
+  read -r u t a < <(df -Pk "$p" 2>/dev/null | awk 'NR == 2 { print $3, $2, $4 }') || true
+  if [[ $u =~ ^[0-9]+$ && $t =~ ^[0-9]+$ && $a =~ ^[0-9]+$ ]]; then
+    say "  $label: $(_ff_human_size $((u * 1024))) used of $(_ff_human_size $((t * 1024))), $(_ff_human_size $((a * 1024))) free"
+  else
+    say "  $label: the free space could not be read"
+  fi
+}
+
+_ff_mount_of() {
+  local p=$1
+  while [[ ! -e $p && $p != / ]]; do p=$(dirname "$p"); done
+  df -Pk "$p" 2>/dev/null | awk 'NR == 2 { print $6 }'
+}
+
+cmd_status() {
+  local root file ch ver pinned url mode host storage latest line svc state st s found end smtp
+  local next timer dir last n bytes undo
+  local -a all=() rows=() dumps=()
+  root=$(ff_root)
+  file="$root/.env.prod"
+  if ((${#FF_ARGS[@]})); then _ff_bad_usage "freeframe status takes no other words."; fi
+  _ff_need_root status
+  _ff_need_install
+  ch=$(ff_channel "$file")
+  _ff_check_channel "$ch"
+  ver=$(ff_version)
+  pinned=$(env_get "$file" FREEFRAME_VERSION)
+  url=$(env_get "$file" FRONTEND_URL)
+  host=$(_ff_url_host "$url")
+  mode=$(env_get "$file" FREEFRAME_HTTPS)
+  mode=${mode:-off}
+  storage=$(env_get "$file" FREEFRAME_STORAGE)
+
+  say "FreeFrame on this server"
+  if [[ -n $pinned ]]; then
+    say "  Version:      $ver (pinned in $file), $ch channel"
+  else
+    say "  Version:      $ver, from the $ch channel"
+  fi
+  if latest=$(remote_version "$ch"); then
+    if _ff_version_gt "$latest" "$ver"; then
+      say "  Updates:      $latest is available on the $ch channel. To move to it, run: sudo freeframe update"
+      if [[ -n $pinned ]]; then
+        say "                (first delete the FREEFRAME_VERSION line from $file, which keeps this server on $pinned)"
+      fi
+    else
+      say "  Updates:      none; this is the newest release on the $ch channel"
+    fi
+  else
+    say "  Updates:      Could not check for a newer release (GitHub did not answer)."
+  fi
+  say "  Web address:  $url"
+  if probe_health "$mode" "$host"; then
+    say "  Health:       FreeFrame answers at its web address"
+  else
+    say "  Health:       FreeFrame does not answer at its web address (see why with: sudo freeframe logs)"
+  fi
+  if [[ $mode != off ]]; then
+    if end=$(cert_expiry "$host"); then
+      say "  Certificate:  valid until $end"
+    else
+      say "  Certificate:  not issued yet, so browsers show a warning. Check that the DNS records point here, then run: sudo freeframe restart"
+    fi
+  fi
+  if [[ $storage == bundled ]]; then
+    say "  Footage:      kept on this server"
+  else
+    say "  Footage:      in the S3 bucket $(env_get "$file" S3_BUCKET)"
+  fi
+  smtp=$(env_get "$file" SMTP_HOST)
+  if [[ -n $smtp ]]; then
+    say "  Email:        sent through $smtp"
+  else
+    say "  Email:        not set up, so sign-in codes and invitations are not sent (sudo freeframe configure)"
+  fi
+
+  say ""
+  say "Parts of FreeFrame:"
+  if st=$(dc ps -a --format '{{.Service}}|{{.State}}|{{.Status}}' 2>/dev/null) &&
+    s=$(dc config --services 2>/dev/null); then
+    mapfile -t rows <<<"$st"
+    mapfile -t all <<<"$s"
+    for svc in "${all[@]}"; do
+      [[ -n $svc ]] || continue
+      found=""
+      for line in ${rows[@]+"${rows[@]}"}; do
+        if [[ ${line%%|*} == "$svc" ]]; then found=$line; fi
+      done
+      if [[ -n $found ]]; then
+        state=${found#*|}
+        printf '  %-20s %-9s %s\n' "$svc" "${state%%|*}" "${state#*|}"
+      else
+        printf '  %-20s %s\n' "$svc" "not created"
+      fi
+    done
+  else
+    say "  Docker does not answer, so the state of each part is not known."
+    say "  What to try: sudo systemctl start docker, then sudo freeframe restart"
+  fi
+
+  say ""
+  say "Disk:"
+  _ff_disk_line "$root" "$root"
+  if [[ $(_ff_mount_of /var/lib/docker) != "$(_ff_mount_of "$root")" ]]; then
+    _ff_disk_line "Docker's data (/var/lib/docker)" /var/lib/docker
+  fi
+
+  say ""
+  say "Backups (of the database, in $root/backups):"
+  dir="$root/backups"
+  mapfile -t dumps < <(_ff_backup_dumps "$dir")
+  n=${#dumps[@]}
+  if ((n == 0)); then
+    say "  Last:         none yet (to make one now: sudo freeframe backup)"
+  else
+    last=${dumps[n - 1]}
+    bytes=$(_ff_size_bytes "$last") || bytes=0
+    say "  Last:         $(_ff_stamp_date "${last##*/}") (${last##*/}, $(_ff_human_size "$bytes")); $n kept"
+  fi
+  timer=$(systemctl show -p ActiveState --value freeframe-backup.timer 2>/dev/null) || timer=""
+  if [[ $timer == active ]]; then
+    next=$(systemctl show -p NextElapseUSecRealtime --value freeframe-backup.timer 2>/dev/null) || next=""
+    say "  Next:         ${next:-tonight at about 3:00}"
+  else
+    say "  Next:         none: the nightly backup is off. To turn it on, run: sudo systemctl enable --now freeframe-backup.timer"
+  fi
+  undo=$(_restore_undo_path)
+  if [[ -n $undo ]]; then
+    say "  A restore did not finish. To go back to the database as it was before it, run: sudo freeframe restore --yes $(_ff_q "$undo")"
+  fi
+  say "  These backups are on this server only, so they do not survive losing it. Copy them somewhere"
+  say "  else now and then; the guide explains how: $FF_GUIDE_URL"
+}
+
+# cmd_logs: `freeframe logs [PART]`: the last 200 lines, then new ones as
+# they come (Ctrl-C to stop).
+cmd_logs() {
+  local svc out s ok=0
+  local -a all=()
+  if ((${#FF_ARGS[@]} > 1)); then
+    _ff_bad_usage "freeframe logs takes at most one part of FreeFrame, for example: sudo freeframe logs api"
+  fi
+  _ff_need_root logs
+  _ff_need_install
+  svc=${FF_ARGS[0]:-}
+  if [[ -z $svc ]]; then
+    dc logs -f --tail 200
+    return
+  fi
+  if out=$(dc config --services 2>/dev/null); then
+    mapfile -t all <<<"$out"
+    for s in "${all[@]}"; do
+      if [[ $s == "$svc" ]]; then ok=1; fi
+    done
+    if ((!ok)); then
+      _ff_stop 2 "FreeFrame has no part called '$svc'." "use one of: ${all[*]}; or leave it out to see them all."
+    fi
+  fi
+  dc logs -f --tail 200 "$svc"
+}
+
+# _ff_manage_stop CODE MESSAGE WHAT_TO_TRY: _ff_stop, with the lines also in
+# install.log (restart does not copy the screen into the log).
+_ff_manage_stop() {
+  _ff_log_lines "$2" "What to try: $3"
+  _ff_stop "$1" "$2" "$3"
+}
+
+# cmd_restart: `freeframe restart`: every container recreated from the
+# images already here (dc up -d --no-build --force-recreate), then a wait
+# until FreeFrame answers. An unfinished restore's undo record is left alone.
+cmd_restart() {
+  local root url
+  root=$(ff_root)
+  if ((${#FF_ARGS[@]})); then _ff_bad_usage "freeframe restart takes no other words."; fi
+  _ff_need_root restart
+  _ff_need_install
+  _ff_need_finished_install restart
+  _ff_refuse_unfinished_restore restart
+  FF_ACTOR="the restart"
+  _ff_log_open restart
+  if ! _ff_lock; then
+    _ff_manage_stop 1 "Another backup or restore is running right now, so FreeFrame was not restarted." \
+      "wait a few minutes for it to finish, then run sudo freeframe restart again."
+  fi
+  say "Restarting FreeFrame..."
+  if ! _ff_logged dc up -d --no-build --force-recreate; then
+    _ff_manage_stop 1 "FreeFrame could not be restarted." \
+      "the reason is at the end of ${FF_LOG:-the output above}. Then run sudo freeframe restart again."
+  fi
+  say "Waiting for FreeFrame to finish starting..."
+  if ! _ff_wait_for "${FF_API_WAIT:-600}" 5 _ff_logged dc exec -T api curl -fsS http://localhost:8000/health; then
+    _ff_manage_stop 1 "FreeFrame was restarted but did not finish starting within $(((${FF_API_WAIT:-600} + 59) / 60)) minutes." \
+      "see why with: sudo freeframe logs"
+  fi
+  url=$(env_get "$root/.env.prod" FRONTEND_URL)
+  say "FreeFrame is running again: $url"
+}
+
+# ------------------------------------------------------------
 # Commands
 # ------------------------------------------------------------
 
@@ -3129,14 +4229,18 @@ Usage: sudo freeframe <command> [options]
 Commands:
   install     Set up FreeFrame on this server (asks a few questions)
   update      Back up, then move to the newest release on your channel
-  configure   Change the answers you gave (web address, email, storage)
+              (updates this command first; --channel picks another channel)
+  configure   Change the answers you gave (web address, email, storage);
+              with --yes, give only the new answers as options
   backup      Save a copy of the database to /opt/freeframe/backups now
               (this also runs every night at 3:00; the newest 7 are kept)
   restore     List the backups; restore FILE puts one back (replaces the
               current database, after saving a copy of it)
-  status      Show whether everything is running, disk space and backups
-  logs        Show recent messages from FreeFrame
-  restart     Restart FreeFrame
+  status      Show the version, whether everything is running, disk space,
+              backups and whether a newer release is out
+  logs        Show FreeFrame's recent messages and follow new ones (Ctrl-C
+              stops); logs api shows one part only
+  restart     Restart every part of FreeFrame and wait until it answers
   help        Show this list
 
 Answers can be given ahead of time as options or environment variables, for
@@ -3156,16 +4260,19 @@ EOF
 }
 
 main() {
+  # Kept for update, which runs its new copy with the same arguments.
+  FF_ORIG_ARGS=("$@")
   parse_args "$@"
   case $FF_CMD in
     help) usage ;;
     install) cmd_install ;;
     backup) cmd_backup ;;
     restore) cmd_restore ;;
-    update | configure | status | logs | restart)
-      warn "freeframe $FF_CMD is not implemented yet."
-      return 1
-      ;;
+    update) cmd_update ;;
+    configure) cmd_configure ;;
+    status) cmd_status ;;
+    logs) cmd_logs ;;
+    restart) cmd_restart ;;
     *)
       warn "Unknown command: $FF_CMD"
       warn "What to try: run $(_ff_help_cmd) to see the commands."

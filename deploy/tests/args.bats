@@ -182,10 +182,15 @@ setup() {
   done
 }
 
-@test "a subcommand not built yet says so and fails" {
-  run bash "$FF_SCRIPT" status
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"not implemented"* ]]
+@test "every subcommand is built: on a server without FreeFrame each one stops before doing anything" {
+  local c
+  for c in update configure status logs restart; do
+    run bash "$FF_SCRIPT" "$c"
+    # 1: not installed here (FF_ROOT is empty); 2: not root.
+    [[ $status -eq 1 || $status -eq 2 ]] || { echo "$c: $status $output"; false; }
+    [[ $output != *"not implemented"* ]] || { echo "$c: $output"; false; }
+    [[ $output == *"not installed"* || $output == *"as root"* ]] || { echo "$c: $output"; false; }
+  done
 }
 
 @test "an unknown subcommand exits 2" {

@@ -1,0 +1,179 @@
+#!/usr/bin/env bats
+# `freeframe status`, `logs` and `restart`, with every side effect stubbed
+# (manage_stubs.bash).
+
+load manage_helpers
+
+setup() {
+  manage_setup
+  installed_server sslip bundled 1.21.0
+}
+
+# ---------------------------------------------------------------- status
+
+@test "status: version, channel, address, services, disk and backups, and never a secret" {
+  mkdir -p "$BK"
+  printf 'PGDMP x\n' >"$BK/freeframe-20261025-030411.dump"
+  printf 'PGDMP y\n' >"$BK/freeframe-20261026-030412.dump"
+  ff status
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "Version:"
+  assert_out "1.21.0"
+  assert_out "latest channel"
+  assert_out "https://203-0-113-7.sslip.io"
+  assert_out "answers"
+  # Every container, including one that stopped.
+  assert_out "api"
+  assert_out "Up 2 hours (healthy)"
+  assert_out "worker"
+  assert_out "Exited (1) 5 minutes ago"
+  # Disk and backups.
+  assert_out "free"
+  assert_out "2026-10-26 03:04:12"
+  assert_out "Tue 2026-10-27 03:07:12 UTC"
+  assert_out "on this server only"
+  local k v
+  for k in POSTGRES_PASSWORD REDIS_PASSWORD JWT_SECRET S3_ACCESS_KEY S3_SECRET_KEY; do
+    v=$(env_get "$ENV" "$k")
+    [ -n "$v" ]
+    assert_no_out "$v"
+  done
+}
+
+@test "status: a newer release on the channel is named with the command to get it" {
+  export STUB_REMOTE_VERSION=1.22.0
+  ff status
+  [ "$status" -eq 0 ]
+  assert_out "1.22.0 is available on the latest channel"
+  assert_out "sudo freeframe update"
+  grep -qx "remote_version latest" "$CALLS"
+}
+
+@test "status: the newest release says so" {
+  ff status
+  [ "$status" -eq 0 ]
+  assert_out "this is the newest release on the latest channel"
+}
+
+@test "status: no network is not an error" {
+  export STUB_NET_DOWN=1
+  ff status
+  [ "$status" -eq 0 ]
+  assert_out "Could not check for a newer release"
+  assert_out "Version:"
+}
+
+@test "status: the certificate's expiry is shown for HTTPS" {
+  ff status
+  [ "$status" -eq 0 ]
+  assert_out "Jan 24 10:00:00 2027 GMT"
+  grep -qx "cert_expiry 203-0-113-7.sslip.io" "$CALLS"
+}
+
+@test "status: plain HTTP has no certificate line" {
+  env_set "$ENV" FREEFRAME_HTTPS off
+  env_set "$ENV" FRONTEND_URL http://203.0.113.7
+  ff status
+  [ "$status" -eq 0 ]
+  assert_not_called cert_expiry
+  assert_out "http://203.0.113.7"
+}
+
+@test "status: Docker not answering still shows the rest" {
+  export STUB_DOCKER_DOWN=1
+  ff status
+  [ "$status" -eq 0 ]
+  assert_out "Docker does not answer"
+  assert_out "Version:"
+  assert_out "free"
+}
+
+@test "status: a timer that is off is said, with the command to turn it on" {
+  export STUB_TIMER_STATE=inactive
+  ff status
+  [ "$status" -eq 0 ]
+  assert_out "sudo systemctl enable --now freeframe-backup.timer"
+}
+
+@test "status: a pinned version and a channel given with --channel are shown, nothing is written" {
+  printf 'FREEFRAME_VERSION=1.20.0\n' >>"$ENV"
+  cp "$ENV" "$BATS_TEST_TMPDIR/env.before"
+  ff status --channel stable
+  [ "$status" -eq 0 ]
+  assert_out "1.20.0 (pinned"
+  grep -qx "remote_version stable" "$CALLS"
+  cmp "$ENV" "$BATS_TEST_TMPDIR/env.before"
+}
+
+# ---------------------------------------------------------------- logs
+
+@test "logs: follows the last 200 lines, of everything or one part" {
+  ff logs
+  [ "$status" -eq 0 ]
+  grep -qx "dc logs -f --tail 200" "$CALLS"
+  : >"$CALLS"
+  ff logs api
+  [ "$status" -eq 0 ]
+  grep -qx "dc logs -f --tail 200 api" "$CALLS"
+}
+
+@test "logs: an unknown part is named, with the list of parts" {
+  ff logs apii
+  [ "$status" -eq 2 ]
+  assert_out "apii"
+  assert_out "api worker"
+  assert_not_called "dc logs"
+}
+
+# ---------------------------------------------------------------- restart
+
+@test "restart: recreates every container without building, then waits for FreeFrame" {
+  ff restart
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_order "dc up -d --no-build --force-recreate" "localhost:8000/health"
+  assert_out "FreeFrame is running again"
+}
+
+@test "restart: FreeFrame not coming back says how to see why" {
+  export STUB_API_DOWN=1 FF_API_WAIT=10
+  ff restart
+  [ "$status" -eq 1 ]
+  assert_out "sudo freeframe logs"
+}
+
+@test "restart: an unfinished restore is not started over, and its record is kept" {
+  mkdir -p "$BK"
+  printf 'PGDMP old\n' >"$BK/freeframe-20261020-030000.dump"
+  printf '%s\n' "$BK/freeframe-20261020-030000.dump" >"$FF_ROOT/.restore-undo"
+  ff restart
+  [ "$status" -eq 1 ]
+  assert_out "A restore of the database did not finish"
+  assert_out "sudo freeframe restore --yes '$BK/freeframe-20261020-030000.dump'"
+  assert_not_called "dc up"
+  assert_eq "$(cat "$FF_ROOT/.restore-undo")" "$BK/freeframe-20261020-030000.dump"
+}
+
+@test "restart: waits its turn behind a backup or restore" {
+  exec 9>>"$FF_ROOT/.freeframe.lock"
+  flock -n 9
+  ff restart
+  exec 9>&-
+  [ "$status" -eq 1 ]
+  assert_out "Another backup or restore is running"
+  assert_not_called "dc up"
+}
+
+@test "status, logs and restart need root and an installed FreeFrame" {
+  local c
+  for c in status logs restart; do
+    STUB_NOT_ROOT=1 ff "$c"
+    [ "$status" -eq 2 ] || { echo "$c: $output"; false; }
+    assert_out "sudo freeframe $c"
+  done
+  rm "$ENV"
+  for c in status logs restart; do
+    ff "$c"
+    [ "$status" -eq 1 ] || { echo "$c: $output"; false; }
+    assert_out "not installed"
+  done
+}
