@@ -104,6 +104,30 @@ X
   assert_eq "$(cat "$F")" "$(printf 'A=1\nFRONTEND_URL=https://new.example.com\nC=3')"
 }
 
+@test "a pre-created empty file with wide permissions becomes 600 on the first write" {
+  : > "$F"
+  chmod 644 "$F"
+  env_set_if_missing "$F" JWT_SECRET abc
+  run ls -l "$F"
+  [[ "$output" == -rw-------* ]]
+}
+
+@test "a copied 644 file becomes 600 when a key is replaced" {
+  printf 'A=1\n' > "$F"
+  chmod 644 "$F"
+  env_set "$F" A 2
+  run ls -l "$F"
+  [[ "$output" == -rw-------* ]]
+}
+
+@test "env_backup copies are 600 even when the original is not" {
+  printf 'JWT_SECRET=s\n' > "$F"
+  chmod 644 "$F"
+  b=$(env_backup "$F")
+  run ls -l "$b"
+  [[ "$output" == -rw-------* ]]
+}
+
 @test "env_set keeps the file mode" {
   printf 'A=1\n' > "$F"
   chmod 600 "$F"

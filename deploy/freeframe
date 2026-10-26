@@ -135,6 +135,12 @@ _env_write() {
   if [[ ! -e $file ]]; then
     (umask 077 && : >"$file") || return 1
   fi
+  # The settings file holds secrets: owner-only on every write, also for a
+  # file that was created empty or copied in with wider permissions.
+  if ! chmod 600 "$file"; then
+    warn "Cannot make $file private (chmod 600 failed)."
+    return 1
+  fi
   while IFS= read -r line || [[ -n $line ]]; do
     lines+=("$line")
     [[ ${line%$'\r'} == "$key="* ]] && idx=$i
@@ -159,15 +165,15 @@ _env_write() {
 }
 
 # env_set_if_missing FILE KEY VALUE: write only when KEY is absent or empty.
-# Returns 0 either way. An empty VALUE writes nothing. Creates FILE with
-# owner-only permissions when it does not exist.
+# Returns 0 when nothing needed writing or the write worked, 1 when the write
+# failed. An empty VALUE writes nothing. Every write leaves FILE mode 600.
 env_set_if_missing() { _env_write "$1" "$2" "$3" missing; }
 
 # env_set FILE KEY VALUE: overwrite KEY (used only by `configure`).
 env_set() { _env_write "$1" "$2" "$3" always; }
 
-# env_backup FILE: copy FILE to FILE.<YYYYmmdd-HHMMSS> and print that path.
-# A second backup within the same second gets a -1, -2, ... suffix.
+# env_backup FILE: copy FILE to FILE.<YYYYmmdd-HHMMSS> (mode 600) and print
+# that path. A second backup within the same second gets a -1, -2, ... suffix.
 env_backup() {
   local file=$1 stamp dest n=1
   if [[ ! -f $file ]]; then
@@ -180,7 +186,8 @@ env_backup() {
     dest="$file.$stamp-$n"
     n=$((n + 1))
   done
-  cp -p "$file" "$dest" || return 1
+  (umask 077 && cp -p "$file" "$dest") || return 1
+  chmod 600 "$dest" || return 1
   printf '%s\n' "$dest"
 }
 
@@ -599,6 +606,10 @@ derive_env() {
   ((${#workers[@]})) || read -ra workers <<<"$(size_workers 2 4096)"
 
   # --- Write. ---
+  if [[ -e $file ]] && ! chmod 600 "$file"; then
+    warn "Cannot make $file private (chmod 600 failed)."
+    return 1
+  fi
   if [[ ! -s $file ]]; then
     (umask 077 && cat >"$file" <<'EOF'
 # FreeFrame settings, written by the freeframe command.

@@ -291,3 +291,21 @@ derive() {
   run ls -l "$F"
   [[ "$output" == -rw-------* ]]
 }
+
+@test "a copied 644 settings file becomes 600 after derive_env" {
+  printf 'JWT_SECRET=moved\n' > "$F"
+  chmod 644 "$F"
+  run derive FF_HTTPS=off FF_IP=192.168.1.20
+  [ "$status" -eq 0 ]
+  run ls -l "$F"
+  [[ "$output" == -rw-------* ]]
+}
+
+@test "an empty 644 settings file becomes 600 after derive_env" {
+  : > "$F"
+  chmod 644 "$F"
+  run derive FF_HTTPS=off FF_IP=192.168.1.20
+  [ "$status" -eq 0 ]
+  run ls -l "$F"
+  [[ "$output" == -rw-------* ]]
+}
