@@ -210,11 +210,44 @@ assert_root_untouched() {
   grep -q '^dc up -d' "$CALLS"
 }
 
-@test "install: the channel defaults to stable" {
+@test "install: the channel defaults to latest, the ref install.sh uses by default" {
   plain_answers
   ff_install --yes
   [ "$status" -eq 0 ]
-  grep -q '^fetch stable docker-compose.prod.yml$' "$CALLS"
+  grep -q '^fetch latest docker-compose.prod.yml$' "$CALLS"
+  assert_has "$ENV" "FREEFRAME_CHANNEL=latest"
+}
+
+@test "install: a re-run with --channel takes the setup files from it and saves it, after a backup" {
+  plain_answers
+  ff_install --yes --channel latest
+  [ "$status" -eq 0 ]
+  # Settings from an earlier attempt that say stable.
+  rm -f "$FF_ROOT/.installed"
+  env_set "$ENV" FREEFRAME_CHANNEL stable
+  cp "$ENV" "$BATS_TEST_TMPDIR/env.before"
+  rm -f "$ENV".2*
+  : >"$CALLS"
+  # install.sh downloaded this script from latest and passes --channel latest.
+  ff_install --yes --channel latest
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -qx 'fetch latest docker-compose.prod.yml' "$CALLS"
+  assert_not_called "fetch stable"
+  assert_has "$ENV" "FREEFRAME_CHANNEL=latest"
+  local b
+  b=$(ls "$ENV".2*)
+  cmp "$b" "$BATS_TEST_TMPDIR/env.before"
+}
+
+@test "install: a re-run without --channel keeps the settings file's channel" {
+  plain_answers
+  ff_install --yes --channel stable
+  [ "$status" -eq 0 ]
+  rm -f "$FF_ROOT/.installed"
+  : >"$CALLS"
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -qx 'fetch stable docker-compose.prod.yml' "$CALLS"
   assert_has "$ENV" "FREEFRAME_CHANNEL=stable"
 }
 
@@ -1011,7 +1044,7 @@ assert_root_untouched() {
   assert_out "storage.review.yourstudio.com"
   assert_out "203.0.113.7"
   assert_order "dns_points_here review.yourstudio.com 203.0.113.7" "sleep 15" \
-    "dns_points_here review.yourstudio.com 203.0.113.7" "fetch stable docker-compose.prod.yml"
+    "dns_points_here review.yourstudio.com 203.0.113.7" "fetch latest docker-compose.prod.yml"
   assert_has "$ENV" "FRONTEND_URL=https://review.yourstudio.com"
   assert_has "$ENV" "FREEFRAME_HTTPS=own"
   grep -q "cert_issued review.yourstudio.com" "$CALLS"

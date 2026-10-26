@@ -369,8 +369,39 @@ _ff_cmd_installed() { [[ -x ${FF_BIN_DIR:-/usr/local/bin}/freeframe ]]; }
 # passing ARGS on to freeframe install.
 _ff_bootstrap_cmd() {
   local ch=${FF_CHANNEL:-latest}
-  if [[ ! $ch =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ || $ch == *..* ]]; then ch=latest; fi
+  _ff_valid_ref "$ch" || ch=latest
   printf 'curl -fsSL %s/%s/install.sh | sudo bash -s -- %s' "$FF_RAW_BASE" "$ch" "$*"
+}
+
+# _ff_valid_ref REF: 0 for a usable branch or tag name (stable, latest,
+# v1.22.0), never a path that climbs out of the repository.
+_ff_valid_ref() { [[ ${1:-} =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ && $1 != *..* ]]; }
+
+# ff_channel FILE: the channel (branch or tag) this run uses, one rule for
+# every command and for the freeframe command and the setup files alike:
+# --channel (or FREEFRAME_CHANNEL) when given, otherwise FREEFRAME_CHANNEL in
+# FILE, otherwise latest (the ref the one-line install command uses).
+ff_channel() {
+  local ch=${FF_CHANNEL:-}
+  [[ -n $ch ]] || ch=$(env_get "$1" FREEFRAME_CHANNEL)
+  printf '%s' "${ch:-latest}"
+}
+
+# _ff_check_channel CH: stop (exit 2) when CH is not a branch or tag name.
+_ff_check_channel() {
+  if ! _ff_valid_ref "$1"; then
+    _ff_stop 2 "The channel '$1' is not a branch or tag name such as stable or latest." "use --channel stable or --channel latest."
+  fi
+}
+
+# ff_save_channel FILE CH: make CH the channel saved in FILE (an explicit
+# --channel wins), backing FILE up first. Does nothing when it is already.
+ff_save_channel() {
+  local file=$1 ch=$2 backup
+  [[ $(env_get "$file" FREEFRAME_CHANNEL) != "$ch" ]] || return 0
+  backup=$(env_backup "$file") || return 1
+  env_set "$file" FREEFRAME_CHANNEL "$ch" || return 1
+  say "The channel is now $ch (the previous settings are saved in $backup)."
 }
 
 # _ff_help_cmd: the command that lists the commands and options.
@@ -694,7 +725,7 @@ derive_env() {
       ;;
   esac
   channel=$(env_get "$file" FREEFRAME_CHANNEL)
-  channel=${channel:-${FF_CHANNEL:-stable}}
+  channel=${channel:-${FF_CHANNEL:-latest}}
   cores=${FF_CORES:-$(_ff_cores)}
   ram=${FF_RAM_MB:-$(_ff_ram_mb)}
   read -ra workers <<<"$(size_workers "$cores" "$ram")" || true
@@ -1525,11 +1556,14 @@ install_preflight() {
 # ahead of time or is already in the settings file (settings copied from
 # another server, or an earlier attempt).
 
+# The channel follows ff_channel: --channel (install.sh always passes the
+# ref it downloaded this script from) wins over the settings file's, so the
+# script and the setup files come from the same ref. The settings step
+# saves it.
 _install_ask_channel() {
   local file=$1 ref
-  ref=$(env_get "$file" FREEFRAME_CHANNEL)
-  ref=${ref:-${FF_CHANNEL:-stable}}
-  if [[ ! $ref =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ || $ref == *..* ]]; then
+  ref=$(ff_channel "$file")
+  if ! _ff_valid_ref "$ref"; then
     _ff_answer_error "The channel '$ref' is not a branch or tag name such as stable or latest." "use --channel stable or --channel latest."
   fi
   FF_CHANNEL=$ref
@@ -2078,21 +2112,50 @@ _install_fetch_step() {
 # Fill the settings file. An existing file (copied from another server, or
 # an earlier attempt) is only completed, never changed, and it is backed up
 # first whenever something is added.
+# fill_settings FILE [CHANNEL]: complete FILE with derive_env: only missing
+# or empty keys are added and secrets are never replaced (spec goal 6). With
+# CHANNEL, FREEFRAME_CHANNEL is set to it first (an explicit --channel). The
+# work happens on a copy: when the copy differs, FILE is backed up
+# (env_backup) and the copy moved over it; otherwise FILE stays byte for byte
+# as it was. FILE always ends mode 600. 1 on failure (with a message).
+fill_settings() {
+  local file=$1 ch=${2:-} tmp
+  if ! tmp=$(mktemp "$file.new.XXXXXX"); then
+    warn "Cannot write next to $file."
+    return 1
+  fi
+  if ! cp -p "$file" "$tmp"; then
+    rm -f "$tmp"
+    warn "Cannot copy $file."
+    return 1
+  fi
+  if [[ -n $ch && $(env_get "$tmp" FREEFRAME_CHANNEL) != "$ch" ]] && ! env_set "$tmp" FREEFRAME_CHANNEL "$ch"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if ! derive_env "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if cmp -s "$file" "$tmp"; then
+    rm -f "$tmp"
+  elif ! env_backup "$file" >/dev/null; then
+    rm -f "$tmp"
+    warn "Could not back up $file."
+    return 1
+  elif ! mv -f "$tmp" "$file"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  chmod 600 "$file"
+}
+
 _install_settings_step() {
-  local file=$1 tmp
+  local file=$1
   FF_STEP="writing the settings"
   if [[ -f $file ]]; then
-    tmp=$(mktemp "$file.new.XXXXXX") || install_fail "Cannot write next to $file." "check that the disk is not full, then run the installer again."
-    cp -p "$file" "$tmp"
-    if ! derive_env "$tmp"; then
-      rm -f "$tmp"
+    if ! fill_settings "$file" "$FF_CHANNEL"; then
       install_fail "The settings could not be completed." "fix what the message above says, then run sudo freeframe install again."
-    fi
-    if cmp -s "$file" "$tmp"; then
-      rm -f "$tmp"
-    else
-      env_backup "$file" >/dev/null || install_fail "Could not back up $file." "check that the disk is not full, then run the installer again."
-      mv -f "$tmp" "$file"
     fi
   elif ! derive_env "$file"; then
     install_fail "The settings could not be written." "fix what the message above says, then run sudo freeframe install again."

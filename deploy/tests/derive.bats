@@ -33,7 +33,7 @@ derive() {
   assert_has "$F" "STORAGE_PORT_BIND=127.0.0.1:9000"
   assert_has "$F" "FREEFRAME_HTTPS=own"
   assert_has "$F" "FREEFRAME_STORAGE=bundled"
-  assert_has "$F" "FREEFRAME_CHANNEL=stable"
+  assert_has "$F" "FREEFRAME_CHANNEL=latest"
   [[ "$(env_get "$F" S3_ACCESS_KEY)" =~ ^[0-9a-f]{32}$ ]]
   [[ "$(env_get "$F" S3_SECRET_KEY)" =~ ^[0-9a-f]{64}$ ]]
 }
