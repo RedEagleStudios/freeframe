@@ -2717,6 +2717,16 @@ _restore_fail() {
   install_fail "$2" "$3"
 }
 
+# _restore_restart: start FreeFrame again after a step that changed nothing
+# failed, and print the sentence that says whether that worked.
+_restore_restart() {
+  if _ff_logged dc up -d --no-build; then
+    printf 'FreeFrame has been started again.'
+  else
+    printf 'FreeFrame could not be started again. To start it, run: sudo freeframe restart'
+  fi
+}
+
 _restore_on_error() {
   local code=$?
   if ((BASH_SUBSHELL > 0)); then exit "$code"; fi
@@ -2832,8 +2842,7 @@ cmd_restore() {
   done
   say "Stopping FreeFrame (its web address shows an error until the restore is done)..."
   if ((${#svcs[@]})) && ! _ff_logged dc stop "${svcs[@]}"; then
-    _ff_logged dc up -d --no-build || true
-    _restore_fail "" "FreeFrame could not be stopped, so nothing was changed." \
+    _restore_fail "$(_restore_restart)" "FreeFrame could not be stopped, so nothing was changed." \
       "run: $FF_RERUN. The reason is at the end of the log."
   fi
   FF_STATE="FreeFrame is stopped and the database has not been changed. To start FreeFrame again as it was, run: sudo freeframe restart"
@@ -2843,16 +2852,14 @@ cmd_restore() {
   # cannot be checked is never dropped without a copy.
   FF_STEP="checking the current database"
   if ! state=$(_restore_db_state); then
-    _ff_logged dc up -d --no-build || true
-    _restore_fail "" "The current database could not be checked, so the restore stopped before changing anything (it will not replace a database it cannot copy first). FreeFrame has been started again." \
+    _restore_fail "$(_restore_restart)" "The current database could not be checked, so the restore stopped before changing anything (it will not replace a database it cannot copy first)." \
       "the reason is at the end of $FF_LOG. Then run: $FF_RERUN"
   fi
   FF_STEP="saving a copy of the current database"
   if [[ $state == data ]]; then
     say "Saving a copy of the current database first..."
     if ! backup_create keep; then
-      _ff_logged dc up -d --no-build || true
-      _restore_fail "" "No copy of the current database could be saved, so the restore stopped before changing anything. FreeFrame has been started again." \
+      _restore_fail "$(_restore_restart)" "No copy of the current database could be saved, so the restore stopped before changing anything." \
         "fix what the message above says, then run: $FF_RERUN"
     fi
     if [[ -n $recorded ]]; then
@@ -2861,8 +2868,7 @@ cmd_restore() {
     else
       recorded=$FF_BACKUP_MADE
       if ! _restore_undo_set "$recorded"; then
-        _ff_logged dc up -d --no-build || true
-        _restore_fail "" "The copy of the current database ($recorded) could not be recorded, so the restore stopped before changing anything. FreeFrame has been started again." \
+        _restore_fail "$(_restore_restart)" "The copy of the current database ($recorded) could not be recorded, so the restore stopped before changing anything." \
           "check that the disk is not full, then run: $FF_RERUN"
       fi
       say "Saved the current database as $recorded"
@@ -2881,8 +2887,7 @@ cmd_restore() {
   FF_STEP="removing the current database"
   say "Replacing the database with the backup..."
   if ! _ff_logged dc exec -T postgres dropdb -U "$FF_PG_USER" --if-exists --force "$FF_PG_DB"; then
-    _ff_logged dc up -d --no-build || true
-    _restore_fail "" "The current database could not be removed, so it is unchanged, and FreeFrame has been started again." \
+    _restore_fail "$(_restore_restart)" "The current database could not be removed, so it is unchanged." \
       "the reason is at the end of $FF_LOG. Then run: $FF_RERUN"
   fi
   FF_STATE="The database has been removed and is not back yet. FreeFrame is stopped, so nothing can write to it. To try again, run: $FF_RERUN${undo:+. To go back to the data as it was before this restore instead, run: $undo_cmd}"

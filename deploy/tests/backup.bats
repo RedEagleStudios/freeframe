@@ -551,6 +551,29 @@ dumps() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null) || true; }
   assert_out "install.log"
 }
 
+@test "restore: it says FreeFrame was started again only when it was" {
+  old_backup 20261020-030000
+  export STUB_DROP_FAIL=1
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  assert_out "FreeFrame has been started again."
+  export STUB_UP_FAIL=1
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  if [[ $output == *"has been started again"* ]]; then echo "$output"; false; fi
+  assert_out "FreeFrame could not be started again. To start it, run: sudo freeframe restart"
+  # The same for a stop that fails, and a database that cannot be checked.
+  export STUB_DROP_FAIL="" STUB_STOP_FAIL=1
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  assert_out "FreeFrame could not be stopped, so nothing was changed."
+  assert_out "FreeFrame could not be started again."
+  export STUB_STOP_FAIL="" STUB_DB_OPEN_FAIL=1
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  assert_out "FreeFrame could not be started again."
+}
+
 @test "restore: createdb failing after the drop says the database is gone and how to retry" {
   old_backup 20261020-030000
   export STUB_CREATE_FAIL=1
