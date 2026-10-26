@@ -1,0 +1,786 @@
+#!/usr/bin/env bash
+# ============================================================
+# freeframe: install and look after FreeFrame on this server.
+#
+#   sudo freeframe install     set up FreeFrame on a fresh server
+#   sudo freeframe help        list every command
+#
+# Everything lives in /opt/freeframe: the compose files, the settings file
+# .env.prod (private, holds generated passwords), backups/ and install.log.
+#
+# This file can be sourced without side effects (the tests in deploy/tests do
+# that); it only runs when executed. Strict mode (set -Eeuo pipefail) is turned
+# on at the bottom, only when executed, so sourcing never changes the caller's
+# shell options. Every function below is written to work under strict mode.
+# ============================================================
+
+# ------------------------------------------------------------
+# Messages
+# ------------------------------------------------------------
+
+warn() { printf '%s\n' "$*" >&2; }
+
+ff_root() { printf '%s' "${FF_ROOT:-/opt/freeframe}"; }
+
+# ------------------------------------------------------------
+# .env.prod reading and writing
+#
+# Values are written as KEY=VALUE, unquoted. The one exception is a value that
+# docker compose would change when it reads the file: compose expands $NAME,
+# drops " #..." as a comment and trims spaces in unquoted values. Such a value
+# (typically a typed SMTP or storage password) is written single-quoted, or
+# double-quoted with \ " $ escaped when it contains a single quote, so compose
+# hands the container exactly what was typed.
+# ------------------------------------------------------------
+
+_env_key_ok() { [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; }
+
+# _env_decode RAW: the value compose sees for the text after "KEY=".
+_env_decode() {
+  local raw=$1 out="" c i=0
+  raw=${raw#"${raw%%[![:space:]]*}"}
+  case $raw in
+    \'*)
+      raw=${raw#\'}
+      printf '%s' "${raw%%\'*}"
+      ;;
+    \"*)
+      raw=${raw#\"}
+      while ((i < ${#raw})); do
+        c=${raw:i:1}
+        if [[ $c == "\\" ]] && ((i + 1 < ${#raw})); then
+          out+=${raw:i+1:1}
+          i=$((i + 2))
+          continue
+        fi
+        [[ $c == '"' ]] && break
+        out+=$c
+        i=$((i + 1))
+      done
+      printf '%s' "$out"
+      ;;
+    *)
+      raw=${raw%%[[:space:]]#*}
+      raw=${raw%"${raw##*[![:space:]]}"}
+      printf '%s' "$raw"
+      ;;
+  esac
+}
+
+# _env_encode VALUE: the text to write after "KEY=". Fails (2) for a value
+# that contains both a single quote and a backtick, which no quoting keeps
+# literal for both compose and a shell.
+_env_encode() {
+  local v=$1
+  case $v in
+    *[[:space:]\$\#\"\\\`]* | \'*) ;;
+    *)
+      printf '%s' "$v"
+      return 0
+      ;;
+  esac
+  if [[ $v != *\'* ]]; then
+    printf "'%s'" "$v"
+    return 0
+  fi
+  [[ $v != *\`* ]] || return 2
+  v=${v//\\/\\\\}
+  v=${v//\"/\\\"}
+  v=${v//\$/\\\$}
+  printf '"%s"' "$v"
+}
+
+# env_get FILE KEY: print the value of KEY (empty when absent). The last
+# KEY= line wins, as in compose.
+env_get() {
+  local file=$1 key=$2 line raw="" found=0
+  [[ -f $file ]] || return 0
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%$'\r'}
+    if [[ $line == "$key="* ]]; then
+      raw=${line#"$key="}
+      found=1
+    fi
+  done <"$file"
+  ((found)) || return 0
+  _env_decode "$raw"
+}
+
+# _env_write FILE KEY VALUE missing|always
+_env_write() {
+  local file=$1 key=$2 value=$3 mode=$4 enc line tmp idx=-1 i=0
+  local -a lines=()
+  if ! _env_key_ok "$key"; then
+    warn "Cannot save the setting '$key': that is not a valid setting name."
+    return 1
+  fi
+  if [[ $value == *$'\n'* || $value == *$'\r'* ]]; then
+    warn "Cannot save $key: the value contains a line break."
+    warn "What to try: type the value again on a single line."
+    return 1
+  fi
+  if ! enc=$(_env_encode "$value"); then
+    warn "Cannot save $key: the value contains both ' and \`, which the settings file cannot hold safely."
+    warn "What to try: choose a value without one of those two characters."
+    return 1
+  fi
+  if [[ $mode == missing ]]; then
+    [[ -n $value ]] || return 0
+    [[ -z $(env_get "$file" "$key") ]] || return 0
+  fi
+  if [[ ! -e $file ]]; then
+    (umask 077 && : >"$file") || return 1
+  fi
+  while IFS= read -r line || [[ -n $line ]]; do
+    lines+=("$line")
+    [[ ${line%$'\r'} == "$key="* ]] && idx=$i
+    i=$((i + 1))
+  done <"$file"
+  if ((idx < 0)); then
+    # Append, after making sure the last line is finished.
+    if [[ -s $file && -n $(tail -c 1 "$file") ]]; then
+      printf '\n' >>"$file"
+    fi
+    printf '%s=%s\n' "$key" "$enc" >>"$file"
+    return 0
+  fi
+  lines[idx]="$key=$enc"
+  # Write a copy beside the file (same mode and owner via cp -p), then rename
+  # it over the original, so a crash never leaves a half-written file.
+  tmp=$(mktemp "$file.tmp.XXXXXX") || return 1
+  if ! { cp -p "$file" "$tmp" && printf '%s\n' "${lines[@]}" >"$tmp" && mv -f "$tmp" "$file"; }; then
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+# env_set_if_missing FILE KEY VALUE: write only when KEY is absent or empty.
+# Returns 0 either way. An empty VALUE writes nothing. Creates FILE with
+# owner-only permissions when it does not exist.
+env_set_if_missing() { _env_write "$1" "$2" "$3" missing; }
+
+# env_set FILE KEY VALUE: overwrite KEY (used only by `configure`).
+env_set() { _env_write "$1" "$2" "$3" always; }
+
+# env_backup FILE: copy FILE to FILE.<YYYYmmdd-HHMMSS> and print that path.
+# A second backup within the same second gets a -1, -2, ... suffix.
+env_backup() {
+  local file=$1 stamp dest n=1
+  if [[ ! -f $file ]]; then
+    warn "Cannot back up $file: the file does not exist."
+    return 1
+  fi
+  stamp=$(date +%Y%m%d-%H%M%S)
+  dest="$file.$stamp"
+  while [[ -e $dest ]]; do
+    dest="$file.$stamp-$n"
+    n=$((n + 1))
+  done
+  cp -p "$file" "$dest" || return 1
+  printf '%s\n' "$dest"
+}
+
+# gen_secret BYTES: BYTES random bytes as lowercase hex (openssl rand -hex).
+# openssl is on every supported server; the /dev/urandom fallback only keeps
+# the function working where it is missing (the bats test image).
+gen_secret() {
+  local bytes=${1:-32}
+  [[ $bytes =~ ^[1-9][0-9]*$ ]] || return 1
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex "$bytes"
+    return
+  fi
+  od -An -v -tx1 -N "$bytes" /dev/urandom | tr -d ' \n'
+  printf '\n'
+}
+
+# ------------------------------------------------------------
+# Server facts
+# ------------------------------------------------------------
+
+# is_public_ipv4 IP: 0 for a public address. Private (10/8, 172.16/12,
+# 192.168/16), loopback, link-local, CGNAT (100.64/10), "this network" (0/8),
+# multicast and reserved (224/4 and up) and malformed input are not public.
+is_public_ipv4() {
+  local ip=${1:-} o a b
+  [[ $ip =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  a=$((10#${BASH_REMATCH[1]}))
+  b=$((10#${BASH_REMATCH[2]}))
+  for o in "${BASH_REMATCH[@]:1}"; do
+    # No leading zeros: 010 means 8 to some tools and 10 to others.
+    [[ $o == 0 || $o != 0* ]] || return 1
+    ((10#$o <= 255)) || return 1
+  done
+  ((a == 0 || a == 10 || a == 127 || a >= 224)) && return 1
+  ((a == 100 && b >= 64 && b <= 127)) && return 1
+  ((a == 169 && b == 254)) && return 1
+  ((a == 172 && b >= 16 && b <= 31)) && return 1
+  ((a == 192 && b == 168)) && return 1
+  return 0
+}
+
+# sslip_host IP: the free automatic address for IP, 1-2-3-4.sslip.io.
+sslip_host() { printf '%s.sslip.io\n' "${1//./-}"; }
+
+# os_supported ID VERSION_ID: 0 for the systems the installer supports.
+os_supported() {
+  case "${1:-}:${2:-}" in
+    ubuntu:22.04 | ubuntu:24.04 | ubuntu:26.04 | debian:12 | debian:13) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# dns_points_here NAME IP: 0 when NAME resolves (IPv4) to IP.
+dns_points_here() {
+  local name=$1 ip=$2 out addr
+  out=$(getent ahostsv4 "$name" 2>/dev/null) || return 1
+  while read -r addr _; do
+    [[ $addr == "$ip" ]] && return 0
+  done <<<"$out"
+  return 1
+}
+
+# _ff_freeframe_services "SVC SVC ...": 0 when at least three FreeFrame
+# service names are present (api, worker, email_worker, maintenance_worker,
+# beat, web).
+_ff_freeframe_services() {
+  local s n=0
+  for s in api worker email_worker maintenance_worker beat web; do
+    [[ " $1 " == *" $s "* ]] && n=$((n + 1))
+  done
+  ((n >= 3))
+}
+
+# detect_foreign_install: 0 when this server runs (or holds the database of) a
+# FreeFrame this script does not manage, for example a clone-and-build install.
+# 1 when there is none. 2 when Docker is installed but does not answer, so the
+# answer is unknown (callers must not treat that as "none").
+#
+# Ours: compose containers whose working directory is $FF_ROOT. Foreign:
+#   - any other container running a FreeFrame image (name contains
+#     "freeframe", which covers ghcr.io/techiebutler/freeframe-* and the
+#     freeframe-api style names a clone named freeframe builds), or
+#   - a *_pgdata volume whose project has FreeFrame services (a clone in a
+#     renamed folder), or
+#   - a freeframe_pgdata volume left behind by a stopped clone, when this
+#     script has no settings file yet: our project is also called freeframe,
+#     so installing would silently take over that database volume, or
+#   - a git checkout in $FF_ROOT itself.
+detect_foreign_install() {
+  local root ps vols line proj wd svc image rest name
+  local -A ours=() services=()
+  root=$(ff_root)
+  [[ -d $root/.git ]] && return 0
+  command -v docker >/dev/null 2>&1 || return 1
+  local tab=$'\t'
+  if ! ps=$(docker ps -a --format "{{.Label \"com.docker.compose.project\"}}${tab}{{.Label \"com.docker.compose.project.working_dir\"}}${tab}{{.Label \"com.docker.compose.service\"}}${tab}{{.Image}}" 2>/dev/null) ||
+    ! vols=$(docker volume ls --format "{{.Name}}${tab}{{.Label \"com.docker.compose.project\"}}" 2>/dev/null); then
+    warn "Docker is installed but did not answer, so the installer cannot check for an existing FreeFrame."
+    warn "What to try: sudo systemctl start docker, then run the command again."
+    return 2
+  fi
+  # Fields are split by hand: read with IFS=tab would merge empty fields.
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    proj=${line%%"$tab"*}
+    rest=${line#*"$tab"}
+    wd=${rest%%"$tab"*}
+    rest=${rest#*"$tab"}
+    svc=${rest%%"$tab"*}
+    image=${rest#*"$tab"}
+    if [[ -n $proj && $wd == "$root" ]]; then
+      ours[$proj]=1
+      continue
+    fi
+    [[ ${image,,} == *freeframe* ]] && return 0
+    [[ -n $proj ]] && services[$proj]+=" $svc"
+  done <<<"$ps"
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    name=${line%%"$tab"*}
+    proj=""
+    [[ $line == *"$tab"* ]] && proj=${line#*"$tab"}
+    [[ $name == *_pgdata ]] || continue
+    proj=${proj:-${name%_pgdata}}
+    [[ -n ${ours[$proj]:-} ]] && continue
+    _ff_freeframe_services "${services[$proj]:-}" && return 0
+    [[ $proj == freeframe && ! -e $root/.env.prod ]] && return 0
+  done <<<"$vols"
+  return 1
+}
+
+# ------------------------------------------------------------
+# Answers: flags, environment variables and prompts
+# ------------------------------------------------------------
+
+# The answers, as FF_<NAME>, each seeded from FREEFRAME_<NAME>.
+_ff_answer_names() {
+  printf '%s\n' DOMAIN HTTPS ACME_EMAIL STORAGE S3_ENDPOINT S3_BUCKET S3_ACCESS_KEY \
+    S3_SECRET_KEY S3_REGION SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASSWORD SMTP_FROM \
+    ADMIN_NAME ADMIN_EMAIL ADMIN_PASSWORD CHANNEL
+}
+
+_ff_bad_usage() {
+  warn "$1"
+  warn "What to try: run 'freeframe help' to see the commands and options."
+  exit 2
+}
+
+# FF_YES and the other answers are read by the subcommands, not here.
+# shellcheck disable=SC2034
+# parse_args "$@": sets FF_CMD (help when none), FF_ARGS (words after the
+# command) and the FF_* answers. Flags win over FREEFRAME_* variables.
+# Accepts --flag value and --flag=value. Unknown flags exit 2.
+parse_args() {
+  local name env arg flag val have_val
+  local -a names=()
+  read -ra names <<<"$(_ff_answer_names | tr '\n' ' ')"
+  for name in "${names[@]}"; do
+    env="FREEFRAME_$name"
+    printf -v "FF_$name" '%s' "${!env:-}"
+  done
+  case "${FREEFRAME_YES:-}" in
+    1 | [Tt]rue | TRUE | [Yy]es | YES | [Yy]) FF_YES=1 ;;
+    *) FF_YES="" ;;
+  esac
+  FF_CMD=""
+  FF_ARGS=()
+  while (($#)); do
+    arg=$1
+    shift
+    case $arg in
+      --)
+        for arg in "$@"; do
+          if [[ -z $FF_CMD ]]; then FF_CMD=$arg; else FF_ARGS+=("$arg"); fi
+        done
+        break
+        ;;
+      -y | --yes) FF_YES=1 ;;
+      -h | --help) FF_CMD=help ;;
+      --*)
+        have_val=0
+        if [[ $arg == *=* ]]; then
+          flag=${arg%%=*}
+          val=${arg#*=}
+          have_val=1
+        else
+          flag=$arg
+        fi
+        name=${flag#--}
+        name=${name^^}
+        name=${name//-/_}
+        [[ " ${names[*]} " == *" $name "* ]] || _ff_bad_usage "Unknown option: $flag"
+        if ((!have_val)); then
+          (($#)) || _ff_bad_usage "The option $flag needs a value, for example $flag=something"
+          val=$1
+          shift
+        fi
+        printf -v "FF_$name" '%s' "$val"
+        ;;
+      -*) _ff_bad_usage "Unknown option: $arg" ;;
+      *)
+        if [[ -z $FF_CMD ]]; then FF_CMD=$arg; else FF_ARGS+=("$arg"); fi
+        ;;
+    esac
+  done
+  [[ -n $FF_CMD ]] || FF_CMD=help
+}
+
+_ff_tty_path() { printf '%s' "${FF_TTY:-/dev/tty}"; }
+
+# _ff_has_tty: 0 when the terminal (or FF_TTY) can be opened for reading.
+_ff_has_tty() {
+  local t
+  t=$(_ff_tty_path)
+  [[ -r $t ]] || return 1
+  { true <"$t"; } 2>/dev/null
+}
+
+# ask VAR QUESTION DEFAULT: print QUESTION, read one line from the terminal
+# (${FF_TTY:-/dev/tty}), trim spaces, and store it in VAR, or DEFAULT when the
+# line is empty. Fails when there is no terminal or the input has ended.
+# The terminal is opened once and kept open, so successive calls read
+# successive lines.
+ask() {
+  local var=$1 question=$2 default=${3:-} tty line=""
+  tty=$(_ff_tty_path)
+  if [[ ${_FF_TTY_OPEN:-} != "$tty" ]]; then
+    _ff_has_tty || return 1
+    { exec {_FF_TTY_FD}<"$tty"; } 2>/dev/null || return 1
+    _FF_TTY_OPEN=$tty
+  fi
+  if [[ -n $default ]]; then
+    printf '%s [%s]: ' "$question" "$default" >&2
+  else
+    printf '%s: ' "$question" >&2
+  fi
+  if ! IFS= read -r -u "$_FF_TTY_FD" line && [[ -z $line ]]; then
+    printf '\n' >&2
+    return 1
+  fi
+  line=${line%$'\r'}
+  line=${line#"${line%%[![:space:]]*}"}
+  line=${line%"${line##*[![:space:]]}"}
+  [[ -n $line ]] || line=$default
+  printf -v "$var" '%s' "$line"
+}
+
+# require_answer VAR ENVNAME QUESTION: make sure VAR has a value. Asks on the
+# terminal when there is one; with no terminal and no value, fails naming the
+# environment variable to set.
+require_answer() {
+  local var=$1 envname=$2 question=$3
+  [[ -n ${!var:-} ]] && return 0
+  if _ff_has_tty; then
+    while [[ -z ${!var:-} ]]; do
+      ask "$var" "$question" "" || break
+    done
+    [[ -n ${!var:-} ]] && return 0
+  fi
+  warn "Missing answer: set $envname ($question)"
+  warn "What to try: run the command in a terminal so it can ask you, or set $envname=... before it."
+  return 1
+}
+
+# ------------------------------------------------------------
+# Settings derived from the answers
+# ------------------------------------------------------------
+
+# size_workers CORES RAM_MB: worker counts for this machine.
+#   TRANSCODING_CONCURRENCY = max(1, min(CORES/2, RAM_MB/2048))
+#   API_WORKERS             = max(1, min(4, CORES))
+#   EMAIL_CONCURRENCY=2 and MAINTENANCE_CONCURRENCY=1 (the defaults)
+size_workers() {
+  local cores=${1:-} ram=${2:-} t a
+  [[ $cores =~ ^[0-9]+$ && $ram =~ ^[0-9]+$ ]] || return 1
+  cores=$((10#$cores))
+  ram=$((10#$ram))
+  t=$((cores / 2))
+  ((ram / 2048 < t)) && t=$((ram / 2048))
+  ((t < 1)) && t=1
+  a=$cores
+  ((a > 4)) && a=4
+  ((a < 1)) && a=1
+  printf 'TRANSCODING_CONCURRENCY=%d EMAIL_CONCURRENCY=2 MAINTENANCE_CONCURRENCY=1 API_WORKERS=%d\n' "$t" "$a"
+}
+
+_ff_cores() {
+  local n
+  n=$(nproc 2>/dev/null) || n=2
+  printf '%s' "${n:-2}"
+}
+
+_ff_ram_mb() {
+  local kb=""
+  [[ -r /proc/meminfo ]] && kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+  if [[ $kb =~ ^[0-9]+$ ]]; then printf '%s' $((kb / 1024)); else printf '4096'; fi
+}
+
+# https_mode: own, sslip or off, from FF_HTTPS (auto when empty): auto means
+# own with a domain, sslip with a public IPv4 in FF_IP, otherwise off.
+https_mode() {
+  case "${FF_HTTPS:-auto}" in
+    own | sslip | off) printf '%s\n' "$FF_HTTPS" ;;
+    auto)
+      if [[ -n ${FF_DOMAIN:-} ]]; then
+        printf 'own\n'
+      elif is_public_ipv4 "${FF_IP:-}"; then
+        printf 'sslip\n'
+      else
+        printf 'off\n'
+      fi
+      ;;
+    *)
+      warn "FREEFRAME_HTTPS must be auto, own, sslip or off (it is '$FF_HTTPS')."
+      return 1
+      ;;
+  esac
+}
+
+# _ensure_secret FILE KEY BYTES: generate KEY once; never replace it.
+_ensure_secret() {
+  [[ -n $(env_get "$1" "$2") ]] && return 0
+  env_set_if_missing "$1" "$2" "$(gen_secret "$3")"
+}
+
+# derive_env FILE: fill FILE with every setting the stack needs, from the
+# answers (FF_*, plus FF_IP, the server's address). Only missing or empty keys
+# are written (env_set_if_missing); secrets are generated once and never
+# replaced. When FILE already says how the server is set up (FREEFRAME_HTTPS,
+# FREEFRAME_STORAGE, FRONTEND_URL), that wins over the answers, so a key added
+# later (by `update`) matches what is already there. Worker counts are sized
+# from FF_CORES / FF_RAM_MB, or the machine when those are unset.
+derive_env() {
+  local file=$1 mode storage channel host url scheme ip=${FF_IP:-}
+  local s3_endpoint s3_bucket s3_access s3_secret s3_region s3_type v
+  local pg_user pg_pw pg_db redis_pw pair cores ram
+  local -a workers=()
+
+  # --- Work out the shape first; write nothing until it is complete. ---
+  mode=$(env_get "$file" FREEFRAME_HTTPS)
+  [[ -n $mode ]] || mode=$(https_mode) || return 1
+  url=$(env_get "$file" FRONTEND_URL)
+  if [[ -n $url ]]; then
+    host=${url#*://}
+    host=${host%%/*}
+    host=${host%%:*}
+  else
+    case $mode in
+      own) host=${FF_DOMAIN:-} ;;
+      sslip) [[ -z $ip ]] || host=$(sslip_host "$ip") ;;
+      off) host=${FF_DOMAIN:-$ip} ;;
+      *) host="" ;;
+    esac
+  fi
+  case $mode in
+    own | sslip) scheme=https ;;
+    off) scheme=http ;;
+    *)
+      warn "FREEFRAME_HTTPS in $file must be own, sslip or off (it is '$mode')."
+      return 1
+      ;;
+  esac
+  if [[ -z $host ]]; then
+    if [[ $mode == own ]]; then
+      warn "Missing answer: set FREEFRAME_DOMAIN (the web address, for example review.yourstudio.com)"
+    else
+      warn "The server's IP address is not known, so the web address cannot be worked out."
+    fi
+    return 1
+  fi
+
+  storage=$(env_get "$file" FREEFRAME_STORAGE)
+  storage=${storage:-${FF_STORAGE:-bundled}}
+  case $storage in
+    bundled)
+      s3_type=minio
+      s3_endpoint=http://minio:9000
+      s3_bucket=freeframe
+      s3_region=${FF_S3_REGION:-us-east-1}
+      ;;
+    s3)
+      s3_endpoint=${FF_S3_ENDPOINT:-$(env_get "$file" S3_ENDPOINT)}
+      s3_bucket=${FF_S3_BUCKET:-$(env_get "$file" S3_BUCKET)}
+      s3_access=${FF_S3_ACCESS_KEY:-$(env_get "$file" S3_ACCESS_KEY)}
+      s3_secret=${FF_S3_SECRET_KEY:-$(env_get "$file" S3_SECRET_KEY)}
+      s3_region=${FF_S3_REGION:-us-east-1}
+      for pair in "FREEFRAME_S3_BUCKET:$s3_bucket" "FREEFRAME_S3_ACCESS_KEY:$s3_access" \
+        "FREEFRAME_S3_SECRET_KEY:$s3_secret"; do
+        if [[ -z ${pair#*:} ]]; then
+          warn "Missing answer: set ${pair%%:*} (needed to use your own S3 bucket)"
+          return 1
+        fi
+      done
+      # Native AWS (no endpoint, or an *.amazonaws.com one) uses S3_STORAGE=s3;
+      # every other S3-compatible service uses minio mode (see apps/api/config.py).
+      v=${s3_endpoint#*://}
+      v=${v%%[/:]*}
+      v=${v,,}
+      if [[ -z $s3_endpoint || $v == amazonaws.com || $v == *.amazonaws.com ]]; then
+        s3_type=s3
+      else
+        s3_type=minio
+      fi
+      ;;
+    *)
+      warn "FREEFRAME_STORAGE must be bundled or s3 (it is '$storage')."
+      return 1
+      ;;
+  esac
+  channel=$(env_get "$file" FREEFRAME_CHANNEL)
+  channel=${channel:-${FF_CHANNEL:-stable}}
+  cores=${FF_CORES:-$(_ff_cores)}
+  ram=${FF_RAM_MB:-$(_ff_ram_mb)}
+  read -ra workers <<<"$(size_workers "$cores" "$ram")" || true
+  ((${#workers[@]})) || read -ra workers <<<"$(size_workers 2 4096)"
+
+  # --- Write. ---
+  if [[ ! -s $file ]]; then
+    (umask 077 && cat >"$file" <<'EOF'
+# FreeFrame settings, written by the freeframe command.
+# Keep this file private: it holds the passwords for the database and storage.
+# To change the answers you gave, run: sudo freeframe configure
+EOF
+    ) || return 1
+  fi
+
+  env_set_if_missing "$file" FRONTEND_URL "$scheme://$host"
+  if [[ $scheme == https ]]; then
+    env_set_if_missing "$file" DOMAIN "$host"
+    env_set_if_missing "$file" ACME_EMAIL "${FF_ACME_EMAIL:-}"
+  fi
+
+  env_set_if_missing "$file" POSTGRES_USER freeframe
+  env_set_if_missing "$file" POSTGRES_DB freeframe
+  _ensure_secret "$file" POSTGRES_PASSWORD 32
+  pg_user=$(env_get "$file" POSTGRES_USER)
+  pg_pw=$(env_get "$file" POSTGRES_PASSWORD)
+  pg_db=$(env_get "$file" POSTGRES_DB)
+  env_set_if_missing "$file" DATABASE_URL "postgresql://$pg_user:$pg_pw@postgres:5432/$pg_db"
+
+  # A copied settings file whose REDIS_URL has no password keeps redis
+  # without one: a new password the URL does not carry would lock the app out.
+  if [[ -z $(env_get "$file" REDIS_URL) ]]; then
+    _ensure_secret "$file" REDIS_PASSWORD 32
+  fi
+  redis_pw=$(env_get "$file" REDIS_PASSWORD)
+  if [[ -n $redis_pw ]]; then
+    env_set_if_missing "$file" REDIS_URL "redis://:$redis_pw@redis:6379/0"
+  else
+    env_set_if_missing "$file" REDIS_URL "redis://redis:6379/0"
+  fi
+  _ensure_secret "$file" JWT_SECRET 64
+
+  env_set_if_missing "$file" S3_STORAGE "$s3_type"
+  env_set_if_missing "$file" S3_ENDPOINT "$s3_endpoint"
+  env_set_if_missing "$file" S3_BUCKET "$s3_bucket"
+  env_set_if_missing "$file" S3_REGION "$s3_region"
+  if [[ $storage == bundled ]]; then
+    _ensure_secret "$file" S3_ACCESS_KEY 16
+    _ensure_secret "$file" S3_SECRET_KEY 32
+    if [[ $scheme == https ]]; then
+      env_set_if_missing "$file" S3_PUBLIC_ENDPOINT "https://storage.$host"
+      env_set_if_missing "$file" STORAGE_DOMAIN "storage.$host"
+      env_set_if_missing "$file" STORAGE_ROUTED true
+      env_set_if_missing "$file" STORAGE_PORT_BIND 127.0.0.1:9000
+    else
+      env_set_if_missing "$file" S3_PUBLIC_ENDPOINT "http://$host:9000"
+      env_set_if_missing "$file" STORAGE_ROUTED false
+      env_set_if_missing "$file" STORAGE_PORT_BIND 0.0.0.0:9000
+    fi
+  else
+    env_set_if_missing "$file" S3_ACCESS_KEY "$s3_access"
+    env_set_if_missing "$file" S3_SECRET_KEY "$s3_secret"
+  fi
+
+  # Always smtp: the app's default (ses) hides the "email is not set up" warning.
+  env_set_if_missing "$file" MAIL_PROVIDER smtp
+  if [[ -n ${FF_SMTP_HOST:-} ]]; then
+    env_set_if_missing "$file" SMTP_HOST "$FF_SMTP_HOST"
+    env_set_if_missing "$file" SMTP_PORT "${FF_SMTP_PORT:-587}"
+    # Port 465 is TLS from the first byte; anything else upgrades with STARTTLS.
+    if [[ ${FF_SMTP_PORT:-587} == 465 ]]; then
+      env_set_if_missing "$file" SMTP_USE_TLS false
+    else
+      env_set_if_missing "$file" SMTP_USE_TLS true
+    fi
+    env_set_if_missing "$file" SMTP_USER "${FF_SMTP_USER:-}"
+    env_set_if_missing "$file" SMTP_PASSWORD "${FF_SMTP_PASSWORD:-}"
+  fi
+  env_set_if_missing "$file" MAIL_FROM_ADDRESS "${FF_SMTP_FROM:-}"
+
+  env_set_if_missing "$file" FREEFRAME_HTTPS "$mode"
+  env_set_if_missing "$file" FREEFRAME_STORAGE "$storage"
+  env_set_if_missing "$file" FREEFRAME_CHANNEL "$channel"
+
+  for pair in "${workers[@]}"; do
+    env_set_if_missing "$file" "${pair%%=*}" "${pair#*=}"
+  done
+}
+
+# ------------------------------------------------------------
+# Docker compose
+# ------------------------------------------------------------
+
+# compose_files ENVFILE: the -f arguments for this server, in order.
+compose_files() {
+  local file=$1 out="-f docker-compose.prod.yml -f docker-compose.images.yml"
+  case "$(env_get "$file" FREEFRAME_HTTPS)" in
+    own | sslip) out+=" -f docker-compose.https.yml" ;;
+  esac
+  if [[ $(env_get "$file" FREEFRAME_STORAGE) == bundled ]]; then
+    out+=" -f docker-compose.storage.yml"
+  fi
+  printf '%s\n' "$out"
+}
+
+# dc ARGS...: docker compose for this install, run from $FF_ROOT.
+dc() {
+  local root
+  local -a files=()
+  root=$(ff_root)
+  read -ra files <<<"$(compose_files "$root/.env.prod")"
+  (cd "$root" && docker compose --project-name freeframe --env-file "$root/.env.prod" "${files[@]}" "$@")
+}
+
+# ------------------------------------------------------------
+# Backups
+# ------------------------------------------------------------
+
+# backup_prune DIR KEEP: delete all but the newest KEEP freeframe-*.dump files
+# in DIR, with their freeframe-*.env.prod settings copies. Backups are named
+# freeframe-<YYYYmmdd-HHMMSS>.dump, so newest is last in name order.
+backup_prune() {
+  local dir=$1 keep=$2 f n i=0
+  local LC_ALL=C
+  local -a dumps=()
+  if [[ ! $keep =~ ^[0-9]+$ ]]; then
+    warn "backup_prune: the number of backups to keep must be a whole number (got '$keep')."
+    return 1
+  fi
+  [[ -d $dir ]] || return 0
+  for f in "$dir"/freeframe-*.dump; do
+    [[ -f $f ]] && dumps+=("$f")
+  done
+  n=$((${#dumps[@]} - 10#$keep))
+  while ((i < n)); do
+    rm -f -- "${dumps[i]}" "${dumps[i]%.dump}.env.prod"
+    i=$((i + 1))
+  done
+}
+
+# ------------------------------------------------------------
+# Commands
+# ------------------------------------------------------------
+
+usage() {
+  cat <<'EOF'
+freeframe: install and look after FreeFrame on this server.
+
+Usage: sudo freeframe <command> [options]
+
+Commands:
+  install     Set up FreeFrame on this server (asks a few questions)
+  update      Back up, then move to the newest release on your channel
+  configure   Change the answers you gave (web address, email, storage)
+  backup      Save a copy of the database to /opt/freeframe/backups
+  restore     Put a saved copy of the database back (replaces current data)
+  status      Show whether everything is running, disk space and backups
+  logs        Show recent messages from FreeFrame
+  restart     Restart FreeFrame
+  help        Show this list
+
+Answers can be given ahead of time as options or environment variables, for
+example --domain review.yourstudio.com or FREEFRAME_DOMAIN=review.yourstudio.com.
+Options: --domain --https --acme-email --storage --s3-endpoint --s3-bucket
+  --s3-access-key --s3-secret-key --s3-region --smtp-host --smtp-port
+  --smtp-user --smtp-password --smtp-from --admin-name --admin-email
+  --admin-password --channel --yes
+EOF
+}
+
+main() {
+  parse_args "$@"
+  case $FF_CMD in
+    help) usage ;;
+    install | update | configure | backup | restore | status | logs | restart)
+      warn "freeframe $FF_CMD is not implemented yet."
+      return 1
+      ;;
+    *)
+      warn "Unknown command: $FF_CMD"
+      warn "What to try: run 'freeframe help' to see the commands."
+      return 2
+      ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  if ((BASH_VERSINFO[0] < 4)); then
+    echo "freeframe needs bash 4 or newer (this is bash $BASH_VERSION)." >&2
+    echo "What to try: run it on the Ubuntu or Debian server, not on this computer." >&2
+    exit 1
+  fi
+  set -Eeuo pipefail
+  main "$@"
+fi
