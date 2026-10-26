@@ -1904,6 +1904,9 @@ _install_settings_step() {
   elif ! derive_env "$file"; then
     install_fail "The settings could not be written." "fix what the message above says, then run sudo freeframe install again."
   fi
+  # Also when nothing had to be added: a file copied in with wider
+  # permissions still holds the passwords.
+  chmod 600 "$file" || install_fail "Cannot make $file private (chmod 600 failed)." "check the disk, then run sudo freeframe install again."
   FF_STATE="Your settings are saved in $file. Running sudo freeframe install again keeps them and continues from here."
 }
 

@@ -250,6 +250,19 @@ assert_root_untouched() {
   assert_out "from the existing settings"
 }
 
+@test "install: a complete settings file copied in as 644 ends up 600" {
+  plain_answers
+  ff_install --yes
+  [ "$status" -eq 0 ]
+  rm -f "$FF_ROOT/.installed"
+  chmod 644 "$ENV"
+  cp "$ENV" "$BATS_TEST_TMPDIR/env.before"
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  cmp "$ENV" "$BATS_TEST_TMPDIR/env.before"
+  [ "$(stat -c %a "$ENV" 2>/dev/null || stat -f %Lp "$ENV")" = 600 ]
+}
+
 @test "install: an admin that already exists is not an error" {
   plain_answers
   export STUB_ADMIN_CODE=403 STUB_ADMIN_BODY='{"detail":"Setup already completed. Superadmin already exists."}'
