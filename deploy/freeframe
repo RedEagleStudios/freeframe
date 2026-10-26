@@ -2882,6 +2882,7 @@ cmd_restore() {
     if [[ -n $s && $s != postgres && $s != traefik ]]; then svcs+=("$s"); fi
   done
   say "Stopping FreeFrame (its web address shows an error until the restore is done)..."
+  FF_STATE="FreeFrame may be partly stopped; the database has not been changed. To start FreeFrame again as it was, run: sudo freeframe restart"
   if ((${#svcs[@]})) && ! _ff_logged dc stop "${svcs[@]}"; then
     _restore_fail "$(_restore_restart)" "FreeFrame could not be stopped, so nothing was changed." \
       "run: $FF_RERUN. The reason is at the end of the log."
@@ -2933,6 +2934,7 @@ cmd_restore() {
   FF_STEP="removing the current database"
   say "Replacing the database with the backup..."
   FF_DROP_STARTED=1
+  FF_STATE="The database may already have been removed. FreeFrame is stopped, so nothing can write to it. To try again, run: $FF_RERUN${undo:+. To go back to the data as it was before this restore instead, run: $undo_cmd}"
   if ! _ff_logged dc exec -T postgres dropdb -U "$FF_PG_USER" --if-exists --force "$FF_PG_DB"; then
     # DROP DATABASE either happens or not: the database is unchanged.
     FF_DROP_STARTED=""

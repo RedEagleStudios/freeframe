@@ -856,6 +856,33 @@ ff_signal() {
   [ -z "$(ls -A "$BK" | grep partial)" ]
 }
 
+@test "restore: stopped while FreeFrame is being stopped, it says it may be partly stopped and how to start it" {
+  old_backup 20261020-030000
+  export STUB_STOP_HANG=1
+  ff_signal TERM stop restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  assert_out "while stopping FreeFrame"
+  assert_out "FreeFrame may be partly stopped; the database has not been changed."
+  assert_out "sudo freeframe restart"
+  assert_not_called dropdb
+  [ ! -e "$FF_ROOT/.restore-undo" ]
+}
+
+@test "restore: stopped during the drop, it says the database may be gone and gives retry and undo" {
+  old_backup 20261020-030000
+  export STUB_DROP_HANG=1
+  ff_signal TERM dropdb restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  assert_out "while removing the current database"
+  assert_out "The database may already have been removed."
+  assert_out "To try again, run: sudo freeframe restore --yes '$BK/freeframe-20261020-030000.dump'"
+  local safety
+  safety=$(dumps | tail -1)
+  assert_out "run: sudo freeframe restore --yes '$BK/$safety'"
+  # The database may be gone, so the record stays for a retry.
+  assert_eq "$(cat "$FF_ROOT/.restore-undo")" "$BK/$safety"
+}
+
 # ---------------------------------------------------------------- the timer
 
 UNITS="${BATS_TEST_DIRNAME}/../systemd"
