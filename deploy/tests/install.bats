@@ -1423,3 +1423,27 @@ run_bootstrap() {
   assert_out "/freeframe/stable/install.sh | sudo bash -s -- --help"
   if [[ $output == *"see: freeframe help"* ]]; then echo "$output"; false; fi
 }
+
+@test "install: a failure after server changes lists what was already done" {
+  plain_answers
+  export FF_RAM_MB=3000 STUB_UFW_ACTIVE=1 STUB_FETCH_FAIL=docker-compose.https.yml
+  ff_install --yes
+  [ "$status" -eq 1 ]
+  assert_out "Could not download docker-compose.https.yml"
+  assert_out "installed the freeframe command at $FF_BIN_DIR/freeframe"
+  assert_out "installed Docker"
+  assert_out "added a 2 GB swap file"
+  assert_out "ufw firewall"
+  if [[ $output == *"has only written its log"* ]]; then echo "$output"; false; fi
+  # A failed download replaces none of the setup files, so it is not claimed.
+  if [[ $output == *"downloaded the setup files"* ]]; then echo "$output"; false; fi
+}
+
+@test "install: a failure right after the download says the setup files are there" {
+  plain_answers
+  export STUB_DOCKER=ok STUB_DERIVE_FAIL=1
+  ff_install --yes
+  [ "$status" -eq 1 ]
+  assert_out "downloaded the setup files into $FF_ROOT"
+  if [[ $output == *"installed Docker"* ]]; then echo "$output"; false; fi
+}

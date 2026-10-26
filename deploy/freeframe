@@ -1121,6 +1121,16 @@ _install_tell_password() {
     "Write it down now: it is shown on the screen only and saved nowhere." ""
 }
 
+# _install_done WHAT: note a change the install has made to the server, so
+# that a later failure says what is already in place (FF_STATE), not that
+# only the log was written.
+_install_done() {
+  local list="" item
+  FF_DONE+=("$1")
+  for item in "${FF_DONE[@]}"; do list+="${list:+; }$item"; done
+  FF_STATE="Already done: $list. FreeFrame itself is not set up yet; running ${FF_RERUN:-the install command} again keeps this and continues from here."
+}
+
 # install_fail MESSAGE WHAT_TO_TRY: a step failed. Says what state the
 # server is in and where the log is, then exits 1. When this run created the
 # admin account with a generated password, the password is repeated (on the
@@ -1305,10 +1315,15 @@ switch_to_http_mode() {
 _install_self() {
   local src=${BASH_SOURCE[0]} dir=${FF_BIN_DIR:-/usr/local/bin}
   [[ -f $src ]] || install_fail "Cannot find the freeframe script that is running ($src)." "run the install command again."
-  if [[ -e $dir/freeframe ]] && cmp -s "$src" "$dir/freeframe"; then return 0; fi
+  if [[ -e $dir/freeframe ]] && cmp -s "$src" "$dir/freeframe"; then
+    FF_RERUN="sudo freeframe install"
+    return 0
+  fi
   if ! { mkdir -p "$dir" && install -m 755 "$src" "$dir/freeframe"; }; then
     install_fail "Could not install the freeframe command into $dir." "check that the disk is not full or read-only, then run the install command again."
   fi
+  FF_RERUN="sudo freeframe install"
+  _install_done "installed the freeframe command at $dir/freeframe"
 }
 
 _install_check_system() {
@@ -1901,7 +1916,7 @@ _install_docker_step() {
   if [[ $(docker_status) != ok ]]; then
     install_fail "Docker was installed but does not answer." "run: sudo systemctl start docker, then sudo freeframe install again."
   fi
-  FF_STATE="Docker is installed; FreeFrame itself is not set up yet. Running sudo freeframe install again continues from here."
+  _install_done "installed Docker"
 }
 
 _install_swap_step() {
@@ -1916,7 +1931,9 @@ _install_swap_step() {
     return 0
   fi
   say "Adding a 2 GB swap file, because this server has less than 4 GB of memory..."
-  if ! _ff_logged add_swap; then
+  if _ff_logged add_swap; then
+    _install_done "added a 2 GB swap file (/swapfile)"
+  else
     warn "Could not add a swap file; continuing without one (the reason is in the log)."
   fi
 }
@@ -1925,11 +1942,13 @@ _install_ufw_step() {
   ufw_active || return 0
   FF_STEP="opening the firewall"
   say "The ufw firewall is on: allowing web traffic (ports 80 and 443) and SSH."
+  local added=0
   if _ff_logged ufw app info OpenSSH; then
-    _ff_logged ufw allow OpenSSH || warn "Could not add the ufw rule for SSH."
+    if _ff_logged ufw allow OpenSSH; then added=1; else warn "Could not add the ufw rule for SSH."; fi
   fi
-  _ff_logged ufw allow 80/tcp || warn "Could not add the ufw rule for port 80."
-  _ff_logged ufw allow 443/tcp || warn "Could not add the ufw rule for port 443."
+  if _ff_logged ufw allow 80/tcp; then added=1; else warn "Could not add the ufw rule for port 80."; fi
+  if _ff_logged ufw allow 443/tcp; then added=1; else warn "Could not add the ufw rule for port 443."; fi
+  if ((added)); then _install_done "allowed SSH and web traffic (ports 80 and 443) in the ufw firewall"; fi
   if [[ $FF_MODE == off && $FF_STORAGE == bundled ]]; then
     say "Note: ports that Docker opens skip ufw's rules. FreeFrame opens only 80 and 443, and 9000 for uploads in plain HTTP mode."
   else
@@ -2011,23 +2030,49 @@ _install_dns_step() {
   say "The DNS records point at this server."
 }
 
+FF_SETUP_FILES=(docker-compose.prod.yml docker-compose.images.yml docker-compose.https.yml docker-compose.storage.yml
+  deploy/systemd/freeframe-backup.service deploy/systemd/freeframe-backup.timer)
+
+# fetch_setup_files REF: download the compose files and the nightly backup
+# units from REF into $FF_ROOT (the units into $FF_ROOT/systemd, where
+# install_backup_timer takes them from). All of them are downloaded first
+# and only then moved into place, so a failed download leaves the old set
+# whole. On failure FF_FETCH_FAILED names the file and it returns 1.
+fetch_setup_files() {
+  local ref=$1 root stage f dest
+  root=$(ff_root)
+  FF_FETCH_FAILED=""
+  mkdir -p "$root/systemd" || return 1
+  stage=$(mktemp -d "$root/.download.XXXXXX") || return 1
+  for f in "${FF_SETUP_FILES[@]}"; do
+    if ! _ff_logged fetch "$ref" "$f" "$stage/${f##*/}"; then
+      FF_FETCH_FAILED=$f
+      rm -rf "$stage"
+      return 1
+    fi
+  done
+  for f in "${FF_SETUP_FILES[@]}"; do
+    dest="$root/$f"
+    [[ $f != deploy/systemd/* ]] || dest="$root/systemd/${f##*/}"
+    if ! mv -f "$stage/${f##*/}" "$dest"; then
+      FF_FETCH_FAILED=$f
+      rm -rf "$stage"
+      return 1
+    fi
+  done
+  rm -rf "$stage"
+}
+
 _install_fetch_step() {
-  local root f dest
+  local root
   root=$(ff_root)
   FF_STEP="downloading the setup files"
   say "Downloading the setup files for the $FF_CHANNEL channel..."
-  # The nightly backup units go to $root/systemd; install_backup_timer
-  # puts them into systemd once FreeFrame is running.
-  mkdir -p "$root/systemd"
-  for f in docker-compose.prod.yml docker-compose.images.yml docker-compose.https.yml docker-compose.storage.yml \
-    deploy/systemd/freeframe-backup.service deploy/systemd/freeframe-backup.timer; do
-    dest="$root/$f"
-    [[ $f != deploy/systemd/* ]] || dest="$root/systemd/${f##*/}"
-    if ! _ff_logged fetch "$FF_CHANNEL" "$f" "$dest"; then
-      install_fail "Could not download $f for the $FF_CHANNEL channel." \
-        "check that this server can reach raw.githubusercontent.com, then run sudo freeframe install again. If it can, the $FF_CHANNEL channel may not have this file yet (the installer needs a release after v1.21.0): try --channel latest."
-    fi
-  done
+  if ! fetch_setup_files "$FF_CHANNEL"; then
+    install_fail "Could not download ${FF_FETCH_FAILED:-the setup files} for the $FF_CHANNEL channel." \
+      "check that this server can reach raw.githubusercontent.com, then run sudo freeframe install again. If it can, the $FF_CHANNEL channel may not have this file yet (the installer needs a release after v1.21.0): try --channel latest."
+  fi
+  _install_done "downloaded the setup files into $root"
 }
 
 # Fill the settings file. An existing file (copied from another server, or
@@ -2321,6 +2366,7 @@ cmd_install() {
   FF_STOPPED=()
   FF_ADDR_FROM_FILE="" FF_SMTP_FROM_FILE="" FF_ADMIN_EXISTED="" FF_CERT_PENDING="" FF_FELL_BACK=""
   FF_ADMIN_CREATED="" FF_PW_GENERATED="" FF_RERUN="the install command"
+  FF_DONE=()
 
   # Refusals first: nothing is written before these pass.
   _install_check_system
@@ -2347,7 +2393,6 @@ cmd_install() {
 
   # From here on the server is changed.
   _install_self
-  FF_RERUN="sudo freeframe install"
   _install_docker_step
   _install_swap_step
   _install_ufw_step

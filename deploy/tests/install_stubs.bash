@@ -133,5 +133,7 @@ dc() {
 eval "_real_derive_env() $(declare -f derive_env | tail -n +2)"
 derive_env() {
   _stub_log derive_env
+  # STUB_DERIVE_FAIL: the settings cannot be completed.
+  [[ -z ${STUB_DERIVE_FAIL:-} ]] || return 1
   _real_derive_env "$@"
 }
