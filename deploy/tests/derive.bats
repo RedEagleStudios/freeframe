@@ -309,3 +309,41 @@ derive() {
   run ls -l "$F"
   [[ "$output" == -rw-------* ]]
 }
+
+# derive_with_secret STUB: derive_env with gen_secret replaced by STUB.
+derive_with_secret() {
+  env FF_HTTPS=off FF_IP=192.168.1.20 FF_CORES="$FF_CORES" FF_RAM_MB="$FF_RAM_MB" \
+    bash -c 'set -Eeuo pipefail; source "$1"; eval "$3"; derive_env "$2"' \
+    ff-derive "$FF_SCRIPT" "$F" "$1"
+}
+
+@test "a failing gen_secret stops derive_env loudly and no URL gets an empty password" {
+  run derive_with_secret 'gen_secret() { return 1; }'
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Could not generate a random POSTGRES_PASSWORD"* ]]
+  assert_no_key "$F" DATABASE_URL
+  assert_no_key "$F" POSTGRES_PASSWORD
+}
+
+@test "an empty gen_secret result stops derive_env loudly" {
+  run derive_with_secret 'gen_secret() { :; }'
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Could not generate a random POSTGRES_PASSWORD"* ]]
+  assert_no_key "$F" DATABASE_URL
+}
+
+@test "a short gen_secret result stops derive_env loudly" {
+  run derive_with_secret 'gen_secret() { echo abc; }'
+  [ "$status" -ne 0 ]
+  assert_no_key "$F" DATABASE_URL
+}
+
+@test "derive_env stops at the first failed write, even when called inside if" {
+  run env FF_HTTPS=off FF_IP=192.168.1.20 FF_CORES=4 FF_RAM_MB=8192 bash -c 'source "$1"
+    gen_secret() { return 1; }
+    if derive_env "$2"; then echo "derive said ok"; else echo "derive failed"; fi' \
+    ff-derive "$FF_SCRIPT" "$F"
+  [[ "$output" == *"Could not generate a random POSTGRES_PASSWORD"* ]]
+  [[ "$output" == *"derive failed"* ]]
+  assert_no_key "$F" DATABASE_URL
+}

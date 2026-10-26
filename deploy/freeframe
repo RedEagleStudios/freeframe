@@ -508,10 +508,18 @@ https_mode() {
   esac
 }
 
-# _ensure_secret FILE KEY BYTES: generate KEY once; never replace it.
+# _ensure_secret FILE KEY BYTES: generate KEY once; never replace it. Fails
+# loudly when no proper secret (BYTES*2 lowercase hex characters) comes back,
+# so a URL is never built around an empty password.
 _ensure_secret() {
-  [[ -n $(env_get "$1" "$2") ]] && return 0
-  env_set_if_missing "$1" "$2" "$(gen_secret "$3")"
+  local file=$1 key=$2 bytes=$3 v=""
+  [[ -n $(env_get "$file" "$key") ]] && return 0
+  if ! v=$(gen_secret "$bytes") || [[ ! $v =~ ^[0-9a-f]+$ ]] || ((${#v} != bytes * 2)); then
+    warn "Could not generate a random $key: openssl rand gave no usable result."
+    warn "What to try: check that openssl works (openssl rand -hex 32), then run the command again."
+    return 1
+  fi
+  env_set_if_missing "$file" "$key" "$v"
 }
 
 # derive_env FILE: fill FILE with every setting the stack needs, from the
@@ -619,77 +627,77 @@ EOF
     ) || return 1
   fi
 
-  env_set_if_missing "$file" FRONTEND_URL "$scheme://$host"
+  env_set_if_missing "$file" FRONTEND_URL "$scheme://$host" || return 1
   if [[ $scheme == https ]]; then
-    env_set_if_missing "$file" DOMAIN "$host"
-    env_set_if_missing "$file" ACME_EMAIL "${FF_ACME_EMAIL:-}"
+    env_set_if_missing "$file" DOMAIN "$host" || return 1
+    env_set_if_missing "$file" ACME_EMAIL "${FF_ACME_EMAIL:-}" || return 1
   fi
 
-  env_set_if_missing "$file" POSTGRES_USER freeframe
-  env_set_if_missing "$file" POSTGRES_DB freeframe
-  _ensure_secret "$file" POSTGRES_PASSWORD 32
+  env_set_if_missing "$file" POSTGRES_USER freeframe || return 1
+  env_set_if_missing "$file" POSTGRES_DB freeframe || return 1
+  _ensure_secret "$file" POSTGRES_PASSWORD 32 || return 1
   pg_user=$(env_get "$file" POSTGRES_USER)
   pg_pw=$(env_get "$file" POSTGRES_PASSWORD)
   pg_db=$(env_get "$file" POSTGRES_DB)
-  env_set_if_missing "$file" DATABASE_URL "postgresql://$pg_user:$pg_pw@postgres:5432/$pg_db"
+  env_set_if_missing "$file" DATABASE_URL "postgresql://$pg_user:$pg_pw@postgres:5432/$pg_db" || return 1
 
   # A copied settings file whose REDIS_URL has no password keeps redis
   # without one: a new password the URL does not carry would lock the app out.
   if [[ -z $(env_get "$file" REDIS_URL) ]]; then
-    _ensure_secret "$file" REDIS_PASSWORD 32
+    _ensure_secret "$file" REDIS_PASSWORD 32 || return 1
   fi
   redis_pw=$(env_get "$file" REDIS_PASSWORD)
   if [[ -n $redis_pw ]]; then
-    env_set_if_missing "$file" REDIS_URL "redis://:$redis_pw@redis:6379/0"
+    env_set_if_missing "$file" REDIS_URL "redis://:$redis_pw@redis:6379/0" || return 1
   else
-    env_set_if_missing "$file" REDIS_URL "redis://redis:6379/0"
+    env_set_if_missing "$file" REDIS_URL "redis://redis:6379/0" || return 1
   fi
-  _ensure_secret "$file" JWT_SECRET 64
+  _ensure_secret "$file" JWT_SECRET 64 || return 1
 
-  env_set_if_missing "$file" S3_STORAGE "$s3_type"
-  env_set_if_missing "$file" S3_ENDPOINT "$s3_endpoint"
-  env_set_if_missing "$file" S3_BUCKET "$s3_bucket"
-  env_set_if_missing "$file" S3_REGION "$s3_region"
+  env_set_if_missing "$file" S3_STORAGE "$s3_type" || return 1
+  env_set_if_missing "$file" S3_ENDPOINT "$s3_endpoint" || return 1
+  env_set_if_missing "$file" S3_BUCKET "$s3_bucket" || return 1
+  env_set_if_missing "$file" S3_REGION "$s3_region" || return 1
   if [[ $storage == bundled ]]; then
-    _ensure_secret "$file" S3_ACCESS_KEY 16
-    _ensure_secret "$file" S3_SECRET_KEY 32
+    _ensure_secret "$file" S3_ACCESS_KEY 16 || return 1
+    _ensure_secret "$file" S3_SECRET_KEY 32 || return 1
     if [[ $scheme == https ]]; then
-      env_set_if_missing "$file" S3_PUBLIC_ENDPOINT "https://storage.$host"
-      env_set_if_missing "$file" STORAGE_DOMAIN "storage.$host"
-      env_set_if_missing "$file" STORAGE_ROUTED true
-      env_set_if_missing "$file" STORAGE_PORT_BIND 127.0.0.1:9000
+      env_set_if_missing "$file" S3_PUBLIC_ENDPOINT "https://storage.$host" || return 1
+      env_set_if_missing "$file" STORAGE_DOMAIN "storage.$host" || return 1
+      env_set_if_missing "$file" STORAGE_ROUTED true || return 1
+      env_set_if_missing "$file" STORAGE_PORT_BIND 127.0.0.1:9000 || return 1
     else
-      env_set_if_missing "$file" S3_PUBLIC_ENDPOINT "http://$host:9000"
-      env_set_if_missing "$file" STORAGE_ROUTED false
-      env_set_if_missing "$file" STORAGE_PORT_BIND 0.0.0.0:9000
+      env_set_if_missing "$file" S3_PUBLIC_ENDPOINT "http://$host:9000" || return 1
+      env_set_if_missing "$file" STORAGE_ROUTED false || return 1
+      env_set_if_missing "$file" STORAGE_PORT_BIND 0.0.0.0:9000 || return 1
     fi
   else
-    env_set_if_missing "$file" S3_ACCESS_KEY "$s3_access"
-    env_set_if_missing "$file" S3_SECRET_KEY "$s3_secret"
+    env_set_if_missing "$file" S3_ACCESS_KEY "$s3_access" || return 1
+    env_set_if_missing "$file" S3_SECRET_KEY "$s3_secret" || return 1
   fi
 
   # Always smtp: the app's default (ses) hides the "email is not set up" warning.
-  env_set_if_missing "$file" MAIL_PROVIDER smtp
+  env_set_if_missing "$file" MAIL_PROVIDER smtp || return 1
   if [[ -n ${FF_SMTP_HOST:-} ]]; then
-    env_set_if_missing "$file" SMTP_HOST "$FF_SMTP_HOST"
-    env_set_if_missing "$file" SMTP_PORT "${FF_SMTP_PORT:-587}"
+    env_set_if_missing "$file" SMTP_HOST "$FF_SMTP_HOST" || return 1
+    env_set_if_missing "$file" SMTP_PORT "${FF_SMTP_PORT:-587}" || return 1
     # Port 465 is TLS from the first byte; anything else upgrades with STARTTLS.
     if [[ ${FF_SMTP_PORT:-587} == 465 ]]; then
-      env_set_if_missing "$file" SMTP_USE_TLS false
+      env_set_if_missing "$file" SMTP_USE_TLS false || return 1
     else
-      env_set_if_missing "$file" SMTP_USE_TLS true
+      env_set_if_missing "$file" SMTP_USE_TLS true || return 1
     fi
-    env_set_if_missing "$file" SMTP_USER "${FF_SMTP_USER:-}"
-    env_set_if_missing "$file" SMTP_PASSWORD "${FF_SMTP_PASSWORD:-}"
+    env_set_if_missing "$file" SMTP_USER "${FF_SMTP_USER:-}" || return 1
+    env_set_if_missing "$file" SMTP_PASSWORD "${FF_SMTP_PASSWORD:-}" || return 1
   fi
-  env_set_if_missing "$file" MAIL_FROM_ADDRESS "${FF_SMTP_FROM:-}"
+  env_set_if_missing "$file" MAIL_FROM_ADDRESS "${FF_SMTP_FROM:-}" || return 1
 
-  env_set_if_missing "$file" FREEFRAME_HTTPS "$mode"
-  env_set_if_missing "$file" FREEFRAME_STORAGE "$storage"
-  env_set_if_missing "$file" FREEFRAME_CHANNEL "$channel"
+  env_set_if_missing "$file" FREEFRAME_HTTPS "$mode" || return 1
+  env_set_if_missing "$file" FREEFRAME_STORAGE "$storage" || return 1
+  env_set_if_missing "$file" FREEFRAME_CHANNEL "$channel" || return 1
 
   for pair in "${workers[@]}"; do
-    env_set_if_missing "$file" "${pair%%=*}" "${pair#*=}"
+    env_set_if_missing "$file" "${pair%%=*}" "${pair#*=}" || return 1
   done
 }
 
