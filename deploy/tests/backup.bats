@@ -153,6 +153,25 @@ dumps() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null) || true; }
   [ -z "$(dumps)" ]
 }
 
+@test "backup: waits up to a minute for the database (the catch-up run at boot)" {
+  export STUB_PG_READY_AFTER=4
+  ff backup --quiet
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(grep -c '^sleep 5$' "$CALLS")" 3
+  assert_order "pg_isready" "pg_isready" "pg_isready" "pg_isready" "pg_dump"
+}
+
+@test "backup: a database that never answers is refused after the wait, with no dump" {
+  export STUB_PG_DOWN=1
+  ff backup --quiet
+  [ "$status" -eq 1 ]
+  assert_out "FreeFrame's database is not running, so no backup was made."
+  assert_out "sudo freeframe restart"
+  assert_not_called pg_dump
+  # 60 seconds in 5-second steps.
+  assert_eq "$(grep -c '^sleep 5$' "$CALLS")" 12
+}
+
 @test "backup --quiet prints nothing on success" {
   ff backup --quiet
   [ "$status" -eq 0 ]

@@ -842,7 +842,8 @@ backup_prune() {
 # Waits, in seconds (also for unusually slow servers): FF_API_WAIT (600),
 # FF_HEALTH_WAIT (300), FF_CERT_WAIT (300 per name), FF_DNS_WAIT (1800,
 # unattended runs only; with a terminal the installer waits until told),
-# FF_DB_WAIT (120, restore: for the database server to answer).
+# FF_DB_WAIT (120, restore: for the database server to answer),
+# FF_BACKUP_DB_WAIT (60, backup: the same, for the catch-up run at boot).
 # ------------------------------------------------------------
 
 FF_RAW_BASE=https://raw.githubusercontent.com/Techiebutler/freeframe
@@ -2521,6 +2522,13 @@ backup_create() {
   fi
 
   _ff_pg_names
+  # The nightly timer catches up at boot (Persistent=true), possibly before
+  # Docker has started the database: give it a minute.
+  if ! _ff_wait_for "${FF_BACKUP_DB_WAIT:-60}" 5 _ff_logged dc exec -T postgres pg_isready -U "$FF_PG_USER"; then
+    _ff_backup_refused "FreeFrame's database is not running, so no backup was made." \
+      "What to try: start FreeFrame (sudo freeframe restart), then run: $retry"
+    return 1
+  fi
   stamp=$(_ff_stamp) || stamp=""
   while [[ $stamp =~ ^[0-9]{8}-[0-9]{6}$ ]] &&
     [[ -e $dir/freeframe-$stamp.dump || -e $dir/freeframe-$stamp.env.prod ]]; do

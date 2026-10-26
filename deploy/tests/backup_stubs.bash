@@ -71,7 +71,15 @@ dc() {
         printf 'PGDMP current database %s\n' "${STUB_DB_CONTENT:-v2}"
       fi
       ;;
-    "exec -T postgres pg_isready "*) [[ -z ${STUB_PG_DOWN:-} ]] ;;
+    "exec -T postgres pg_isready "*)
+      [[ -z ${STUB_PG_DOWN:-} ]] || return 1
+      # STUB_PG_READY_AFTER=N: the database answers from the Nth check on.
+      local n=0
+      [[ -f $STUB_DIR/ready-count ]] && n=$(<"$STUB_DIR/ready-count")
+      n=$((n + 1))
+      printf '%s' "$n" >"$STUB_DIR/ready-count"
+      ((n >= ${STUB_PG_READY_AFTER:-1}))
+      ;;
     # The maintenance database: does FreeFrame's database exist?
     "exec -T postgres psql -U "*" -d postgres "*)
       cat >"$STUB_DIR/maint-sql"
