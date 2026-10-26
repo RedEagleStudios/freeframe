@@ -132,6 +132,30 @@ Release notes are on the [Releases page](https://github.com/Techiebutler/freefra
 
 ## Production Deployment
 
+There are two ways to run FreeFrame in production. Both use the same `.env.prod` and the same data; pick one.
+
+### Run the published images
+
+No clone and no build: the server needs only the compose files and your settings. Published images exist from v1.21.0 on.
+
+```bash
+mkdir freeframe && cd freeframe
+for f in docker-compose.prod.yml docker-compose.images.yml .env.example; do
+  curl -fsSLO "https://raw.githubusercontent.com/Techiebutler/freeframe/stable/$f"
+done
+cp .env.example .env.prod
+# Edit .env.prod: set your credentials, S3, email config
+# For SSL: also download docker-compose.https.yml, set DOMAIN and ACME_EMAIL,
+# and add -f docker-compose.https.yml below (see docs/deployment.md)
+docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.images.yml up -d
+```
+
+`docker-compose.images.yml` names the release it belongs to, so downloading the files again from the same ref and running `docker compose pull` then `up -d` is how you update. To pin a version, set `FREEFRAME_VERSION` in `.env.prod`.
+
+### Build from source
+
+Fully supported, and unchanged: this builds every image on the server.
+
 ```bash
 git clone -b stable https://github.com/Techiebutler/freeframe.git
 cd freeframe
@@ -141,6 +165,8 @@ cp .env.example .env.prod
 # (Traefik then requests a Let's Encrypt certificate; see docs/deployment.md)
 docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
 ```
+
+Use the same `-f` flags for every later `docker compose` command (`ps`, `logs`, `down`).
 
 For the full guide including **SSL setup**, **bring-your-own infrastructure** (external database, Redis, S3, SMTP), scaling, and troubleshooting, see:
 

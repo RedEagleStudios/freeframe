@@ -324,6 +324,8 @@ jobs:
           python3 -c "import yaml; yaml.safe_load(open('docker-compose.dev.yml'))" && echo "Dev compose YAML is valid"
           python3 -c "import yaml; yaml.safe_load(open('docker-compose.prod.yml'))" && echo "Prod compose YAML is valid"
           python3 -c "import yaml; yaml.safe_load(open('docker-compose.https.yml'))" && echo "HTTPS compose YAML is valid"
+          python3 -c "import yaml; yaml.safe_load(open('docker-compose.images.yml'))" && echo "Images compose YAML is valid"
+          python3 -c "import yaml; yaml.safe_load(open('docker-compose.storage.yml'))" && echo "Storage compose YAML is valid"
 
       - name: Verify the HTTPS compose override merges and needs DOMAIN
         run: |
@@ -339,3 +341,16 @@ jobs:
           fi
           echo "$err" | grep -q DOMAIN || { echo "::error::the error does not name DOMAIN: $err"; exit 1; }
           echo "an empty DOMAIN is refused and named"
+
+      - name: Verify the images and storage compose files merge
+        run: |
+          cp .env.example .env.prod
+          base() { docker compose --env-file .env.prod -f docker-compose.prod.yml "$@"; }
+          base -f docker-compose.images.yml config -q
+          echo "images file merges with the prod compose"
+          base -f docker-compose.images.yml -f docker-compose.storage.yml config -q
+          echo "images and storage files merge with the prod compose"
+          DOMAIN=review.example.com ACME_EMAIL=ops@example.com \
+            STORAGE_DOMAIN=storage.review.example.com STORAGE_ROUTED=true \
+            base -f docker-compose.images.yml -f docker-compose.https.yml -f docker-compose.storage.yml config -q
+          echo "images, https and storage files merge with the prod compose"

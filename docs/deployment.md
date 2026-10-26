@@ -67,6 +67,36 @@ FreeFrame is fully self-contained. Install Docker on any Linux server (Ubuntu 22
 
 ## Quick Setup
 
+There are two ways to run FreeFrame in production: **run the published images** (no clone, no build) or **build from source**. Both use the same `.env.prod` and the same data. If you already run FreeFrame from a clone, nothing changes for you: build from source stays fully supported.
+
+### Run the published images
+
+Published images exist from v1.21.0 on. You need only the compose files and your settings; download them from the ref you want to follow (`stable` for production, `latest` for early adopters, or a pinned `vX.Y.Z`):
+
+```bash
+mkdir freeframe && cd freeframe
+for f in docker-compose.prod.yml docker-compose.images.yml .env.example; do
+  curl -fsSLO "https://raw.githubusercontent.com/Techiebutler/freeframe/stable/$f"
+done
+
+# Create your production environment file and edit it with your actual credentials.
+# At minimum: change passwords, set FRONTEND_URL to your https:// URL, configure S3, email, and JWT_SECRET
+cp .env.example .env.prod
+nano .env.prod
+
+# Start all services (pulls the images, builds nothing)
+docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.images.yml up -d
+
+# Check that everything is running
+docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.images.yml ps
+```
+
+`docker-compose.images.yml` only adds the image names to `docker-compose.prod.yml`. Its default version is the release the file belongs to, so the compose files and the images always match. Set `FREEFRAME_VERSION` in `.env.prod` (for example `1.21.0`, no leading `v`) to pin another version. Use the same `-f` flags for every later command, and add `-f docker-compose.https.yml` or `-f docker-compose.storage.yml` as you need them (both are downloaded the same way).
+
+The published web image is built for the domain root. For a sub-path deployment, a hardware-accelerated transcoder, or your own code changes, build from source.
+
+### Build from source
+
 ```bash
 # 1. Clone the repository
 git clone https://github.com/Techiebutler/freeframe.git
@@ -86,7 +116,7 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
 docker compose --env-file .env.prod -f docker-compose.prod.yml ps
 ```
 
-FreeFrame is now running on **port 80**. The first user to sign up becomes the super admin via the setup wizard.
+FreeFrame is now running on **port 80** (either path). The first user to sign up becomes the super admin via the setup wizard.
 
 ---
 
@@ -214,7 +244,7 @@ Works with: **AWS ElastiCache, Upstash, Redis Cloud, DigitalOcean Managed Redis,
 
 Works with: **AWS S3, Cloudflare R2, Backblaze B2, DigitalOcean Spaces, Silo, Garage, MinIO, or any S3-compatible service.**
 
-The production compose runs no S3 service by default — you provide your own. (`docker-compose.prod.yml` ships a commented-out block running [Silo](https://github.com/pgsty/silo), a maintained fork of MinIO, if you want to keep media on the same host; see the notes above it. The `minio/minio` and `minio/mc` images it used before can no longer be pulled from Docker Hub. Silo reads the same `MINIO_*` variables and opens an existing MinIO data volume as is.) Configure in `.env.prod`:
+The production compose runs no S3 service by default, so you provide your own. To keep media on the same host, add `docker-compose.storage.yml`, which runs [Silo](https://github.com/pgsty/silo), a maintained fork of MinIO, and creates the bucket (see [Bundled storage](#bundled-storage-silo) below). (`docker-compose.prod.yml` still ships a commented-out block running the same Silo setup, for installs that already uncommented it; see the notes above it. The `minio/minio` and `minio/mc` images it used before can no longer be pulled from Docker Hub. Silo reads the same `MINIO_*` variables and opens an existing MinIO data volume as is.) Configure in `.env.prod`:
 
 ```
 S3_STORAGE=s3
@@ -237,6 +267,35 @@ For **non-AWS S3-compatible providers** (R2, B2, Spaces, MinIO, Hetzner, …), s
 | Garage (self-hosted) | `http://your-garage-host:3900` (or your reverse-proxy URL) |
 
 In non-AWS mode FreeFrame always uses **path-style addressing** (`endpoint/bucket/key`) with **SigV4** signatures — the compatibility baseline every S3-compatible provider accepts. No wildcard bucket DNS is needed in front of a self-hosted store.
+
+#### Bundled storage (Silo)
+
+For a new install, keep media on the same host by adding the storage file to every `docker compose` command:
+
+```bash
+docker compose --env-file .env.prod \
+  -f docker-compose.prod.yml -f docker-compose.storage.yml up -d
+```
+
+(add `-f docker-compose.images.yml` and `-f docker-compose.https.yml` too if you use them). Set these in `.env.prod`:
+
+```
+S3_STORAGE=minio
+S3_ENDPOINT=http://minio:9000
+S3_ACCESS_KEY=<strong value>
+S3_SECRET_KEY=<strong value>
+S3_BUCKET=<lowercase letters, digits and hyphens only>
+S3_PUBLIC_ENDPOINT=<the address the browser uses to reach storage>
+```
+
+Uploads go straight from the browser to storage, so `S3_PUBLIC_ENDPOINT` must be reachable from the browser. Two choices:
+
+- **Over HTTPS (with `docker-compose.https.yml`):** point a DNS record for `storage.<your-domain>` at this host and set `STORAGE_DOMAIN=storage.<your-domain>`, `STORAGE_ROUTED=true` and `S3_PUBLIC_ENDPOINT=https://storage.<your-domain>`. Traefik then serves storage on that name and requests its certificate.
+- **Over HTTP (no HTTPS file):** leave `STORAGE_ROUTED` unset, set `STORAGE_PORT_BIND=0.0.0.0:9000` and `S3_PUBLIC_ENDPOINT=http://<this host>:9000`, and open port 9000 to the people who use FreeFrame.
+
+`STORAGE_PORT_BIND` defaults to `127.0.0.1:9000`, which keeps the S3 port off the network. The Silo console (port 9001) is never published. `FRONTEND_URL` must be the exact origin people browse to, because the app sets the bucket's CORS rules from it. An existing `miniodata` volume opens as is.
+
+If you already uncommented the block in `docker-compose.prod.yml`, keep using it as the instructions above it say; do not pass both.
 
 #### Bucket CORS — required for uploads
 
@@ -548,6 +607,21 @@ Your media files are already in S3. For redundancy:
 
 ## Updating
 
+**Running the published images:** download the compose files again from the same ref (they name the release they belong to, and a new release can add services), then pull and restart:
+
+```bash
+cd freeframe
+for f in docker-compose.prod.yml docker-compose.images.yml; do
+  curl -fsSLO "https://raw.githubusercontent.com/Techiebutler/freeframe/stable/$f"
+done
+docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.images.yml pull
+docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.images.yml up -d
+```
+
+Download `docker-compose.https.yml` and `docker-compose.storage.yml` again too if you use them, and keep their `-f` flags in both commands. If you set `FREEFRAME_VERSION` in `.env.prod`, change it to the version you want (or remove it to follow the downloaded file). Keep your own changes in an extra `-f` file rather than editing the downloaded ones, so downloading again does not overwrite them.
+
+**Building from source** (unchanged):
+
 ```bash
 cd freeframe
 git pull origin main
@@ -631,9 +705,9 @@ Only for deployments that run the optional self-hosted storage block in `docker-
 
 1. **Read the changelog** — check for breaking changes or new env vars
 2. **Backup the database** — `pg_dump` before updating (see [Backups](#backups))
-3. **Pull and rebuild** — `git pull && docker compose up -d --build`
+3. **Pull and rebuild**: published images: download the compose files again, then `docker compose pull && docker compose up -d`; from source: `git pull && docker compose up -d --build`
 4. **Verify** — check `/health`, test login, spot-check a share link
-5. **Rollback if needed** — `git checkout v1.x.x && docker compose up -d --build`
+5. **Rollback if needed**: published images: set `FREEFRAME_VERSION=1.x.x` in `.env.prod` (no leading `v`), then `docker compose pull && docker compose up -d`; from source: `git checkout v1.x.x && docker compose up -d --build`
 
 ---
 
@@ -651,6 +725,12 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml logs traefik
 # Check all service statuses
 docker compose --env-file .env.prod -f docker-compose.prod.yml ps
 ```
+
+### `failed to resolve reference ... not found`
+
+With `docker-compose.images.yml`, a version that has no published image prints `failed to resolve reference ghcr.io/techiebutler/freeframe-api:<version>: ... not found`, followed by an error about the build context (the build section of `docker-compose.prod.yml` needs the source tree, which you do not have). Read the pair as "that version is not published". Check `FREEFRAME_VERSION` in `.env.prod` (digits and dots only, no leading `v`) and that the compose files you downloaded belong to a release from v1.21.0 on. A new release's images can take a little while to appear after the release itself.
+
+You must build yourself when you deploy under a sub-path (`NEXT_PUBLIC_BASE_PATH`), use hardware-accelerated transcoding, or run local changes. Clone the repository and run `docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build` without `docker-compose.images.yml`. Adding `--build` to a command that does include the images file also builds from source, but it needs the source tree next to the compose file.
 
 ### Database migration failures
 

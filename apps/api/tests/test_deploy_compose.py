@@ -1,4 +1,4 @@
-"""Deploy compose files (opt-in HTTPS).
+"""Deploy compose files (opt-in HTTPS, published images, bundled storage).
 
 The base docker-compose.prod.yml routes by PathPrefix only. Traefik derives the
 domains it asks Let's Encrypt for from Host() rules, so with no Host() rule it
@@ -6,7 +6,12 @@ logs `No domain parsed in provider ACME` and never requests a certificate, even
 with DOMAIN and ACME_EMAIL set. docker-compose.https.yml adds Host() routers on
 the websecure entrypoint and an http -> https redirect, and is opt-in: the base
 file must not change for anyone who does not pass `-f docker-compose.https.yml`.
+
+docker-compose.images.yml names the published GHCR images and
+docker-compose.storage.yml runs the optional bundled Silo storage. Both are
+opt-in extra `-f` files too: nothing here may change docker-compose.prod.yml.
 """
+import re
 from pathlib import Path
 
 import yaml
@@ -14,8 +19,52 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PROD_COMPOSE = REPO_ROOT / "docker-compose.prod.yml"
 HTTPS_COMPOSE = REPO_ROOT / "docker-compose.https.yml"
+IMAGES_COMPOSE = REPO_ROOT / "docker-compose.images.yml"
+STORAGE_COMPOSE = REPO_ROOT / "docker-compose.storage.yml"
+CHANGELOG = REPO_ROOT / "CHANGELOG.md"
 
 APP_SERVICES = ("api", "worker", "email_worker", "maintenance_worker", "beat", "web")
+API_IMAGE_SERVICES = ("api", "worker", "email_worker", "maintenance_worker", "beat")
+SILO_TAG = "RELEASE.2026-09-16T00-00-00Z"
+
+# The commented-out Silo block in docker-compose.prod.yml, byte for byte. A
+# clone that uncommented it must not get a `git pull` conflict, so it never
+# changes; new installs use docker-compose.storage.yml instead.
+PROD_SILO_BLOCK = """\
+  # minio:
+  #   image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z   # maintained MinIO fork; minio/minio is no longer pullable (#461)
+  #   command: server /data --console-address ":9001"
+  #   environment:
+  #     MINIO_ROOT_USER: ${S3_ACCESS_KEY}
+  #     MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY}
+  #   volumes:
+  #     - miniodata:/data
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+  #   restart: unless-stopped
+  #   labels:
+  #     - traefik.enable=true
+  #     - traefik.http.routers.minio.rule=Host(`storage.${DOMAIN}`)
+  #     - traefik.http.routers.minio.entrypoints=websecure
+  #     - traefik.http.routers.minio.tls.certresolver=letsencrypt
+  #     - traefik.http.services.minio.loadbalancer.server.port=9000
+  #
+  # minio-init:                     # one-shot: create the bucket (idempotent)
+  #   image: pgsty/mc:RELEASE.2026-09-16T00-00-00Z
+  #   env_file:
+  #     - .env.prod                    # the S3_* vars below are read inside the container
+  #   depends_on:
+  #     minio:
+  #       condition: service_healthy
+  #   entrypoint: >
+  #     /bin/sh -c "
+  #     mc alias set local http://minio:9000 $${S3_ACCESS_KEY} $${S3_SECRET_KEY} &&
+  #     mc mb --ignore-existing local/$${S3_BUCKET}
+  #     "
+"""
 
 
 def _services(path: Path) -> dict:
@@ -148,3 +197,89 @@ def test_base_prod_file_unchanged():
         "NEXT_PUBLIC_API_URL": "/api",
         "NEXT_PUBLIC_BASE_PATH": "${NEXT_PUBLIC_BASE_PATH:-}",
     }
+
+
+def test_base_prod_file_silo_block_unchanged():
+    assert PROD_SILO_BLOCK in PROD_COMPOSE.read_text()
+
+
+def test_images_file_names_every_app_service():
+    services = _services(IMAGES_COMPOSE)
+    assert set(services) == set(APP_SERVICES)
+    versions = set()
+    for name in API_IMAGE_SERVICES:
+        assert set(services[name]) == {"image"}, name
+        m = re.fullmatch(
+            r"ghcr\.io/techiebutler/freeframe-api:\$\{FREEFRAME_VERSION:-(\d+\.\d+\.\d+)\}",
+            services[name]["image"],
+        )
+        assert m, services[name]["image"]
+        versions.add(m.group(1))
+    assert set(services["web"]) == {"image"}
+    m = re.fullmatch(
+        r"ghcr\.io/techiebutler/freeframe-web:\$\{FREEFRAME_VERSION:-(\d+\.\d+\.\d+)\}",
+        services["web"]["image"],
+    )
+    assert m, services["web"]["image"]
+    versions.add(m.group(1))
+    assert len(versions) == 1, versions
+
+
+def test_images_default_version_matches_changelog():
+    # The release PR bumps the default; this fails until it does.
+    released = re.search(
+        r"^## \[(\d+\.\d+\.\d+)\]", CHANGELOG.read_text(), re.MULTILINE
+    ).group(1)
+    image = _services(IMAGES_COMPOSE)["api"]["image"]
+    assert f"FREEFRAME_VERSION:-{released}}}" in image, (released, image)
+
+
+def test_storage_file_matches_commented_block():
+    services = _services(STORAGE_COMPOSE)
+
+    minio = services["minio"]
+    assert minio["image"] == f"pgsty/silo:{SILO_TAG}"
+    assert minio["command"] == 'server /data --console-address ":9001"'
+    assert minio["volumes"] == ["miniodata:/data"]
+    assert minio["restart"] == "unless-stopped"
+    assert minio["environment"] == {
+        "MINIO_ROOT_USER": "${S3_ACCESS_KEY}",
+        "MINIO_ROOT_PASSWORD": "${S3_SECRET_KEY}",
+    }
+    # Only the S3 port, and only where STORAGE_PORT_BIND says. The console
+    # (9001) is never published.
+    assert minio["ports"] == ["${STORAGE_PORT_BIND:-127.0.0.1:9000}:9000"]
+    assert minio["healthcheck"]["test"] == [
+        "CMD",
+        "curl",
+        "-f",
+        "http://localhost:9000/minio/health/live",
+    ]
+
+    labels = _labels(STORAGE_COMPOSE, "minio")
+    assert labels["traefik.enable"] == "${STORAGE_ROUTED:-false}"
+    assert (
+        labels["traefik.http.routers.minio.rule"]
+        == "Host(`${STORAGE_DOMAIN:-storage.invalid}`)"
+    )
+    assert labels["traefik.http.routers.minio.entrypoints"] == "websecure"
+    assert labels["traefik.http.routers.minio.tls.certresolver"] == "letsencrypt"
+    assert labels["traefik.http.services.minio.loadbalancer.server.port"] == "9000"
+
+    init = services["minio-init"]
+    assert init["image"] == f"pgsty/mc:{SILO_TAG}"
+    assert init["env_file"] == [".env.prod"]
+    assert init["depends_on"] == {"minio": {"condition": "service_healthy"}}
+    assert "mc mb --ignore-existing" in init["entrypoint"]
+
+    for name in API_IMAGE_SERVICES:
+        assert services[name]["depends_on"] == {
+            "minio": {"condition": "service_healthy"}
+        }, name
+
+    assert set(services) == {"minio", "minio-init", *API_IMAGE_SERVICES}
+    assert "miniodata" in yaml.safe_load(STORAGE_COMPOSE.read_text())["volumes"]
+
+    # Same pinned tags as the commented block in the base file.
+    base = PROD_COMPOSE.read_text()
+    assert f"pgsty/silo:{SILO_TAG}" in base and f"pgsty/mc:{SILO_TAG}" in base
