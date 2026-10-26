@@ -2906,7 +2906,9 @@ cmd_restore() {
   else
     say "The current database is empty or not there, so there is nothing to save before the restore."
   fi
-  if [[ -n $recorded ]]; then
+  # Restoring the recorded copy itself is the undo: then there is nothing
+  # further to go back to.
+  if [[ -n $recorded && $recorded != "$dump" ]]; then
     undo=$recorded
     undo_cmd="sudo freeframe restore --yes $(_ff_q "$undo")"
   fi

@@ -524,6 +524,8 @@ dumps() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null) || true; }
   [ "$status" -eq 0 ] || { echo "$output"; false; }
   assert_eq "$(cat "$STUB_DIR/restored")" "PGDMP current database v2"
   [ ! -e "$FF_ROOT/.restore-undo" ]
+  # Having just put that copy back, it is not offered as a way back again.
+  if [[ $output == *"to go back to it"* ]]; then echo "$output"; false; fi
 }
 
 @test "restore: a retry over a database with data copies it too, but the undo stays the first copy" {
