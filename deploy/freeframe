@@ -1310,11 +1310,16 @@ _install_log_stop() {
   wait "$FF_TEE_PID" 2>/dev/null || true
 }
 
-# install_find_ip: FF_IP, the address the web address and DNS records use.
-# A public interface address wins; on a cloud server behind 1:1 NAT the
-# address the internet sees; otherwise (an office server) the local one.
+# install_find_ip: FF_IP, the address the DNS records and the automatic
+# sslip.io address use, and FF_LOCAL_IP, the interface address (the source
+# of the default route). A public interface address is used as both. When
+# the interface address is private and the internet sees a different public
+# one, the server is behind NAT (FF_NAT=1): an office server behind a
+# router, or a cloud server behind a gateway. Plain HTTP then uses the
+# interface address (_install_http_ip).
 install_find_ip() {
   local pub=""
+  FF_NAT=""
   FF_LOCAL_IP=$(local_ip) || FF_LOCAL_IP=""
   if is_public_ipv4 "$FF_LOCAL_IP"; then
     FF_IP=$FF_LOCAL_IP
@@ -1323,6 +1328,7 @@ install_find_ip() {
   pub=$(public_ip) || pub=""
   if is_public_ipv4 "$pub"; then
     FF_IP=$pub
+    if [[ -n $FF_LOCAL_IP && $FF_LOCAL_IP != "$pub" ]]; then FF_NAT=1; fi
   else
     FF_IP=$FF_LOCAL_IP
   fi
@@ -1442,17 +1448,25 @@ _install_ask_channel() {
   FF_CHANNEL=$ref
 }
 
+# _install_http_ip: the address plain HTTP uses: the interface address
+# behind NAT, otherwise FF_IP.
+_install_http_ip() {
+  if [[ -n ${FF_NAT:-} ]]; then printf '%s' "$FF_LOCAL_IP"; else printf '%s' "$FF_IP"; fi
+}
+
 _install_prompt_address() {
   local answer=""
   say ""
   say "1. Web address"
   say "   The address your team will type in the browser, for example review.yourstudio.com."
-  if is_public_ipv4 "$FF_IP"; then
+  if [[ -n ${FF_NAT:-} ]]; then
+    say "   This server has a private address ($FF_LOCAL_IP) and reaches the internet through a router or gateway ($FF_IP), so by default FreeFrame is used from this network only."
+    say "   Press Enter for http://$FF_LOCAL_IP (plain HTTP, from this network only)."
+    say "   To reach it from the internet, ports 80 and 443 on $FF_IP must first be forwarded to this server;"
+    say "   then type your domain, or type sslip for the free temporary address $(sslip_host "$FF_IP")."
+  elif is_public_ipv4 "$FF_IP"; then
     say "   No domain yet? Press Enter for a free temporary address with HTTPS,"
     say "   $(sslip_host "$FF_IP"). It is fine for trying FreeFrame; use your own domain for production."
-    if [[ -n ${FF_LOCAL_IP:-} && $FF_LOCAL_IP != "$FF_IP" ]]; then
-      say "   Only used inside your office? Type this server's local address, $FF_LOCAL_IP, for plain HTTP."
-    fi
   else
     say "   No domain? Press Enter to use this server's address, http://$FF_IP"
     say "   (plain HTTP, for use inside your office network)."
@@ -1460,7 +1474,14 @@ _install_prompt_address() {
   while :; do
     ask answer "   Web address" "" || _ff_input_ended
     answer=$(_ff_clean_host "$answer")
-    [[ -n $answer ]] || return 0
+    if [[ -z $answer ]]; then
+      if [[ -n ${FF_NAT:-} ]]; then FF_HTTPS=off; fi
+      return 0
+    fi
+    if [[ -n ${FF_NAT:-} && $answer == sslip ]]; then
+      FF_HTTPS=sslip
+      return 0
+    fi
     if valid_hostname "$answer"; then
       FF_DOMAIN=$answer
       return 0
@@ -1498,6 +1519,11 @@ _install_ask_address() {
     fi
   elif [[ ${FF_HTTPS:-auto} == auto ]] && _ff_interactive; then
     _install_prompt_address
+  elif [[ ${FF_HTTPS:-auto} == auto && -n ${FF_NAT:-} ]]; then
+    # Behind NAT, unattended, nothing asked for: this network only.
+    FF_HTTPS=off
+    say "This server has a private address ($FF_LOCAL_IP) behind a router or gateway ($FF_IP), so FreeFrame will use http://$FF_LOCAL_IP, from this network only."
+    say "To use a domain or the temporary address instead, give --domain or --https sslip (ports 80 and 443 must be forwarded to this server)."
   fi
   if [[ -n ${FF_DOMAIN:-} ]] && _ff_is_ipv4 "$FF_DOMAIN"; then
     case ${FF_HTTPS:-auto} in
@@ -1525,7 +1551,11 @@ _install_ask_address() {
       fi
       FF_HOST=$(sslip_host "$FF_IP")
       ;;
-    *) FF_HOST=${FF_DOMAIN:-$FF_IP} ;;
+    *)
+      # derive_env uses FF_DOMAIN (or FF_IP) as the plain HTTP address.
+      if [[ -z ${FF_DOMAIN:-} ]]; then FF_DOMAIN=$(_install_http_ip); fi
+      FF_HOST=$FF_DOMAIN
+      ;;
   esac
   FF_HTTPS=$FF_MODE
 }
@@ -2070,7 +2100,7 @@ _install_start_step() {
 }
 
 _install_verify_step() {
-  local file=$1 h ok=1
+  local file=$1 h ok=1 http_ip
   local -a hosts=()
   FF_STEP="checking that FreeFrame answers"
   say "Checking that FreeFrame answers at $(_ff_scheme "$FF_MODE")://$FF_HOST ..."
@@ -2097,12 +2127,13 @@ _install_verify_step() {
     warn "The certificate for the temporary address $h did not arrive in time. This happens when the free sslip.io service or Let's Encrypt is busy."
     say "Switching to plain HTTP on this server's IP address instead..."
     FF_STEP="switching to plain HTTP"
-    if ! switch_to_http_mode "$file" "$FF_IP"; then
+    http_ip=$(_install_http_ip)
+    if ! switch_to_http_mode "$file" "$http_ip"; then
       install_fail "Could not switch to plain HTTP." "run sudo freeframe install again; the reason is at the end of the log."
     fi
-    FF_MODE=off FF_HOST=$FF_IP FF_FELL_BACK=1
-    if ! _ff_wait_for "${FF_HEALTH_WAIT:-300}" 5 probe_health off "$FF_IP"; then
-      install_fail "FreeFrame does not answer on http://$FF_IP." "see why with: sudo freeframe logs, then run sudo freeframe install again."
+    FF_MODE=off FF_HOST=$http_ip FF_FELL_BACK=1
+    if ! _ff_wait_for "${FF_HEALTH_WAIT:-300}" 5 probe_health off "$http_ip"; then
+      install_fail "FreeFrame does not answer on http://$http_ip." "see why with: sudo freeframe logs, then run sudo freeframe install again."
     fi
   else
     FF_CERT_PENDING=$h
