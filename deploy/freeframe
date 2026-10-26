@@ -1448,8 +1448,9 @@ _install_ask_channel() {
   FF_CHANNEL=$ref
 }
 
-# _install_http_ip: the address plain HTTP uses: the interface address
-# behind NAT, otherwise FF_IP.
+# _install_http_ip: the address plain HTTP uses when no name was given: the
+# interface (LAN) address behind NAT, otherwise FF_IP. Needs install_find_ip
+# first; configure uses the pair to pick the address for switch_to_http_mode.
 _install_http_ip() {
   if [[ -n ${FF_NAT:-} ]]; then printf '%s' "$FF_LOCAL_IP"; else printf '%s' "$FF_IP"; fi
 }
@@ -1459,14 +1460,13 @@ _install_prompt_address() {
   say ""
   say "1. Web address"
   say "   The address your team will type in the browser, for example review.yourstudio.com."
-  if [[ -n ${FF_NAT:-} ]]; then
-    say "   This server has a private address ($FF_LOCAL_IP) and reaches the internet through a router or gateway ($FF_IP), so by default FreeFrame is used from this network only."
-    say "   Press Enter for http://$FF_LOCAL_IP (plain HTTP, from this network only)."
-    say "   To reach it from the internet, ports 80 and 443 on $FF_IP must first be forwarded to this server;"
-    say "   then type your domain, or type sslip for the free temporary address $(sslip_host "$FF_IP")."
-  elif is_public_ipv4 "$FF_IP"; then
+  if is_public_ipv4 "$FF_IP"; then
     say "   No domain yet? Press Enter for a free temporary address with HTTPS,"
     say "   $(sslip_host "$FF_IP"). It is fine for trying FreeFrame; use your own domain for production."
+    if [[ -n ${FF_NAT:-} ]]; then
+      say "   This server reaches the internet through a router (its own address is $FF_LOCAL_IP). If it is an office or home server that should only be used on this network, choose 'this network only'."
+      say "   For this network only (plain HTTP on http://$FF_LOCAL_IP), type: local"
+    fi
   else
     say "   No domain? Press Enter to use this server's address, http://$FF_IP"
     say "   (plain HTTP, for use inside your office network)."
@@ -1474,12 +1474,9 @@ _install_prompt_address() {
   while :; do
     ask answer "   Web address" "" || _ff_input_ended
     answer=$(_ff_clean_host "$answer")
-    if [[ -z $answer ]]; then
-      if [[ -n ${FF_NAT:-} ]]; then FF_HTTPS=off; fi
-      return 0
-    fi
-    if [[ -n ${FF_NAT:-} && $answer == sslip ]]; then
-      FF_HTTPS=sslip
+    [[ -n $answer ]] || return 0
+    if [[ -n ${FF_NAT:-} && ( $answer == local || $answer == "this network only" ) ]]; then
+      FF_HTTPS=off
       return 0
     fi
     if valid_hostname "$answer"; then
@@ -1519,11 +1516,6 @@ _install_ask_address() {
     fi
   elif [[ ${FF_HTTPS:-auto} == auto ]] && _ff_interactive; then
     _install_prompt_address
-  elif [[ ${FF_HTTPS:-auto} == auto && -n ${FF_NAT:-} ]]; then
-    # Behind NAT, unattended, nothing asked for: this network only.
-    FF_HTTPS=off
-    say "This server has a private address ($FF_LOCAL_IP) behind a router or gateway ($FF_IP), so FreeFrame will use http://$FF_LOCAL_IP, from this network only."
-    say "To use a domain or the temporary address instead, give --domain or --https sslip (ports 80 and 443 must be forwarded to this server)."
   fi
   if [[ -n ${FF_DOMAIN:-} ]] && _ff_is_ipv4 "$FF_DOMAIN"; then
     case ${FF_HTTPS:-auto} in
@@ -2125,9 +2117,13 @@ _install_verify_step() {
   fi
   if [[ $FF_MODE == sslip ]]; then
     warn "The certificate for the temporary address $h did not arrive in time. This happens when the free sslip.io service or Let's Encrypt is busy."
-    say "Switching to plain HTTP on this server's IP address instead..."
     FF_STEP="switching to plain HTTP"
     http_ip=$(_install_http_ip)
+    if [[ -n ${FF_NAT:-} ]]; then
+      say "This server reaches the internet through a router, so FreeFrame switches to plain HTTP on the server's own network address, http://$http_ip. It works from this network only."
+    else
+      say "Switching to plain HTTP on this server's IP address instead..."
+    fi
     if ! switch_to_http_mode "$file" "$http_ip"; then
       install_fail "Could not switch to plain HTTP." "run sudo freeframe install again; the reason is at the end of the log."
     fi

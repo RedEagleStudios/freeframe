@@ -786,65 +786,91 @@ assert_root_untouched() {
   assert_has "$ENV" "FRONTEND_URL=https://203-0-113-7.sslip.io"
 }
 
-@test "NAT ruling: behind NAT, Enter at the address means HTTP on the interface address" {
-  printf '%s\n' "" "1" "" "Grace" "grace@example.com" \
+@test "NAT ruling: behind NAT, Enter still means the automatic address, with a note" {
+  printf '%s\n' "" "certs@example.com" "1" "" "Grace" "grace@example.com" \
     "long-password-1" "long-password-1" "y" >"$BATS_TEST_TMPDIR/tty"
   export FF_TTY="$BATS_TEST_TMPDIR/tty" STUB_LOCAL_IP=10.0.0.5
   ff_install
   [ "$status" -eq 0 ] || { echo "$output"; false; }
-  assert_out "private address (10.0.0.5)"
-  assert_out "forwarded"
-  assert_out "type sslip"
+  assert_out "This server reaches the internet through a router (its own address is 10.0.0.5)."
+  assert_out "choose 'this network only'"
+  assert_out "type: local"
+  assert_has "$ENV" "FRONTEND_URL=https://203-0-113-7.sslip.io"
+}
+
+@test "NAT ruling: behind NAT, 'this network only' means HTTP on the interface address" {
+  printf '%s\n' "local" "1" "" "Grace" "grace@example.com" \
+    "long-password-1" "long-password-1" "y" >"$BATS_TEST_TMPDIR/tty"
+  export FF_TTY="$BATS_TEST_TMPDIR/tty" STUB_LOCAL_IP=10.0.0.5
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
   assert_has "$ENV" "FRONTEND_URL=http://10.0.0.5"
   assert_has "$ENV" "FREEFRAME_HTTPS=off"
   assert_has "$ENV" "S3_PUBLIC_ENDPOINT=http://10.0.0.5:9000"
   assert_out "FreeFrame is ready: http://10.0.0.5"
 }
 
-@test "NAT ruling: behind NAT, typing sslip picks the automatic address" {
-  printf '%s\n' "sslip" "certs@example.com" "1" "" "Grace" "grace@example.com" \
+@test "NAT ruling: without NAT the address question has no router note" {
+  printf '%s\n' "" "certs@example.com" "1" "" "Grace" "grace@example.com" \
     "long-password-1" "long-password-1" "y" >"$BATS_TEST_TMPDIR/tty"
-  export FF_TTY="$BATS_TEST_TMPDIR/tty" STUB_LOCAL_IP=10.0.0.5
-  ff_install
+  FF_TTY="$BATS_TEST_TMPDIR/tty" ff_install
   [ "$status" -eq 0 ] || { echo "$output"; false; }
-  assert_has "$ENV" "FRONTEND_URL=https://203-0-113-7.sslip.io"
+  if grep -q "through a router" <<<"$output"; then echo "$output"; false; fi
 }
 
-@test "NAT ruling: behind NAT and unattended, HTTP on the interface address" {
+@test "NAT ruling: behind NAT and unattended, the default is still the automatic address" {
   plain_answers
   unset FREEFRAME_HTTPS
   export STUB_LOCAL_IP=10.0.0.5
   ff_install --yes
   [ "$status" -eq 0 ] || { echo "$output"; false; }
-  assert_has "$ENV" "FRONTEND_URL=http://10.0.0.5"
+  assert_has "$ENV" "FRONTEND_URL=https://203-0-113-7.sslip.io"
+  assert_has "$ENV" "FREEFRAME_HTTPS=sslip"
+}
+
+@test "NAT ruling: behind NAT, an sslip certificate timeout falls back to HTTP on the interface address" {
+  plain_answers
+  unset FREEFRAME_HTTPS
+  export STUB_LOCAL_IP=10.0.0.5 STUB_CERT_FAIL=1 FF_CERT_WAIT=10
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
   assert_has "$ENV" "FREEFRAME_HTTPS=off"
-  assert_out "from this network only"
+  assert_has "$ENV" "FRONTEND_URL=http://10.0.0.5"
+  assert_has "$ENV" "S3_PUBLIC_ENDPOINT=http://10.0.0.5:9000"
+  assert_out "the server's own network address, http://10.0.0.5"
+  assert_out "FreeFrame is ready: http://10.0.0.5"
   grep -q "probe_health off 10.0.0.5" "$CALLS"
 }
 
-@test "NAT ruling: an explicit --https wins behind NAT" {
+@test "NAT ruling: explicit choices win behind NAT" {
   plain_answers
   export STUB_LOCAL_IP=10.0.0.5
+  # plain_answers sets FREEFRAME_HTTPS=off: plain HTTP on the interface address.
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_has "$ENV" "FRONTEND_URL=http://10.0.0.5"
+
+  rm -rf "$FF_ROOT" && mkdir -p "$FF_ROOT"
   ff_install --yes --https sslip
   [ "$status" -eq 0 ] || { echo "$output"; false; }
   assert_has "$ENV" "FRONTEND_URL=https://203-0-113-7.sslip.io"
 
   rm -rf "$FF_ROOT" && mkdir -p "$FF_ROOT"
+  unset FREEFRAME_HTTPS
   export FREEFRAME_ACME_EMAIL=certs@example.com
-  ff_install --yes --https own --domain review.yourstudio.com
+  ff_install --yes --domain review.yourstudio.com
   [ "$status" -eq 0 ] || { echo "$output"; false; }
   assert_has "$ENV" "FRONTEND_URL=https://review.yourstudio.com"
   # The DNS records point at the public address, not the private one.
   grep -q "dns_points_here review.yourstudio.com 203.0.113.7" "$CALLS"
 }
 
-@test "NAT ruling: an sslip certificate that never arrives falls back to the interface address" {
+@test "NAT ruling: without NAT the sslip fallback stays on the public address" {
   plain_answers
-  export STUB_LOCAL_IP=10.0.0.5 FREEFRAME_HTTPS=sslip STUB_CERT_FAIL=1 FF_CERT_WAIT=10
+  export FREEFRAME_HTTPS=sslip STUB_CERT_FAIL=1 FF_CERT_WAIT=10
   ff_install --yes
   [ "$status" -eq 0 ] || { echo "$output"; false; }
-  assert_has "$ENV" "FRONTEND_URL=http://10.0.0.5"
-  assert_out "FreeFrame is ready: http://10.0.0.5"
+  assert_has "$ENV" "FRONTEND_URL=http://203.0.113.7"
 }
 
 # ---------------------------------------------------------------- server fixes
