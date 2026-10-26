@@ -2941,11 +2941,19 @@ cmd_restore() {
   FF_DROP_STARTED=1
   FF_STATE="The database may already have been removed. FreeFrame is stopped, so nothing can write to it. To try again, run: $FF_RERUN${undo:+. To go back to the data as it was before this restore instead, run: $undo_cmd}"
   if ! _ff_logged dc exec -T postgres dropdb -U "$FF_PG_USER" --if-exists --force "$FF_PG_DB"; then
-    # DROP DATABASE either happens or not: the database is unchanged.
-    FF_DROP_STARTED=""
-    _restore_forget_new_record
-    _restore_fail "$(_restore_restart)" "The current database could not be removed, so it is unchanged." \
-      "the reason is at the end of $FF_LOG. Then run: $FF_RERUN"
+    # DROP DATABASE either happens or not, but dropdb can fail after it did
+    # (a broken connection), so ask what is there now instead of assuming.
+    state=$(_restore_db_state) || state=unknown
+    if [[ $state == data ]]; then
+      FF_DROP_STARTED=""
+      _restore_forget_new_record
+      _restore_fail "$(_restore_restart)" "The current database could not be removed, so it is unchanged." \
+        "the reason is at the end of $FF_LOG. Then run: $FF_RERUN"
+    fi
+    # Possibly gone: keep the record and keep FreeFrame stopped (on an empty
+    # database its setup page would be open to anyone).
+    install_fail "The current database could not be replaced, and it may already have been removed." \
+      "the reason is at the end of $FF_LOG."
   fi
   FF_STATE="The database has been removed and is not back yet. FreeFrame is stopped, so nothing can write to it. To try again, run: $FF_RERUN${undo:+. To go back to the data as it was before this restore instead, run: $undo_cmd}"
   FF_STEP="creating the database again"

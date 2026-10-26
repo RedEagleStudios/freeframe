@@ -730,6 +730,46 @@ dumps() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null) || true; }
   assert_out "FreeFrame could not be started again."
 }
 
+@test "restore: dropdb failing on a database with data forgets the new record" {
+  old_backup 20261020-030000
+  export STUB_DROP_FAIL=1
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  assert_out "The current database could not be removed, so it is unchanged."
+  [ ! -e "$FF_ROOT/.restore-undo" ]
+}
+
+@test "restore: dropdb failing after the database went away keeps the undo and leaves FreeFrame stopped" {
+  old_backup 20261020-030000
+  export STUB_DROP_FAIL_GONE=1
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  if [[ $output == *unchanged* ]]; then echo "$output"; false; fi
+  assert_out "may already have been removed"
+  assert_out "To try again, run: sudo freeframe restore --yes '$BK/freeframe-20261020-030000.dump'"
+  local safety
+  safety=$(dumps | tail -1)
+  assert_out "run: sudo freeframe restore --yes '$BK/$safety'"
+  assert_out "install.log"
+  # Only the database server was started; FreeFrame stays stopped.
+  [ "$(grep -c '^dc up -d' "$CALLS")" -eq 1 ]
+  assert_not_called createdb
+  assert_eq "$(cat "$FF_ROOT/.restore-undo")" "$BK/$safety"
+}
+
+@test "restore: dropdb failing when the database can no longer be checked is treated as maybe removed" {
+  old_backup 20261020-030000
+  export STUB_DROP_FAIL=1 STUB_MAINT_FAIL_AFTER_DROP=1
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  if [[ $output == *unchanged* ]]; then echo "$output"; false; fi
+  assert_out "may already have been removed"
+  [ "$(grep -c '^dc up -d' "$CALLS")" -eq 1 ]
+  local safety
+  safety=$(dumps | tail -1)
+  assert_eq "$(cat "$FF_ROOT/.restore-undo")" "$BK/$safety"
+}
+
 @test "restore: createdb failing after the drop says the database is gone and how to retry" {
   old_backup 20261020-030000
   export STUB_CREATE_FAIL=1

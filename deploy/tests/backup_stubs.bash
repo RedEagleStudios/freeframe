@@ -94,6 +94,8 @@ dc() {
     "exec -T postgres psql -U "*" -d postgres "*)
       cat >"$STUB_DIR/maint-sql"
       [[ -z ${STUB_MAINT_FAIL:-} ]] || return 1
+      # STUB_MAINT_FAIL_AFTER_DROP: the check fails once a drop was tried.
+      [[ -z ${STUB_MAINT_FAIL_AFTER_DROP:-} || ! -e $STUB_DIR/drop-tried ]] || return 1
       if [[ $(_stub_db) == absent ]]; then echo 0; else echo 1; fi
       ;;
     # FreeFrame's database: how many tables?
@@ -102,7 +104,14 @@ dc() {
       if [[ $(_stub_db) == empty ]]; then echo 0; else echo 42; fi
       ;;
     "exec -T postgres dropdb "*)
+      : >"$STUB_DIR/drop-tried"
       [[ -z ${STUB_DROP_HANG:-} ]] || _stub_hang dropdb
+      # STUB_DROP_FAIL_GONE: the drop went through but dropdb still failed
+      # (the connection broke before the answer came back).
+      if [[ -n ${STUB_DROP_FAIL_GONE:-} ]]; then
+        _stub_db_set absent
+        return 1
+      fi
       [[ -z ${STUB_DROP_FAIL:-} ]] || return 1
       _stub_db_set absent
       ;;
