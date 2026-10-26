@@ -788,8 +788,14 @@ ff_signal() {
   local sig=$1 step=$2 pid n=0
   shift 2
   command -v setsid >/dev/null || skip "no setsid"
-  setsid bash -c 'set -Eeuo pipefail; source "$1"; source "$2"; shift 2; main "$@"' \
-    ff-run "$FF_SCRIPT" "$STUBS" "$@" >"$BATS_TEST_TMPDIR/out" 2>&1 &
+  # FF_SIGNAL_ERR=FILE sends stderr there instead (for example /dev/full).
+  if [[ -n ${FF_SIGNAL_ERR:-} ]]; then
+    setsid bash -c 'set -Eeuo pipefail; source "$1"; source "$2"; shift 2; main "$@"' \
+      ff-run "$FF_SCRIPT" "$STUBS" "$@" >"$BATS_TEST_TMPDIR/out" 2>"$FF_SIGNAL_ERR" &
+  else
+    setsid bash -c 'set -Eeuo pipefail; source "$1"; source "$2"; shift 2; main "$@"' \
+      ff-run "$FF_SCRIPT" "$STUBS" "$@" >"$BATS_TEST_TMPDIR/out" 2>&1 &
+  fi
   pid=$!
   while [[ ! -e $STUB_DIR/hanging-$step ]]; do
     sleep 0.1
@@ -813,6 +819,26 @@ ff_signal() {
   assert_out "The backup was stopped (SIGTERM) before it finished."
   assert_out "No new backup was made"
   [ -z "$(ls -A "$BK" | grep -v '^\.')" ]
+}
+
+@test "backup: stopped with its stderr gone, it still logs and cleans up" {
+  [ -w /dev/full ] || skip "no /dev/full"
+  export STUB_DUMP_HANG=1 FF_SIGNAL_ERR=/dev/full
+  ff_signal TERM pg_dump backup --quiet
+  [ "$status" -eq 1 ]
+  grep -q "The backup was stopped (SIGTERM) before it finished." "$FF_ROOT/install.log"
+  grep -q "No new backup was made" "$FF_ROOT/install.log"
+  [ -z "$(ls -A "$BK" | grep -v '^\.')" ]
+}
+
+@test "backup: a refusal with its stderr gone is still logged" {
+  [ -w /dev/full ] || skip "no /dev/full"
+  export STUB_FREE_MB=500
+  run bash -c 'set -Eeuo pipefail; source "$1"; source "$2"; shift 2; exec 2>/dev/full; main "$@"' \
+    ff-run "$FF_SCRIPT" "$STUBS" backup --quiet
+  [ "$status" -eq 1 ]
+  grep -q "not enough free disk space" "$FF_ROOT/install.log"
+  grep -q "No new backup was made" "$FF_ROOT/install.log"
 }
 
 @test "backup: files a killed backup left behind are removed by the next one" {

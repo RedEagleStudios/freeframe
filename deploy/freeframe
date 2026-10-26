@@ -2481,9 +2481,11 @@ _ff_log_lines() {
 _ff_backup_refused() {
   local line
   _ff_backup_cleanup
-  for line in "$@"; do warn "$line"; done
-  warn "No new backup was made; the earlier ones are untouched."
+  # The log first, and a screen or journal that is gone (an ssh hangup, a
+  # stopped journald) must not stop the rest, even under set -e.
   _ff_log_lines "$@" "No new backup was made; the earlier ones are untouched."
+  for line in "$@"; do warn "$line" || true; done
+  warn "No new backup was made; the earlier ones are untouched." || true
 }
 
 # backup_create prune|keep: save a backup of the database now (see the top of
@@ -2597,7 +2599,8 @@ backup_create() {
 # backup. The part-written files are removed (and a SIGKILL's are removed by
 # the next backup).
 _backup_on_signal() {
-  trap '' INT TERM HUP
+  # PIPE too: a write to a vanished reader then fails instead of killing.
+  trap '' INT TERM HUP PIPE
   # To the saved stderr: a trap runs inside the redirection of the command
   # it interrupted.
   _ff_backup_refused "The backup was stopped (SIG$1) before it finished." 2>&"${FF_BACKUP_ERR:-2}"
