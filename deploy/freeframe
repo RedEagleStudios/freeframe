@@ -2521,11 +2521,17 @@ backup_create() {
   fi
 
   _ff_pg_names
-  stamp=$(_ff_stamp)
-  while [[ -e $dir/freeframe-$stamp.dump || -e $dir/freeframe-$stamp.env.prod ]]; do
+  stamp=$(_ff_stamp) || stamp=""
+  while [[ $stamp =~ ^[0-9]{8}-[0-9]{6}$ ]] &&
+    [[ -e $dir/freeframe-$stamp.dump || -e $dir/freeframe-$stamp.env.prod ]]; do
     sleep 1
-    stamp=$(_ff_stamp)
+    stamp=$(_ff_stamp) || stamp=""
   done
+  if [[ ! $stamp =~ ^[0-9]{8}-[0-9]{6}$ ]]; then
+    _ff_backup_refused "The backup could not be named: the server's date ('$stamp') is not usable." \
+      "What to try: check the date with: date, then run: $retry"
+    return 1
+  fi
   base="$dir/freeframe-$stamp"
   FF_PARTIAL=$base
   printf 'backup: writing %s.dump\n' "$base" >>"${FF_LOG:-/dev/null}"
@@ -2561,16 +2567,6 @@ backup_create() {
   return 0
 }
 
-# _backup_on_error: the ERR trap of freeframe backup.
-_backup_on_error() {
-  local code=$?
-  if ((BASH_SUBSHELL > 0)); then exit "$code"; fi
-  trap - ERR
-  _ff_backup_refused "The backup stopped unexpectedly (error $code)." \
-    "What to try: run sudo freeframe backup again.${FF_LOG:+ The reason is at the end of $FF_LOG.}"
-  exit 1
-}
-
 # _backup_on_signal SIG: Ctrl-C, systemctl stop or a shutdown during a
 # backup. The part-written files are removed (and a SIGKILL's are removed by
 # the next backup).
@@ -2599,12 +2595,13 @@ cmd_backup() {
       "wait a few minutes for it to finish, then run sudo freeframe backup again."
   fi
   exec {FF_BACKUP_ERR}>&2
-  trap _backup_on_error ERR
+  # No ERR trap: backup_create runs inside `if !`, where bash never fires
+  # one, so every step in it is checked explicitly instead.
   trap '_backup_on_signal INT' INT
   trap '_backup_on_signal TERM' TERM
   trap '_backup_on_signal HUP' HUP
   if ! backup_create prune; then exit 1; fi
-  trap - ERR INT TERM HUP
+  trap - INT TERM HUP
   [[ -z ${FF_QUIET:-} ]] || return 0
   base=${FF_BACKUP_MADE%.dump}
   size=$(_ff_human_size "$(_ff_size_bytes "$FF_BACKUP_MADE")")

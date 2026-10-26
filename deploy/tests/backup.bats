@@ -214,6 +214,19 @@ dumps() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null) || true; }
   if [[ $output == *"/dev/null"* || $output == *"end of"* ]]; then echo "$output"; false; fi
 }
 
+@test "backup: a failing step in it is checked, not left to an ERR trap that never fires" {
+  # backup_create runs inside `if !`, so no ERR trap can catch a failure in
+  # it. A date that cannot be read must still stop it, with no odd file name.
+  export STUB_STAMP_FAIL=1
+  ff backup
+  [ "$status" -eq 1 ]
+  assert_out "could not be named"
+  assert_not_called pg_dump
+  [ -z "$(ls -A "$BK" | grep -v '^\.')" ]
+  # And there is no dead ERR handler left in the script.
+  if grep -q '_backup_on_error' "$FF_SCRIPT"; then false; fi
+}
+
 @test "backup: the log records the run" {
   ff backup
   [ "$status" -eq 0 ]

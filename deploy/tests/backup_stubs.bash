@@ -12,6 +12,8 @@ ff_is_root() { [[ -z ${STUB_NOT_ROOT:-} ]]; }
 ff_sleep() { _stub_log "sleep $1"; }
 _ff_free_mb() { printf '%s\n' "${STUB_FREE_MB:-80000}"; }
 
+if [[ -n ${STUB_STAMP_FAIL:-} ]]; then _ff_stamp() { return 1; }; fi
+
 # STUB_BIG_LAST=BYTES: the size the newest existing dump reports, so the
 # low-disk rule can be tested without writing a large file.
 if [[ -n ${STUB_BIG_LAST:-} ]]; then
