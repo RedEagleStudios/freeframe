@@ -94,9 +94,10 @@ assert_root_untouched() {
     "net_reachable https://download.docker.com" install_docker \
     "fetch latest docker-compose.prod.yml" "fetch latest docker-compose.images.yml" \
     "fetch latest docker-compose.https.yml" "fetch latest docker-compose.storage.yml" \
+    "fetch latest deploy/systemd/freeframe-backup.service" "fetch latest deploy/systemd/freeframe-backup.timer" \
     derive_env "dc pull" "dc config --services" "dc up -d" \
     "localhost:8000/health" "localhost:8000/setup/create-superadmin" \
-    "dc up -d --no-build traefik" "probe_health off 203.0.113.7"
+    "dc up -d --no-build traefik" "probe_health off 203.0.113.7" install_backup_timer
   [ -f "$ENV" ]
   assert_has "$ENV" "FRONTEND_URL=http://203.0.113.7"
   assert_has "$ENV" "FREEFRAME_CHANNEL=latest"
@@ -234,6 +235,49 @@ assert_root_untouched() {
   if grep -q -F "$pw" "$log"; then echo "password in the log"; false; fi
   if grep -q -F "tok-SECRET" "$log"; then echo "token in the log"; false; fi
   grep -q "FreeFrame is ready" "$log"
+}
+
+@test "install: the nightly backup timer is set up once FreeFrame answers, before the summary" {
+  plain_answers
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_order "localhost:8000/setup/create-superadmin" "dc up -d --no-build traefik" \
+    "probe_health off" install_backup_timer
+  [ "$(grep -c '^install_backup_timer$' "$CALLS")" -eq 1 ]
+  [[ $output == *"nightly"*"FreeFrame is ready"* ]] || { echo "$output"; false; }
+}
+
+@test "install: the summary says the backups stay on this server and are nightly" {
+  plain_answers
+  ff_install --yes
+  [ "$status" -eq 0 ]
+  assert_out "every night at 3:00"
+  assert_out "on this server only"
+  assert_out "do not survive losing it"
+}
+
+@test "install: a backup timer that cannot be set up stops before marking the install complete" {
+  plain_answers
+  export STUB_TIMER_FAIL=1
+  ff_install --yes
+  [ "$status" -eq 1 ]
+  [ ! -e "$FF_ROOT/.installed" ]
+  assert_out "nightly database backups could not be set up"
+  assert_out "FreeFrame is running"
+  assert_out "install.log"
+  # A re-run finishes the job.
+  unset STUB_TIMER_FAIL
+  ff_install --yes
+  [ "$status" -eq 0 ]
+  [ -f "$FF_ROOT/.installed" ]
+}
+
+@test "install: the backup units are downloaded into the systemd folder of the install" {
+  plain_answers
+  ff_install --yes
+  [ "$status" -eq 0 ]
+  [ -f "$FF_ROOT/systemd/freeframe-backup.service" ]
+  [ -f "$FF_ROOT/systemd/freeframe-backup.timer" ]
 }
 
 @test "install: marks the install complete only at the end" {

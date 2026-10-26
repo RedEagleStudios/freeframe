@@ -1,0 +1,527 @@
+#!/usr/bin/env bats
+# `freeframe backup`, `freeframe restore` and the nightly backup timer, with
+# every side effect stubbed (backup_stubs.bash). Like install.bats, each flow
+# runs in a fresh bash under the script's own strict mode.
+
+load helpers
+
+setup() {
+  common_setup
+  export STUB_DIR="$BATS_TEST_TMPDIR"
+  export CALLS="$BATS_TEST_TMPDIR/calls"
+  : >"$CALLS"
+  STUBS="${BATS_TEST_DIRNAME}/backup_stubs.bash"
+  ENV="$FF_ROOT/.env.prod"
+  BK="$FF_ROOT/backups"
+  # An installed server: a settings file with a quoted database user, so the
+  # names must come through env_get.
+  printf "POSTGRES_USER='ffuser'\nPOSTGRES_DB=ffdb\nPOSTGRES_PASSWORD=pw\n" >"$ENV"
+  chmod 600 "$ENV"
+}
+
+# ff ARGS...: run `freeframe ARGS` with the stubs.
+ff() {
+  run bash -c 'set -Eeuo pipefail; source "$1"; source "$2"; shift 2; main "$@"' \
+    ff-run "$FF_SCRIPT" "$STUBS" "$@"
+}
+
+assert_order() {
+  local last=0 pat n
+  for pat in "$@"; do
+    n=$(grep -n -F -- "$pat" "$CALLS" | awk -F: -v l="$last" '$1 > l { print $1; exit }')
+    if [[ -z $n ]]; then
+      echo "not found after line $last: $pat"
+      echo "--- calls ---"
+      cat "$CALLS"
+      return 1
+    fi
+    last=$n
+  done
+}
+
+assert_not_called() {
+  if grep -q -F -- "$1" "$CALLS"; then
+    echo "unexpected call: $1"
+    cat "$CALLS"
+    return 1
+  fi
+}
+
+assert_out() {
+  if [[ $output != *"$1"* ]]; then
+    echo "expected output to contain: $1"
+    echo "--- output ---"
+    echo "$output"
+    return 1
+  fi
+}
+
+# old_backup STAMP [CONTENT]: an earlier backup and its settings copy.
+old_backup() {
+  mkdir -p "$BK"
+  printf 'PGDMP %s\n' "${2:-old $1}" >"$BK/freeframe-$1.dump"
+  printf 'X=1\n' >"$BK/freeframe-$1.env.prod"
+}
+
+dumps() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null) || true; }
+
+# ---------------------------------------------------------------- backup
+
+@test "backup: writes to a .partial name and renames it only when the dump is complete" {
+  ff backup
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -qx 'dc exec -T postgres pg_dump -Fc -U ffuser ffdb' "$CALLS"
+  # While pg_dump ran, only the .partial name existed.
+  grep -q '^freeframe-[0-9]\{8\}-[0-9]\{6\}\.dump\.partial$' "$STUB_DIR/during-dump"
+  if grep -q '\.dump$' "$STUB_DIR/during-dump"; then false; fi
+  local d
+  d=$(dumps)
+  [[ $d =~ ^freeframe-[0-9]{8}-[0-9]{6}\.dump$ ]] || { echo "dumps: $d"; false; }
+  assert_eq "$(cat "$BK/$d")" "PGDMP current database v2"
+  cmp "$ENV" "$BK/${d%.dump}.env.prod"
+  [ -z "$(ls "$BK" | grep partial)" ]
+  assert_out "$BK/$d"
+}
+
+@test "backup: the dump and the settings copy are private (600, folder 700)" {
+  ff backup
+  [ "$status" -eq 0 ]
+  local d
+  d=$(dumps)
+  assert_eq "$(stat -c %a "$BK/$d")" 600
+  assert_eq "$(stat -c %a "$BK/${d%.dump}.env.prod")" 600
+  assert_eq "$(stat -c %a "$BK")" 700
+}
+
+@test "backup: a failed dump leaves no .dump and removes the .partial" {
+  old_backup 20261020-030000
+  export STUB_DUMP_FAIL=1
+  ff backup
+  [ "$status" -eq 1 ]
+  # The .partial existed while pg_dump ran, and is gone now.
+  grep -q '\.dump\.partial$' "$STUB_DIR/during-dump"
+  assert_eq "$(ls -A "$BK" | grep -v '^\.' | tr '\n' ' ')" \
+    "freeframe-20261020-030000.dump freeframe-20261020-030000.env.prod "
+  assert_out "could not be backed up"
+  assert_out "No new backup was made"
+  assert_out "install.log"
+}
+
+@test "backup: output that is not a database dump is not kept" {
+  export STUB_DUMP_GARBAGE=1
+  ff backup
+  [ "$status" -eq 1 ]
+  [ -z "$(dumps)" ]
+  [ -z "$(ls -A "$BK" | grep -v '^\.')" ]
+  assert_out "No new backup was made"
+}
+
+@test "backup: keeps the newest 7 with their settings copies" {
+  local s
+  for s in 01 02 03 04 05 06 07 08; do old_backup "202610$s-030000"; done
+  ff backup
+  [ "$status" -eq 0 ]
+  assert_eq "$(dumps | wc -l | tr -d ' ')" 7
+  [ ! -e "$BK/freeframe-20261001-030000.dump" ]
+  [ ! -e "$BK/freeframe-20261002-030000.env.prod" ]
+  [ -e "$BK/freeframe-20261003-030000.dump" ]
+}
+
+@test "backup: refuses when free space is below twice the last dump" {
+  old_backup 20261020-030000
+  export STUB_BIG_LAST=$((700 * 1048576)) STUB_BIG_LAST_FILE="$BK/freeframe-20261020-030000.dump"
+  export STUB_FREE_MB=1300
+  ff backup
+  [ "$status" -eq 1 ]
+  assert_out "1300 MB free"
+  assert_out "at least 1400 MB"
+  assert_not_called pg_dump
+  assert_eq "$(dumps)" "freeframe-20261020-030000.dump"
+  # With room for twice the last one, it goes ahead.
+  export STUB_FREE_MB=1500
+  ff backup
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+}
+
+@test "backup: refuses below 1 GB free even when the last dump was small" {
+  export STUB_FREE_MB=1000
+  ff backup
+  [ "$status" -eq 1 ]
+  assert_out "1000 MB free"
+  assert_out "at least 1024 MB"
+  assert_not_called pg_dump
+  [ -z "$(dumps)" ]
+}
+
+@test "backup --quiet prints nothing on success" {
+  ff backup --quiet
+  [ "$status" -eq 0 ]
+  assert_eq "$output" ""
+  [ -n "$(dumps)" ]
+}
+
+@test "backup --quiet prints a plain error on failure" {
+  export STUB_DUMP_FAIL=1
+  ff backup --quiet
+  [ "$status" -eq 1 ]
+  assert_out "could not be backed up"
+  export STUB_DUMP_FAIL="" STUB_FREE_MB=10
+  ff backup --quiet
+  [ "$status" -eq 1 ]
+  assert_out "not enough free disk space"
+}
+
+@test "backup: says plainly that the backups stay on this server" {
+  ff backup
+  [ "$status" -eq 0 ]
+  assert_out "on this server only"
+  assert_out "media"
+}
+
+@test "backup: without an installed FreeFrame it says so" {
+  rm -f "$ENV"
+  ff backup
+  [ "$status" -eq 1 ]
+  assert_out "not installed"
+  assert_not_called "dc "
+}
+
+@test "backup: not root exits 2 and names sudo" {
+  export STUB_NOT_ROOT=1
+  ff backup
+  [ "$status" -eq 2 ]
+  assert_out "sudo freeframe backup"
+  assert_not_called "dc "
+}
+
+@test "backup: a second backup or restore at the same time is refused" {
+  command -v flock >/dev/null || skip "no flock"
+  exec 8>>"$FF_ROOT/.freeframe.lock"
+  flock -n 8
+  ff backup
+  exec 8>&-
+  [ "$status" -eq 1 ]
+  assert_out "Another backup or restore is running"
+  assert_not_called pg_dump
+}
+
+@test "backup: with no log file possible, a failure does not point at one" {
+  mkdir "$FF_ROOT/install.log"
+  export STUB_DUMP_FAIL=1
+  ff backup --quiet
+  [ "$status" -eq 1 ]
+  assert_out "could not be backed up"
+  if [[ $output == *"/dev/null"* || $output == *"end of"* ]]; then echo "$output"; false; fi
+}
+
+@test "backup: the log records the run" {
+  ff backup
+  [ "$status" -eq 0 ]
+  grep -q 'freeframe backup' "$FF_ROOT/install.log"
+  assert_eq "$(stat -c %a "$FF_ROOT/install.log")" 600
+}
+
+@test "parse_args: --quiet and -q set FF_QUIET" {
+  parse_args backup --quiet
+  assert_eq "$FF_QUIET" 1
+  parse_args -q backup
+  assert_eq "$FF_QUIET" 1
+  parse_args backup
+  assert_eq "$FF_QUIET" ""
+}
+
+# ---------------------------------------------------------------- restore: list
+
+@test "restore without FILE lists backups newest first with sizes and dates" {
+  old_backup 20261024-030512
+  old_backup 20261026-030001 "$(head -c 3000 /dev/zero | tr '\0' x)"
+  old_backup 20261025-031500
+  ff restore
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  local a b c
+  a=$(grep -n 'freeframe-20261026-030001.dump' <<<"$output" | head -1 | cut -d: -f1)
+  b=$(grep -n 'freeframe-20261025-031500.dump' <<<"$output" | head -1 | cut -d: -f1)
+  c=$(grep -n 'freeframe-20261024-030512.dump' <<<"$output" | head -1 | cut -d: -f1)
+  [ -n "$a" ] && [ -n "$b" ] && [ -n "$c" ]
+  ((a < b && b < c)) || { echo "$output"; false; }
+  [[ $(sed -n "${a}p" <<<"$output") == *"2026-10-26 03:00:01"*"KB"* ]] || { echo "$output"; false; }
+  [[ $(sed -n "${c}p" <<<"$output") == *"2026-10-24 03:05:12"*"bytes"* ]] || { echo "$output"; false; }
+  assert_out "sudo freeframe restore $BK/freeframe-20261026-030001.dump"
+  assert_not_called "dc "
+}
+
+@test "restore without FILE and no backups says how to make one" {
+  ff restore
+  [ "$status" -eq 0 ]
+  assert_out "no backups"
+  assert_out "sudo freeframe backup"
+}
+
+# ---------------------------------------------------------------- restore: refusals
+
+@test "restore without --yes and no terminal refuses and changes nothing" {
+  old_backup 20261020-030000
+  ff restore "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 2 ]
+  assert_out "no terminal"
+  assert_out "--yes"
+  assert_not_called "dc "
+}
+
+@test "restore: answering no cancels and changes nothing" {
+  old_backup 20261020-030000
+  printf 'n\n' >"$BATS_TEST_TMPDIR/tty"
+  export FF_TTY="$BATS_TEST_TMPDIR/tty"
+  ff restore "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  assert_out "replaces"
+  assert_out "Restore cancelled. Nothing was changed."
+  assert_not_called "dc "
+}
+
+@test "restore: answering yes goes ahead" {
+  old_backup 20261020-030000
+  printf 'y\n' >"$BATS_TEST_TMPDIR/tty"
+  export FF_TTY="$BATS_TEST_TMPDIR/tty"
+  ff restore "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_order "dc exec -T postgres dropdb" "dc exec -T postgres pg_restore"
+}
+
+@test "restore: a file that is not a backup is refused before any change" {
+  printf 'CREATE TABLE x();\n' >"$BATS_TEST_TMPDIR/backup.sql"
+  ff restore --yes "$BATS_TEST_TMPDIR/backup.sql"
+  [ "$status" -eq 1 ]
+  assert_out "is not a FreeFrame database backup"
+  assert_not_called "dc "
+}
+
+@test "restore: a missing file is refused; a bare name is found in the backups folder" {
+  ff restore --yes nosuch.dump
+  [ "$status" -eq 1 ]
+  assert_out "There is no backup file"
+  assert_not_called "dc "
+  old_backup 20261020-030000
+  ff restore --yes freeframe-20261020-030000.dump
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(cat "$STUB_DIR/restored")" "PGDMP old 20261020-030000"
+}
+
+@test "restore: not root exits 2" {
+  export STUB_NOT_ROOT=1
+  ff restore
+  [ "$status" -eq 2 ]
+  assert_out "sudo freeframe restore"
+}
+
+@test "restore: two files is a usage error" {
+  ff restore a.dump b.dump
+  [ "$status" -eq 2 ]
+  assert_not_called "dc "
+}
+
+# ---------------------------------------------------------------- restore: the steps
+
+@test "restore calls stop, dropdb, createdb, pg_restore, up in that order" {
+  old_backup 20261020-030000
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_order "dc up -d --no-build postgres" "dc exec -T postgres pg_isready" \
+    "dc stop " \
+    "dc exec -T postgres dropdb -U ffuser --if-exists --force ffdb" \
+    "dc exec -T postgres createdb -U ffuser -O ffuser ffdb" \
+    "dc exec -T postgres pg_restore -U ffuser -d ffdb --no-owner --no-acl --single-transaction" \
+    "dc up -d --no-build" "localhost:8000/health"
+  # Every service except postgres and traefik is stopped.
+  local stop
+  stop=$(grep '^dc stop ' "$CALLS")
+  assert_eq "$stop" "dc stop redis api worker email_worker maintenance_worker beat web minio minio-init"
+  # The dump's bytes reached pg_restore.
+  assert_eq "$(cat "$STUB_DIR/restored")" "PGDMP old 20261020-030000"
+  assert_out "The database is back as it was"
+}
+
+@test "restore: a safety copy of the current database is saved first, as a normal backup" {
+  local s
+  for s in 14 15 16 17 18 19 20; do old_backup "202610$s-030000"; done
+  # Restore the oldest of 7: the safety copy must not prune it away.
+  ff restore --yes "$BK/freeframe-20261014-030000.dump"
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_order "dc stop " "dc exec -T postgres pg_dump -Fc -U ffuser ffdb" "dc exec -T postgres dropdb"
+  assert_eq "$(dumps | wc -l | tr -d ' ')" 8
+  [ -e "$BK/freeframe-20261014-030000.dump" ]
+  local safety
+  safety=$(dumps | tail -1)
+  [[ $safety != freeframe-20261020-030000.dump ]]
+  assert_eq "$(cat "$BK/$safety")" "PGDMP current database v2"
+  [ -e "$BK/${safety%.dump}.env.prod" ]
+  assert_out "sudo freeframe restore --yes $BK/$safety"
+  assert_eq "$(cat "$STUB_DIR/restored")" "PGDMP old 20261014-030000"
+}
+
+@test "restore: a database that cannot be opened skips the safety copy and says so" {
+  old_backup 20261020-030000
+  export STUB_DB_MISSING=1
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_not_called pg_dump
+  assert_out "no copy of it was saved"
+  assert_order "dc exec -T postgres dropdb" "dc exec -T postgres pg_restore"
+}
+
+@test "restore: a failed safety copy changes nothing and starts FreeFrame again" {
+  old_backup 20261020-030000
+  export STUB_DUMP_FAIL=1
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  assert_not_called dropdb
+  assert_not_called pg_restore
+  assert_order "dc stop " "pg_dump" "dc up -d --no-build"
+  assert_out "before changing anything"
+  [ -z "$(ls -A "$BK" | grep partial)" ]
+}
+
+@test "restore: too little disk for the safety copy changes nothing" {
+  old_backup 20261020-030000
+  export STUB_FREE_MB=10
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  assert_not_called dropdb
+  assert_out "not enough free disk space"
+  assert_out "before changing anything"
+}
+
+@test "restore: the database server not starting stops before any change" {
+  old_backup 20261020-030000
+  export STUB_PG_DOWN=1
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  assert_not_called "dc stop"
+  assert_not_called dropdb
+  assert_out "nothing was changed"
+}
+
+@test "restore: dropdb failing leaves the database as it was and starts FreeFrame again" {
+  old_backup 20261020-030000
+  export STUB_DROP_FAIL=1
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  assert_not_called createdb
+  assert_order "dropdb" "dc up -d --no-build"
+  assert_out "unchanged"
+  assert_out "install.log"
+}
+
+@test "restore: createdb failing after the drop says the database is gone and how to retry" {
+  old_backup 20261020-030000
+  export STUB_CREATE_FAIL=1
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  assert_not_called pg_restore
+  # FreeFrame stays stopped: an app on an empty database would offer its
+  # setup page to anyone.
+  [ "$(grep -c '^dc up -d' "$CALLS")" -eq 1 ]
+  assert_out "The database has been removed"
+  assert_out "sudo freeframe restore --yes $BK/freeframe-20261020-030000.dump"
+  assert_out "install.log"
+}
+
+@test "restore: pg_restore failing says the database is empty, FreeFrame stays stopped, and how to retry" {
+  old_backup 20261020-030000
+  export STUB_RESTORE_FAIL=1
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  [ "$(grep -c '^dc up -d' "$CALLS")" -eq 1 ]
+  assert_out "The database is empty now"
+  assert_out "FreeFrame is stopped"
+  assert_out "sudo freeframe restore --yes $BK/freeframe-20261020-030000.dump"
+  local safety
+  safety=$(dumps | tail -1)
+  assert_out "sudo freeframe restore --yes $BK/$safety"
+  assert_out "install.log"
+}
+
+@test "restore: FreeFrame not answering afterwards says the backup is back but the app is not" {
+  old_backup 20261020-030000
+  export STUB_API_DOWN=1 FF_API_WAIT=10
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  assert_out "The backup has been put back"
+  assert_out "sudo freeframe logs"
+}
+
+@test "restore: the log records what happened" {
+  old_backup 20261020-030000
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 0 ]
+  grep -q 'freeframe restore' "$FF_ROOT/install.log"
+  grep -q 'The database is back as it was' "$FF_ROOT/install.log"
+}
+
+# ---------------------------------------------------------------- the timer
+
+UNITS="${BATS_TEST_DIRNAME}/../systemd"
+
+@test "the timer runs every night at 03:00, catches up, with a random 15-minute delay" {
+  local t="$UNITS/freeframe-backup.timer"
+  assert_has "$t" "OnCalendar=*-*-* 03:00"
+  assert_has "$t" "Persistent=true"
+  assert_has "$t" "RandomizedDelaySec=15m"
+  assert_has "$t" "WantedBy=timers.target"
+}
+
+@test "the backup service runs freeframe backup --quiet once" {
+  local s="$UNITS/freeframe-backup.service"
+  assert_has "$s" "Type=oneshot"
+  assert_has "$s" "ExecStart=/usr/local/bin/freeframe backup --quiet"
+  assert_has "$s" "After=docker.service"
+}
+
+@test "the units pass systemd-analyze verify" {
+  command -v systemd-analyze >/dev/null || skip "no systemd-analyze"
+  local d="$BATS_TEST_TMPDIR/units"
+  mkdir -p "$d"
+  cp "$UNITS"/freeframe-backup.* "$d/"
+  # verify checks that ExecStart exists; point it at a stand-in.
+  printf '#!/bin/sh\n' >"$d/freeframe"
+  chmod 755 "$d/freeframe"
+  sed -i "s#/usr/local/bin/freeframe#$d/freeframe#" "$d/freeframe-backup.service"
+  run systemd-analyze verify "$d/freeframe-backup.service" "$d/freeframe-backup.timer"
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+}
+
+@test "install_backup_timer installs both units and starts the timer" {
+  mkdir -p "$FF_ROOT/systemd" "$BATS_TEST_TMPDIR/etc"
+  cp "$UNITS"/freeframe-backup.* "$FF_ROOT/systemd/"
+  export FF_SYSTEMD_DIR="$BATS_TEST_TMPDIR/etc"
+  systemctl() { printf 'systemctl %s\n' "$*" >>"$CALLS"; }
+  install_backup_timer
+  cmp "$UNITS/freeframe-backup.service" "$FF_SYSTEMD_DIR/freeframe-backup.service"
+  cmp "$UNITS/freeframe-backup.timer" "$FF_SYSTEMD_DIR/freeframe-backup.timer"
+  assert_eq "$(stat -c %a "$FF_SYSTEMD_DIR/freeframe-backup.timer")" 644
+  assert_order "systemctl daemon-reload" "systemctl enable --now freeframe-backup.timer"
+}
+
+@test "install_backup_timer fails when the units are missing or systemctl fails" {
+  mkdir -p "$BATS_TEST_TMPDIR/etc"
+  export FF_SYSTEMD_DIR="$BATS_TEST_TMPDIR/etc"
+  systemctl() { printf 'systemctl %s\n' "$*" >>"$CALLS"; }
+  run install_backup_timer
+  [ "$status" -ne 0 ]
+  mkdir -p "$FF_ROOT/systemd"
+  cp "$UNITS"/freeframe-backup.* "$FF_ROOT/systemd/"
+  systemctl() { return 1; }
+  run install_backup_timer
+  [ "$status" -ne 0 ]
+}
+
+# ---------------------------------------------------------------- helpers
+
+@test "_ff_human_size and _ff_stamp_date" {
+  assert_eq "$(_ff_human_size 512)" "512 bytes"
+  assert_eq "$(_ff_human_size 3000)" "2 KB"
+  assert_eq "$(_ff_human_size $((12 * 1048576 + 400000)))" "12.4 MB"
+  assert_eq "$(_ff_human_size $((3 * 1073741824)))" "3.0 GB"
+  assert_eq "$(_ff_stamp_date freeframe-20261026-030412.dump)" "2026-10-26 03:04:12"
+  assert_eq "$(_ff_stamp_date something.dump)" ""
+}

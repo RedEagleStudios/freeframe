@@ -76,6 +76,11 @@ fetch() {
 
 ff_sleep() { _stub_log "sleep $1"; }
 
+install_backup_timer() {
+  _stub_log install_backup_timer
+  [[ -z ${STUB_TIMER_FAIL:-} ]]
+}
+
 probe_health() {
   _stub_log "probe_health $*"
   [[ -z ${STUB_HEALTH_FAIL:-} ]]

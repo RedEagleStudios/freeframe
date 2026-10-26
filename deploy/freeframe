@@ -363,7 +363,8 @@ _ff_bad_usage() {
 # FF_YES and the other answers are read by the subcommands, not here.
 # shellcheck disable=SC2034
 # parse_args "$@": sets FF_CMD (help when none), FF_ARGS (words after the
-# command) and the FF_* answers. Flags win over FREEFRAME_* variables.
+# command), FF_YES, FF_QUIET (-q/--quiet, for the nightly backup) and the
+# FF_* answers. Flags win over FREEFRAME_* variables.
 # Accepts --flag value and --flag=value. Unknown flags exit 2.
 parse_args() {
   local name env arg flag val have_val
@@ -379,6 +380,7 @@ parse_args() {
   esac
   FF_CMD=""
   FF_ARGS=()
+  FF_QUIET=""
   while (($#)); do
     arg=$1
     shift
@@ -390,6 +392,7 @@ parse_args() {
         break
         ;;
       -y | --yes) FF_YES=1 ;;
+      -q | --quiet) FF_QUIET=1 ;;
       -h | --help) FF_CMD=help ;;
       --*)
         have_val=0
@@ -832,9 +835,12 @@ backup_prune() {
 #   FF_OS_RELEASE=FILE     read FILE instead of /etc/os-release
 #   FF_BIN_DIR=DIR         install the freeframe command into DIR instead
 #                          of /usr/local/bin
+#   FF_SYSTEMD_DIR=DIR     install the nightly backup units into DIR
+#                          instead of /etc/systemd/system
 # Waits, in seconds (also for unusually slow servers): FF_API_WAIT (600),
 # FF_HEALTH_WAIT (300), FF_CERT_WAIT (300 per name), FF_DNS_WAIT (1800,
-# unattended runs only; with a terminal the installer waits until told).
+# unattended runs only; with a terminal the installer waits until told),
+# FF_DB_WAIT (120, restore: for the database server to answer).
 # ------------------------------------------------------------
 
 FF_RAW_BASE=https://raw.githubusercontent.com/Techiebutler/freeframe
@@ -990,6 +996,24 @@ EOF
   systemctl enable --now docker
 }
 
+# install_backup_timer: put the nightly backup units (fetched into
+# $FF_ROOT/systemd with the compose files) into systemd and start the timer.
+# Safe to run again: it replaces the units with the fetched ones.
+install_backup_timer() {
+  local root dir u
+  root=$(ff_root)
+  dir=${FF_SYSTEMD_DIR:-/etc/systemd/system}
+  for u in freeframe-backup.service freeframe-backup.timer; do
+    if [[ ! -f $root/systemd/$u ]]; then
+      warn "The nightly backup unit $root/systemd/$u is missing."
+      return 1
+    fi
+    install -m 644 "$root/systemd/$u" "$dir/$u" || return 1
+  done
+  systemctl daemon-reload || return 1
+  systemctl enable --now freeframe-backup.timer
+}
+
 # fetch REF PATH DEST: download PATH from the repository at REF (a branch or
 # tag) to DEST. The old DEST stays in place unless the download completes.
 # With FF_FETCH_FROM_DIR (test-only) PATH is copied from that folder instead.
@@ -1048,7 +1072,7 @@ _ff_stop() {
   warn "$2"
   if [[ -n ${3:-} ]]; then warn "What to try: $3"; fi
   _ff_already_done
-  if [[ -n ${FF_LOG:-} ]]; then warn "Everything the installer did is written to $FF_LOG."; fi
+  if [[ -n ${FF_LOG:-} ]]; then warn "Everything ${FF_ACTOR:-the installer} did is written to $FF_LOG."; fi
   exit "$1"
 }
 
@@ -1086,7 +1110,7 @@ install_fail() {
   if [[ -n ${2:-} ]]; then warn "What to try: $2"; fi
   if [[ -n ${FF_STATE:-} ]]; then warn "$FF_STATE"; fi
   _ff_already_done
-  if [[ -n ${FF_LOG:-} ]]; then warn "Everything the installer did is written to $FF_LOG."; fi
+  if [[ -n ${FF_LOG:-} ]]; then warn "Everything ${FF_ACTOR:-the installer} did is written to $FF_LOG."; fi
   if [[ -n ${FF_ADMIN_CREATED:-} && -n ${FF_PW_GENERATED:-} ]]; then
     _ff_term_say "" "The admin account for $FF_ADMIN_EMAIL was created, with the password made for you:" \
       "  $FF_ADMIN_PASSWORD" "Write it down now: it is shown on the screen only and saved nowhere."
@@ -1284,8 +1308,10 @@ _install_check_foreign() {
   esac
 }
 
+# _install_log_start [COMMAND]: from here on, everything printed also goes
+# to install.log (mode 600), under a header naming COMMAND (install).
 _install_log_start() {
-  local root
+  local root what=${1:-install}
   root=$(ff_root)
   # Created as 755; an existing folder keeps its own (possibly stricter) mode.
   if ! { { [[ -d $root ]] || { mkdir -p "$(dirname "$root")" && mkdir -m 755 "$root"; }; } &&
@@ -1294,7 +1320,7 @@ _install_log_start() {
     _ff_stop 1 "Cannot create $root for FreeFrame's files." "check that the disk is not full or read-only, then run the installer again."
   fi
   FF_LOG="$root/install.log"
-  printf '\n===== freeframe install, %s =====\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" >>"$FF_LOG"
+  printf '\n===== freeframe %s, %s =====\n' "$what" "$(date '+%Y-%m-%d %H:%M:%S %z')" >>"$FF_LOG"
   # Everything printed from here on goes to the terminal and to install.log.
   # The terminal's own fds are kept, for the one line the log must not hold.
   exec {FF_TERM_OUT}>&1 {FF_TERM_ERR}>&2
@@ -1940,12 +1966,18 @@ _install_dns_step() {
 }
 
 _install_fetch_step() {
-  local root f
+  local root f dest
   root=$(ff_root)
   FF_STEP="downloading the setup files"
   say "Downloading the setup files for the $FF_CHANNEL channel..."
-  for f in docker-compose.prod.yml docker-compose.images.yml docker-compose.https.yml docker-compose.storage.yml; do
-    if ! _ff_logged fetch "$FF_CHANNEL" "$f" "$root/$f"; then
+  # The nightly backup units go to $root/systemd; install_backup_timer
+  # puts them into systemd once FreeFrame is running.
+  mkdir -p "$root/systemd"
+  for f in docker-compose.prod.yml docker-compose.images.yml docker-compose.https.yml docker-compose.storage.yml \
+    deploy/systemd/freeframe-backup.service deploy/systemd/freeframe-backup.timer; do
+    dest="$root/$f"
+    [[ $f != deploy/systemd/* ]] || dest="$root/systemd/${f##*/}"
+    if ! _ff_logged fetch "$FF_CHANNEL" "$f" "$dest"; then
       install_fail "Could not download $f for the $FF_CHANNEL channel." \
         "check that this server can reach raw.githubusercontent.com, then run sudo freeframe install again. If it can, the $FF_CHANNEL channel may not have this file yet (the installer needs a release after v1.21.0): try --channel latest."
     fi
@@ -2136,6 +2168,18 @@ _install_verify_step() {
   fi
 }
 
+# Nightly backups (spec goal 11), set up once FreeFrame runs and the admin
+# exists. A failure stops before the install is marked complete, so a re-run
+# finishes it.
+_install_backup_timer_step() {
+  FF_STEP="setting up the nightly backups"
+  say "Setting up the nightly database backups..."
+  if ! _ff_logged install_backup_timer; then
+    install_fail "The nightly database backups could not be set up." \
+      "run sudo freeframe install again; the reason is at the end of the log."
+  fi
+}
+
 # _install_summary_lines WITH_PASSWORD: the closing message (spec goal 8).
 # The generated password is only printed with WITH_PASSWORD=1 (the terminal),
 # never into install.log.
@@ -2201,8 +2245,12 @@ _install_summary_lines() {
   fi
   say ""
   say "Settings:     $file (private: it holds the passwords; keep a copy somewhere safe)"
-  say "Backups:      $root/backups"
+  say "Backups:      $root/backups (the database, every night at 3:00; the newest $FF_BACKUP_KEEP are kept)"
   say "Install log:  $root/install.log"
+  say ""
+  say "The backups are on this server only, so they do not survive losing it. Copy them somewhere"
+  say "else now and then; the guide explains how: $FF_GUIDE_URL"
+  say "Uploaded media is not in these backups."
   say ""
   say "Commands you will need:"
   say "  sudo freeframe status    see whether everything is running"
@@ -2260,10 +2308,450 @@ cmd_install() {
   _install_settings_step "$file"
   _install_start_step
   _install_verify_step "$file"
+  _install_backup_timer_step
 
   printf 'FreeFrame installed %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" >"$root/.installed"
   trap - ERR
   _install_final_summary "$file"
+}
+
+# ------------------------------------------------------------
+# Backups and restore (spec goals 11 and 13)
+#
+# A backup is two files in $FF_ROOT/backups: freeframe-<YYYYmmdd-HHMMSS>.dump
+# (pg_dump -Fc of the database, written under a .partial name and renamed
+# only when complete) and freeframe-<same stamp>.env.prod (a copy of the
+# settings). Both are mode 600 in a 700 folder: they hold the passwords.
+# backup_prune keeps the newest FF_BACKUP_KEEP by name. Media in the bucket
+# is not part of a backup.
+#
+# backup and restore take a lock ($FF_ROOT/.freeframe.lock), so the nightly
+# backup never runs in the middle of a restore.
+# ------------------------------------------------------------
+
+FF_BACKUP_KEEP=7
+
+# _ff_size_bytes FILE: the size of FILE in bytes.
+_ff_size_bytes() { wc -c <"$1" | tr -d '[:space:]'; }
+
+# _ff_human_size BYTES: 512 bytes, 2 KB, 12.4 MB, 3.0 GB.
+_ff_human_size() {
+  awk -v b="${1:-0}" 'BEGIN {
+    if (b >= 1073741824) printf "%.1f GB", b / 1073741824
+    else if (b >= 1048576) printf "%.1f MB", b / 1048576
+    else if (b >= 1024) printf "%d KB", b / 1024
+    else printf "%d bytes", b
+  }'
+}
+
+# _ff_stamp: the time stamp in a backup's name.
+_ff_stamp() { date +%Y%m%d-%H%M%S; }
+
+# _ff_stamp_date NAME: "2026-10-26 03:04:12" for freeframe-20261026-030412.dump,
+# nothing for a name without a stamp. The name, not the file's time, says
+# when a backup was made: copying a file between servers changes its time.
+_ff_stamp_date() {
+  local re='freeframe-([0-9]{4})([0-9]{2})([0-9]{2})-([0-9]{2})([0-9]{2})([0-9]{2})\.dump$'
+  [[ ${1:-} =~ $re ]] || return 0
+  printf '%s-%s-%s %s:%s:%s' "${BASH_REMATCH[@]:1:6}"
+}
+
+# _ff_backup_dumps DIR: the backups in DIR, oldest first (name order), one
+# path per line.
+_ff_backup_dumps() {
+  local f
+  local LC_ALL=C
+  for f in "$1"/freeframe-*.dump; do
+    if [[ -f $f ]]; then printf '%s\n' "$f"; fi
+  done
+}
+
+# _ff_is_pg_dump FILE: 0 when FILE is a pg_dump custom-format archive (it
+# starts with PGDMP), which is what freeframe backup writes.
+_ff_is_pg_dump() { [[ -r $1 && $(head -c 5 "$1" 2>/dev/null) == PGDMP ]]; }
+
+# _ff_pg_names: FF_PG_USER and FF_PG_DB from .env.prod, with the defaults
+# docker-compose.prod.yml and derive_env use.
+_ff_pg_names() {
+  local file
+  file="$(ff_root)/.env.prod"
+  FF_PG_USER=$(env_get "$file" POSTGRES_USER)
+  FF_PG_DB=$(env_get "$file" POSTGRES_DB)
+  FF_PG_USER=${FF_PG_USER:-freeframe}
+  FF_PG_DB=${FF_PG_DB:-freeframe}
+}
+
+# _ff_need_root COMMAND / _ff_need_install: the refusals every command
+# other than install shares.
+_ff_need_root() {
+  if ! ff_is_root; then
+    _ff_stop 2 "Please run this as root." "put sudo in front of the command: sudo freeframe $1"
+  fi
+}
+
+_ff_need_install() {
+  local root
+  root=$(ff_root)
+  if [[ ! -f $root/.env.prod ]]; then
+    _ff_stop 1 "FreeFrame is not installed on this server (there is no $root/.env.prod), so there is nothing to do." \
+      "install it first: see $FF_GUIDE_URL"
+  fi
+}
+
+# _ff_lock: take the backup/restore lock, without waiting. 1 when another
+# backup or restore holds it. Without flock (not on a supported server) there
+# is no lock.
+_ff_lock() {
+  local root
+  root=$(ff_root)
+  command -v flock >/dev/null 2>&1 || return 0
+  [[ -z ${FF_LOCK_FD:-} ]] || return 0
+  (umask 077 && : >>"$root/.freeframe.lock") || return 0
+  exec {FF_LOCK_FD}>>"$root/.freeframe.lock"
+  flock -n "$FF_LOCK_FD"
+}
+
+# _ff_log_open COMMAND: write to install.log (mode 600) without copying the
+# screen into it; for the nightly backup, whose own messages go to the
+# journal.
+_ff_log_open() {
+  local root
+  root=$(ff_root)
+  FF_LOG="$root/install.log"
+  if ! { (umask 077 && : >>"$FF_LOG") && chmod 600 "$FF_LOG"; }; then
+    # No log (a full disk, say): the messages then do not mention one.
+    FF_LOG=""
+    return 0
+  fi
+  printf '\n===== freeframe %s, %s =====\n' "$1" "$(date '+%Y-%m-%d %H:%M:%S %z')" >>"$FF_LOG"
+}
+
+# _ff_backup_cleanup: remove what a backup that did not finish left behind.
+_ff_backup_cleanup() {
+  [[ -n ${FF_PARTIAL:-} ]] || return 0
+  rm -f "$FF_PARTIAL.dump.partial" "$FF_PARTIAL.env.prod.partial"
+  FF_PARTIAL=""
+}
+
+# _ff_backup_refused LINE...: a backup that did not happen. Says so, and
+# that the earlier backups are untouched.
+_ff_backup_refused() {
+  local line
+  _ff_backup_cleanup
+  for line in "$@"; do warn "$line"; done
+  warn "No new backup was made; the earlier ones are untouched."
+}
+
+# backup_create prune|keep: save a backup of the database now (see the top of
+# this section). Sets FF_BACKUP_MADE to the new .dump. With prune, only the
+# newest FF_BACKUP_KEEP are kept afterwards; restore's safety copy uses keep,
+# so it can never delete the backup being restored. Refuses when the disk has
+# less free space than twice the last backup, or 1 GB. Prints its own
+# message and returns 1 when no backup was made.
+backup_create() {
+  local mode=${1:-prune} root dir file base stamp last_bytes=0 need free retry
+  local -a dumps=()
+  root=$(ff_root)
+  dir="$root/backups"
+  file="$root/.env.prod"
+  retry=${FF_RERUN:-sudo freeframe backup}
+  FF_BACKUP_MADE="" FF_PARTIAL=""
+  if ! { (umask 077 && mkdir -p "$dir") && chmod 700 "$dir"; }; then
+    _ff_backup_refused "Cannot create the backups folder $dir." \
+      "What to try: check that the disk is not full or read-only, then run: $retry"
+    return 1
+  fi
+
+  mapfile -t dumps < <(_ff_backup_dumps "$dir")
+  if ((${#dumps[@]})); then
+    last_bytes=$(_ff_size_bytes "${dumps[-1]}") || last_bytes=0
+    [[ $last_bytes =~ ^[0-9]+$ ]] || last_bytes=0
+  fi
+  need=$(((2 * last_bytes + 1048575) / 1048576))
+  ((need >= 1024)) || need=1024
+  free=$(_ff_free_mb "$root") || free=""
+  if [[ ! $free =~ ^[0-9]+$ ]]; then
+    _ff_backup_refused "Could not check the free disk space under $root, so no backup was made." \
+      "What to try: check the disk (df -h $root), then run: $retry"
+    return 1
+  fi
+  if ((free < need)); then
+    _ff_backup_refused "There is not enough free disk space for a backup: $free MB free under $root, and a backup needs at least $need MB there (twice the size of the last backup, and never less than 1 GB)." \
+      "What to try: make room on the disk, for example by copying older backups from $dir to another computer and deleting them here, then run: $retry"
+    return 1
+  fi
+
+  _ff_pg_names
+  stamp=$(_ff_stamp)
+  while [[ -e $dir/freeframe-$stamp.dump || -e $dir/freeframe-$stamp.env.prod ]]; do
+    sleep 1
+    stamp=$(_ff_stamp)
+  done
+  base="$dir/freeframe-$stamp"
+  FF_PARTIAL=$base
+  printf 'backup: writing %s.dump\n' "$base" >>"${FF_LOG:-/dev/null}"
+  if ! (umask 077 && dc exec -T postgres pg_dump -Fc -U "$FF_PG_USER" "$FF_PG_DB" \
+    >"$base.dump.partial" 2>>"${FF_LOG:-/dev/null}"); then
+    _ff_backup_refused "The database could not be backed up: FreeFrame's database did not answer, or the copy stopped part-way." \
+      "What to try: check that FreeFrame's database is running (sudo freeframe status), then run: $retry.${FF_LOG:+ The reason is at the end of $FF_LOG.}"
+    return 1
+  fi
+  if ! _ff_is_pg_dump "$base.dump.partial"; then
+    _ff_backup_refused "The database could not be backed up: what came back is not a database copy." \
+      "What to try: run: $retry.${FF_LOG:+ The reason is at the end of $FF_LOG.}"
+    return 1
+  fi
+  if ! { (umask 077 && cp "$file" "$base.env.prod.partial") && chmod 600 "$base.env.prod.partial"; }; then
+    _ff_backup_refused "The settings could not be copied next to the backup." \
+      "What to try: check that the disk is not full, then run: $retry"
+    return 1
+  fi
+  # The settings copy first: a .dump that exists always has its settings.
+  if ! { mv -f "$base.env.prod.partial" "$base.env.prod" && mv -f "$base.dump.partial" "$base.dump"; }; then
+    rm -f "$base.env.prod"
+    _ff_backup_refused "The backup could not be saved under its final name in $dir." \
+      "What to try: check that the disk is not full, then run: $retry"
+    return 1
+  fi
+  FF_PARTIAL=""
+  FF_BACKUP_MADE="$base.dump"
+  printf 'backup: saved %s.dump (%s)\n' "$base" "$(_ff_human_size "$(_ff_size_bytes "$base.dump")")" >>"${FF_LOG:-/dev/null}"
+  if [[ $mode == prune ]] && ! backup_prune "$dir" "$FF_BACKUP_KEEP"; then
+    warn "The backup was saved, but older backups could not be cleared away."
+  fi
+  return 0
+}
+
+# _backup_on_error: the ERR trap of freeframe backup.
+_backup_on_error() {
+  local code=$?
+  if ((BASH_SUBSHELL > 0)); then exit "$code"; fi
+  trap - ERR
+  _ff_backup_refused "The backup stopped unexpectedly (error $code)." \
+    "What to try: run sudo freeframe backup again.${FF_LOG:+ The reason is at the end of $FF_LOG.}"
+  exit 1
+}
+
+# cmd_backup: `freeframe backup [--quiet]`. --quiet (the nightly timer)
+# prints nothing when the backup is saved, and a plain error when not.
+cmd_backup() {
+  local root base size
+  root=$(ff_root)
+  if ((${#FF_ARGS[@]})); then
+    _ff_bad_usage "freeframe backup takes no file name: backups always go to $root/backups."
+  fi
+  _ff_need_root backup
+  _ff_need_install
+  FF_ACTOR="the backup"
+  _ff_log_open backup
+  if ! _ff_lock; then
+    _ff_stop 1 "Another backup or restore is running right now, so this backup did not start." \
+      "wait a few minutes for it to finish, then run sudo freeframe backup again."
+  fi
+  trap _backup_on_error ERR
+  if ! backup_create prune; then exit 1; fi
+  trap - ERR
+  [[ -z ${FF_QUIET:-} ]] || return 0
+  base=${FF_BACKUP_MADE%.dump}
+  size=$(_ff_human_size "$(_ff_size_bytes "$FF_BACKUP_MADE")")
+  say "Saved a backup of the database: $FF_BACKUP_MADE ($size),"
+  say "with a copy of the settings next to it: ${base##*/}.env.prod"
+  say "The newest $FF_BACKUP_KEEP backups are kept, and one is made every night at 3:00."
+  say "They are on this server only, so they do not survive losing it: copy them somewhere else"
+  say "now and then (the guide explains how: $FF_GUIDE_URL). Uploaded media is not in them."
+}
+
+# restore_list: the backups on this server, newest first, with dates and sizes.
+restore_list() {
+  local dir f name when i
+  local -a dumps=()
+  dir="$(ff_root)/backups"
+  mapfile -t dumps < <(_ff_backup_dumps "$dir")
+  if ((${#dumps[@]} == 0)); then
+    say "There are no backups in $dir yet."
+    say "To make one now, run: sudo freeframe backup"
+    return 0
+  fi
+  say "Backups on this server, newest first:"
+  for ((i = ${#dumps[@]} - 1; i >= 0; i--)); do
+    f=${dumps[i]}
+    name=${f##*/}
+    when=$(_ff_stamp_date "$name")
+    printf '  %-34s  %-19s  %s\n' "$name" "${when:-(no date)}" "$(_ff_human_size "$(_ff_size_bytes "$f")")"
+  done
+  say ""
+  say "To put one back, run for example (this replaces the current database, after saving a copy of it):"
+  say "  sudo freeframe restore ${dumps[-1]}"
+  say "A backup copied from another server can be given by its path."
+}
+
+# _restore_resolve ARG: the full path of the backup ARG names: a path, or a
+# name in the backups folder. Stops when there is no such backup.
+_restore_resolve() {
+  local arg=$1 root path=""
+  root=$(ff_root)
+  if [[ -f $arg ]]; then
+    path=$arg
+  elif [[ $arg != */* && -f $root/backups/$arg ]]; then
+    path="$root/backups/$arg"
+  else
+    _ff_stop 1 "There is no backup file '$arg', so nothing was changed." \
+      "run sudo freeframe restore with no file name to see the backups on this server."
+  fi
+  if [[ $path != /* ]]; then path="$(cd "$(dirname "$path")" && pwd)/${path##*/}"; fi
+  if ! _ff_is_pg_dump "$path"; then
+    _ff_stop 1 "'$path' is not a FreeFrame database backup (one made by freeframe backup), so nothing was changed." \
+      "pick one of the backups listed by: sudo freeframe restore. A .sql.gz backup from a manual setup is restored by hand, as the guide explains: $FF_GUIDE_URL"
+  fi
+  FF_RESTORE_FILE=$path
+}
+
+# _restore_fail STATE MESSAGE WHAT_TO_TRY: a step failed; STATE says where
+# that leaves the database and FreeFrame.
+_restore_fail() {
+  FF_STATE=$1
+  install_fail "$2" "$3"
+}
+
+_restore_on_error() {
+  local code=$?
+  if ((BASH_SUBSHELL > 0)); then exit "$code"; fi
+  trap - ERR
+  _ff_backup_cleanup
+  install_fail "The restore stopped unexpectedly while ${FF_STEP:-restoring} (error $code)." \
+    "look at the end of ${FF_LOG:-the output above} for the reason."
+}
+
+# cmd_restore: `freeframe restore [FILE]` (spec goal 13). With no FILE it
+# lists the backups. With FILE it asks first (unless --yes), stops every
+# service except postgres and traefik, saves a safety copy of the current
+# database as a normal backup, recreates the database, restores FILE into it
+# with pg_restore --no-owner --no-acl in one transaction (so a backup from a
+# server with another database user restores too), and starts FreeFrame
+# again.
+# If a step after the drop fails, FreeFrame stays stopped (on an empty
+# database its setup page would be open to anyone) and the message says what
+# state the database is in and the command that tries again.
+cmd_restore() {
+  local root dump when out s safety="" undo=""
+  local -a all=() svcs=()
+  root=$(ff_root)
+  if ((${#FF_ARGS[@]} > 1)); then
+    _ff_bad_usage "freeframe restore takes one backup file, for example: sudo freeframe restore $root/backups/freeframe-20261026-030000.dump"
+  fi
+  _ff_need_root restore
+  _ff_need_install
+  if ((${#FF_ARGS[@]} == 0)); then
+    restore_list
+    return 0
+  fi
+  _restore_resolve "${FF_ARGS[0]}"
+  dump=$FF_RESTORE_FILE
+  when=$(_ff_stamp_date "${dump##*/}")
+
+  if [[ -z ${FF_YES:-} ]]; then
+    if ! _ff_has_tty; then
+      _ff_stop 2 "Restoring replaces everything in FreeFrame's database, so it needs a yes, and there is no terminal here to ask." \
+        "run it in a terminal, or add --yes: sudo freeframe restore --yes $dump"
+    fi
+    say "This replaces everything in FreeFrame's database with the backup${when:+ made $when}:"
+    say "  $dump"
+    say "Projects, comments, people and share links added or changed since then will be gone."
+    say "A copy of the current database is saved first, so this can be undone. Uploaded media"
+    say "files are not in the backup and stay as they are. FreeFrame is stopped while this runs."
+    if ! confirm "Restore this backup now?" N; then
+      say "Restore cancelled. Nothing was changed."
+      exit 1
+    fi
+  fi
+
+  if ! _ff_lock; then
+    _ff_stop 1 "Another backup or restore is running right now, so this restore did not start. Nothing was changed." \
+      "wait a few minutes for it to finish, then run the command again."
+  fi
+  FF_ACTOR="the restore"
+  FF_STOPPED=()
+  FF_ADMIN_CREATED="" FF_PW_GENERATED=""
+  FF_RERUN="sudo freeframe restore --yes $dump"
+  FF_STATE="Nothing has been changed."
+  _install_log_start restore
+  trap _restore_on_error ERR
+  _ff_pg_names
+
+  FF_STEP="starting the database"
+  say "Restoring the database from $dump"
+  if ! _ff_logged dc up -d --no-build postgres ||
+    ! _ff_wait_for "${FF_DB_WAIT:-120}" 2 _ff_logged dc exec -T postgres pg_isready -U "$FF_PG_USER"; then
+    _restore_fail "" "FreeFrame's database did not start, so nothing was changed." \
+      "see why with: sudo freeframe logs postgres, then run: $FF_RERUN"
+  fi
+
+  FF_STEP="stopping FreeFrame"
+  out=$(dc config --services 2>>"$FF_LOG") ||
+    _restore_fail "" "The setup files in $root could not be read, so nothing was changed." \
+      "run: $FF_RERUN. The reason is at the end of the log."
+  mapfile -t all <<<"$out"
+  for s in "${all[@]}"; do
+    if [[ -n $s && $s != postgres && $s != traefik ]]; then svcs+=("$s"); fi
+  done
+  say "Stopping FreeFrame (its web address shows an error until the restore is done)..."
+  if ((${#svcs[@]})) && ! _ff_logged dc stop "${svcs[@]}"; then
+    _ff_logged dc up -d --no-build || true
+    _restore_fail "" "FreeFrame could not be stopped, so nothing was changed." \
+      "run: $FF_RERUN. The reason is at the end of the log."
+  fi
+  FF_STATE="FreeFrame is stopped and the database has not been changed. To start FreeFrame again as it was, run: sudo freeframe restart"
+
+  FF_STEP="saving a copy of the current database"
+  if _ff_logged dc exec -T postgres psql -U "$FF_PG_USER" -d "$FF_PG_DB" -Atqc 'SELECT 1'; then
+    say "Saving a copy of the current database first..."
+    if ! backup_create keep; then
+      _ff_logged dc up -d --no-build || true
+      _restore_fail "" "No copy of the current database could be saved, so the restore stopped before changing anything. FreeFrame has been started again." \
+        "fix what the message above says, then run: $FF_RERUN"
+    fi
+    safety=$FF_BACKUP_MADE
+    undo="sudo freeframe restore --yes $safety"
+    say "Saved the current database as $safety"
+  else
+    say "The current database could not be opened, so no copy of it was saved before the restore."
+  fi
+
+  FF_STEP="removing the current database"
+  say "Replacing the database with the backup..."
+  if ! _ff_logged dc exec -T postgres dropdb -U "$FF_PG_USER" --if-exists --force "$FF_PG_DB"; then
+    _ff_logged dc up -d --no-build || true
+    _restore_fail "" "The current database could not be removed, so it is unchanged, and FreeFrame has been started again." \
+      "the reason is at the end of $FF_LOG. Then run: $FF_RERUN"
+  fi
+  FF_STATE="The database has been removed and is not back yet. FreeFrame is stopped, so nothing can write to it. To try again, run: $FF_RERUN${undo:+. To go back to the data as it was just before this restore instead, run: $undo}"
+  FF_STEP="creating the database again"
+  if ! _ff_logged dc exec -T postgres createdb -U "$FF_PG_USER" -O "$FF_PG_USER" "$FF_PG_DB"; then
+    install_fail "The database could not be created again." "the reason is at the end of $FF_LOG."
+  fi
+  FF_STATE="The database is empty now and FreeFrame is stopped, so nothing can write to it. To try again, run: $FF_RERUN${undo:+. To go back to the data as it was just before this restore instead, run: $undo}"
+  FF_STEP="putting the backup back"
+  if ! _ff_logged dc exec -T postgres pg_restore -U "$FF_PG_USER" -d "$FF_PG_DB" --no-owner --no-acl --single-transaction <"$dump"; then
+    _restore_fail "The database is empty now: the backup goes back in one piece or not at all, so nothing from it was half applied. FreeFrame is stopped, so nothing can write to it. To try again, run: $FF_RERUN${undo:+. To go back to the data as it was just before this restore instead, run: $undo}" \
+      "The backup could not be put back into the database." "the reason is at the end of $FF_LOG."
+  fi
+
+  FF_STATE="The backup has been put back${undo:+ (the database as it was before is saved; to go back to it, run: $undo)}."
+  FF_STEP="starting FreeFrame again"
+  say "Starting FreeFrame again..."
+  if ! _ff_logged dc up -d --no-build; then
+    install_fail "The backup has been put back, but FreeFrame could not be started again." \
+      "see why with: sudo freeframe logs, then run: sudo freeframe restart"
+  fi
+  if ! _ff_wait_for "${FF_API_WAIT:-600}" 5 _ff_logged dc exec -T api curl -fsS http://localhost:8000/health; then
+    install_fail "The backup has been put back, but FreeFrame did not finish starting within $(((${FF_API_WAIT:-600} + 59) / 60)) minutes." \
+      "see why with: sudo freeframe logs, then run: sudo freeframe restart"
+  fi
+  trap - ERR
+  say ""
+  say "The database is back as it was in $dump${when:+ (made $when)}."
+  if [[ -n $undo ]]; then say "The database as it was before is saved; to go back to it, run: $undo"; fi
+  _install_log_stop
 }
 
 # ------------------------------------------------------------
@@ -2280,8 +2768,10 @@ Commands:
   install     Set up FreeFrame on this server (asks a few questions)
   update      Back up, then move to the newest release on your channel
   configure   Change the answers you gave (web address, email, storage)
-  backup      Save a copy of the database to /opt/freeframe/backups
-  restore     Put a saved copy of the database back (replaces current data)
+  backup      Save a copy of the database to /opt/freeframe/backups now
+              (this also runs every night at 3:00; the newest 7 are kept)
+  restore     List the backups; restore FILE puts one back (replaces the
+              current database, after saving a copy of it)
   status      Show whether everything is running, disk space and backups
   logs        Show recent messages from FreeFrame
   restart     Restart FreeFrame
@@ -2293,6 +2783,7 @@ Options: --domain --https --acme-email --storage --s3-endpoint --s3-bucket
   --s3-access-key --s3-secret-key --s3-region --smtp-host --smtp-port
   --smtp-user --smtp-password --smtp-from --admin-name --admin-email
   --admin-password --channel --yes
+  --quiet     (backup) print nothing unless something goes wrong
 
 Passwords and keys (--admin-password, --smtp-password, --s3-secret-key) are
 better given as FREEFRAME_ADMIN_PASSWORD, FREEFRAME_SMTP_PASSWORD and
@@ -2307,7 +2798,9 @@ main() {
   case $FF_CMD in
     help) usage ;;
     install) cmd_install ;;
-    update | configure | backup | restore | status | logs | restart)
+    backup) cmd_backup ;;
+    restore) cmd_restore ;;
+    update | configure | status | logs | restart)
       warn "freeframe $FF_CMD is not implemented yet."
       return 1
       ;;
