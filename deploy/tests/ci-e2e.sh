@@ -37,6 +37,7 @@ ROOT=/opt/freeframe
 ENV_FILE=$ROOT/.env.prod
 BIN=/usr/local/bin/freeframe
 API=http://localhost/api
+WEB=http://localhost
 API_IMAGE=ghcr.io/techiebutler/freeframe-api:ci
 WEB_IMAGE=ghcr.io/techiebutler/freeframe-web:ci
 # The secrets install generates (derive_env). Every one must be there.
@@ -177,6 +178,23 @@ wait_health() {
   done
   curl -sS -i --max-time 5 "$API/health" || true
   fail "$API/health did not answer within 3 minutes"
+}
+
+# wait_web: the web UI answers /login with 200 through Traefik. /login, not
+# /, because / redirects (to /login or /projects), and a redirect would pass
+# curl -f without proving the page renders.
+wait_web() {
+  local i code=""
+  for ((i = 0; i < 90; i++)); do
+    code=$(curl -fsS --max-time 10 -o /dev/null -w '%{http_code}' "$WEB/login" 2>/dev/null) || code=""
+    if [[ $code == 200 ]]; then
+      pass "$WEB/login answers 200"
+      return 0
+    fi
+    sleep 2
+  done
+  curl -sS -i --max-time 10 "$WEB/login" | head -n 20 || true
+  fail "$WEB/login did not answer 200 within 3 minutes (last answer: ${code:-none})"
 }
 
 # api_call NAME METHOD PATH [JSON_FILE]: an authenticated request; the body
@@ -330,6 +348,7 @@ phase_install() {
   pass "the freeframe command is installed at $BIN"
   say "address: $(sudo sed -n 's/^FRONTEND_URL=//p' "$ENV_FILE")"
   assert_ci_images
+  wait_web
   # Neither the admin password nor a generated secret is in install.log.
   # grep -c reads the whole log, so no SIGPIPE can turn a match into a miss.
   sudo test -s "$ROOT/install.log" || fail "install did not write $ROOT/install.log"
@@ -373,6 +392,7 @@ phase_backup_restore() {
   capture restore ff restore --yes "$dump"
   expect_rc 0 "restore"
   wait_health
+  wait_web
   assert_ci_images
 
   step "Only the project from before the backup is left"
