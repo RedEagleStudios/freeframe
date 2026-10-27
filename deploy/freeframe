@@ -3316,6 +3316,8 @@ _ff_version_gt() {
 _ff_parts_cmp() {
   local i x y
   local -a pa=() pb=()
+  # Text parts compare byte by byte, the same on every server language.
+  local LC_ALL=C
   IFS=. read -ra pa <<<"$1"
   IFS=. read -ra pb <<<"$2"
   for ((i = 0; i < ${#pa[@]} || i < ${#pb[@]}; i++)); do

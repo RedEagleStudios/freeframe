@@ -213,3 +213,11 @@ setup() {
   ff status
   assert_out "Check that the DNS records point here"
 }
+
+@test "_ff_version_gt compares labels by byte, whatever the server's language" {
+  local loc
+  loc=$(locale -a 2>/dev/null | grep -i -m1 -E '^(en_US|de_DE)\.utf-?8$') || skip "no UTF-8 locale with dictionary order here"
+  # In C order 'a' (97) comes after 'B' (66); a dictionary order puts a first.
+  run env LC_ALL="$loc" bash -c 'source "$1"; _ff_version_gt 1.0.0-rc.a 1.0.0-rc.B' ff "$FF_SCRIPT"
+  [ "$status" -eq 0 ]
+}
