@@ -41,6 +41,8 @@ WEB=http://localhost
 API_IMAGE=ghcr.io/techiebutler/freeframe-api:ci
 WEB_IMAGE=ghcr.io/techiebutler/freeframe-web:ci
 # The secrets install generates (derive_env). Every one must be there.
+# The exact line install prints when it finds a finished install.
+ALREADY_INSTALLED="FreeFrame is already installed on this server, so nothing was changed."
 SECRET_KEYS=(POSTGRES_PASSWORD DATABASE_URL REDIS_PASSWORD REDIS_URL JWT_SECRET S3_ACCESS_KEY S3_SECRET_KEY)
 
 say() { printf '%s\n' "$*"; }
@@ -100,12 +102,26 @@ expect_rc() {
   pass "$what exited $want"
 }
 
-expect_out() {
-  local text=$1 what=$2
-  if [[ $OUT != *"$text"* ]]; then
-    fail "$what did not print: $text"
-  fi
-  pass "$what printed: $text"
+# The output checks match whole lines, never substrings: a loose substring
+# can be tripped by a normal line ("Docker is already installed; using it."
+# contains "already installed"), or satisfied by the wrong one.
+
+# has_line LINE: LINE is exactly one of the lines of OUT.
+has_line() { grep -qxF -- "$1" <<<"$OUT"; }
+
+# has_line_re REGEX: a line of OUT matches the extended REGEX (anchor it).
+has_line_re() { grep -qE -- "$1" <<<"$OUT"; }
+
+expect_line() {
+  local line=$1 what=$2
+  has_line "$line" || fail "$what did not print the line: $line"
+  pass "$what printed: $line"
+}
+
+expect_line_re() {
+  local re=$1 what=$2
+  has_line_re "$re" || fail "$what printed no line matching: $re"
+  pass "$what printed a line matching: $re"
 }
 
 # mask_env_secrets: tell the runner to mask every secret in .env.prod, so a
@@ -317,7 +333,7 @@ EOF
   rm -rf "$dir"
   RC=$rc
   expect_rc 3 "install next to a FreeFrame set up by hand"
-  expect_out "set up by hand" "install"
+  expect_line "This server already runs FreeFrame that was set up by hand, not with this installer. The installer will not touch it, so nothing was changed." "install"
   if sudo test -e "$ENV_FILE"; then fail "the refused install wrote $ENV_FILE"; fi
   if sudo test -e "$ROOT/install.log"; then fail "the refused install wrote $ROOT/install.log"; fi
   if [[ -e $BIN ]]; then fail "the refused install installed $BIN"; fi
@@ -341,7 +357,8 @@ phase_install() {
   capture install run_install "$GITHUB_WORKSPACE/deploy/freeframe"
   expect_rc 0 "install"
   mask_env_secrets
-  if [[ $OUT == *"already installed"* ]]; then fail "a first install said FreeFrame is already installed"; fi
+  if has_line "$ALREADY_INSTALLED"; then fail "a first install said: $ALREADY_INSTALLED"; fi
+  expect_line_re '^FreeFrame is ready: http://[^ ]+$' "install"
   sudo test -f "$ROOT/.installed" || fail "install did not write $ROOT/.installed"
   [[ $(sudo stat -c %a "$ENV_FILE") == 600 ]] || fail "$ENV_FILE is mode $(sudo stat -c %a "$ENV_FILE"), expected 600"
   pass "$ENV_FILE is mode 600 and the install is marked finished"
@@ -415,7 +432,7 @@ phase_update() {
   before=$SECRETS_HASH
   capture update ff update
   expect_rc 0 "update"
-  expect_out "its setup files and images were refreshed" "update"
+  expect_line_re '^FreeFrame is already on the newest release of the latest channel \([^)]+\); its setup files and images were refreshed\.$' "update"
   secret_lines_hash
   after=$SECRETS_HASH
   [[ $before == "$after" ]] || fail "update changed a secret in $ENV_FILE (sha256 of the ${#SECRET_KEYS[@]} secret lines differs)"
@@ -434,8 +451,8 @@ phase_rerun() {
   before=$(file_hash "$ENV_FILE")
   capture rerun run_install "$BIN"
   expect_rc 0 "a second install"
-  expect_out "FreeFrame is already installed on this server, so nothing was changed." "a second install"
-  expect_out "sudo freeframe update" "a second install"
+  expect_line "$ALREADY_INSTALLED" "a second install"
+  expect_line "To move to the newest release, run: sudo freeframe update" "a second install"
   after=$(file_hash "$ENV_FILE")
   [[ $before == "$after" ]] || fail "a second install changed $ENV_FILE"
   pass "$ENV_FILE is byte-identical (sha256 $before)"
@@ -445,8 +462,9 @@ phase_status() {
   step "sudo freeframe status"
   capture status ff status
   expect_rc 0 "status"
-  expect_out "FreeFrame answers at its web address" "status"
-  if [[ $OUT == *"not created"* ]]; then fail "status lists a part of FreeFrame as not created"; fi
+  expect_line "  Health:       FreeFrame answers at its web address" "status"
+  # A part row is "  <service padded> not created".
+  if has_line_re '^  [A-Za-z0-9_-]+ +not created$'; then fail "status lists a part of FreeFrame as not created"; fi
   pass "status lists every part as created"
 }
 
