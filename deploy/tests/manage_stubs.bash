@@ -229,3 +229,13 @@ sync() {
   _stub_log "sync $* [$(grep -h '^phase=' "$FF_ROOT/.update-undo" 2>/dev/null || printf 'no record')]"
   command sync "$@" 2>/dev/null || true
 }
+
+# STUB_AT_LOCK: a shell command run just before _ff_lock, as another
+# freeframe command could change things between a question and the lock.
+if [[ -n ${STUB_AT_LOCK:-} ]]; then
+  eval "_real_ff_lock() $(declare -f _ff_lock | tail -n +2)"
+  _ff_lock() {
+    bash -c "$STUB_AT_LOCK"
+    _real_ff_lock "$@"
+  }
+fi

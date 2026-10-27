@@ -3540,20 +3540,22 @@ _update_undo_file() { printf '%s/.update-undo' "$(ff_root)"; }
 # FF_UNDO_PHASE from the record. 1 when there is none. The phase is saved
 # (the files from before are kept; the new version has not started, so the
 # old one is still what runs) or started (the new version was started). A
-# record without one is read as started, the careful choice.
+# record without one is read as started, the careful choice. FF_UNDO_RAW is
+# the record as read (once, so the fields all come from the same record).
 _update_undo_read() {
   local f line
   f=$(_update_undo_file)
-  FF_UNDO_VERSION="" FF_UNDO_BACKUP="" FF_UNDO_TIME="" FF_UNDO_PHASE=started
+  FF_UNDO_VERSION="" FF_UNDO_BACKUP="" FF_UNDO_TIME="" FF_UNDO_PHASE=started FF_UNDO_RAW=""
   [[ -f $f ]] || return 1
-  while IFS= read -r line || [[ -n $line ]]; do
+  FF_UNDO_RAW=$(cat "$f" 2>/dev/null) || return 1
+  while IFS= read -r line; do
     case $line in
       version=*) FF_UNDO_VERSION=${line#version=} ;;
       backup=*) FF_UNDO_BACKUP=${line#backup=} ;;
       time=*) FF_UNDO_TIME=${line#time=} ;;
       phase=*) FF_UNDO_PHASE=${line#phase=} ;;
     esac
-  done <"$f"
+  done <<<"$FF_UNDO_RAW"
   return 0
 }
 
@@ -3974,36 +3976,17 @@ _rollback_unstarted() {
   _install_log_stop
 }
 
-# cmd_rollback: `freeframe rollback`: take the server back to the version
-# it had before an update that did not end well, with the database as it was
-# just before that update. In order: stop the app containers, put the setup
-# files from before back, pin FREEFRAME_VERSION to the old version, restore
-# the update's backup (restore_database, which never starts FreeFrame on an
-# early failure here: the old version must not run on the database the
-# update left), then start and wait for health, and drop the record. Every
-# step can be repeated, so running it again after a failure is safe.
-# When the record says the new version was never started (phase saved),
-# nothing has changed the database: then only the setup files and the pin go
-# back and the old version is started again; the database is not touched,
-# so nothing written since the update began is lost, and no yes is needed.
-cmd_rollback() {
-  local root file old backup when out s url mode host answers f started=1 rec_q unsaved_try
-  local -a all=() svcs=()
-  root=$(ff_root)
-  file="$root/.env.prod"
-  if ((${#FF_ARGS[@]})); then _ff_bad_usage "freeframe rollback takes no other words."; fi
-  _ff_need_root rollback
-  _ff_need_install
-  answers=$(_ff_given_answers)
-  if [[ -n $answers ]]; then
-    _ff_stop 2 "freeframe rollback takes no answers ($answers was given), so nothing was changed." \
-      "to change the web address, email or storage, run: sudo freeframe configure"
-  fi
-  if ! _update_undo_read; then
-    say "There is no update to roll back: the last update finished (or none was made), so nothing was changed."
-    say "To put back an older copy of the database instead, see: sudo freeframe restore"
-    return 0
-  fi
+# _rollback_check: read the update record and check that what a rollback
+# needs is there. Sets the caller's old, backup, started, rec (the record as
+# it is) and unsaved_try. 1 when there is no record; stops (nothing changed)
+# when the rollback cannot go on. cmd_rollback calls it before its question
+# and again under the lock, and acts only on what the second call read.
+_rollback_check() {
+  local f rec_q
+  rec=""
+  _update_undo_read || return 1
+  rec=$FF_UNDO_RAW
+  started=1
   old=$FF_UNDO_VERSION backup=$FF_UNDO_BACKUP
   [[ $FF_UNDO_PHASE != saved ]] || started=""
   rec_q=$(_ff_q "$(_update_undo_file)")
@@ -4033,6 +4016,38 @@ cmd_rollback() {
         "$unsaved_try"
     fi
   done
+}
+
+# cmd_rollback: `freeframe rollback`: take the server back to the version
+# it had before an update that did not end well, with the database as it was
+# just before that update. In order: stop the app containers, put the setup
+# files from before back, pin FREEFRAME_VERSION to the old version, restore
+# the update's backup (restore_database, which never starts FreeFrame on an
+# early failure here: the old version must not run on the database the
+# update left), then start and wait for health, and drop the record. Every
+# step can be repeated, so running it again after a failure is safe.
+# When the record says the new version was never started (phase saved),
+# nothing has changed the database: then only the setup files and the pin go
+# back and the old version is started again; the database is not touched,
+# so nothing written since the update began is lost, and no yes is needed.
+cmd_rollback() {
+  local root file old backup when out s url mode host answers started=1 unsaved_try rec seen seen_started
+  local -a all=() svcs=()
+  root=$(ff_root)
+  file="$root/.env.prod"
+  if ((${#FF_ARGS[@]})); then _ff_bad_usage "freeframe rollback takes no other words."; fi
+  _ff_need_root rollback
+  _ff_need_install
+  answers=$(_ff_given_answers)
+  if [[ -n $answers ]]; then
+    _ff_stop 2 "freeframe rollback takes no answers ($answers was given), so nothing was changed." \
+      "to change the web address, email or storage, run: sudo freeframe configure"
+  fi
+  if ! _rollback_check; then
+    say "There is no update to roll back: the last update finished (or none was made), so nothing was changed."
+    say "To put back an older copy of the database instead, see: sudo freeframe restore"
+    return 0
+  fi
   when=$(_ff_stamp_date "${backup##*/}")
   if [[ -n $started && -z ${FF_YES:-} ]]; then
     if ! _ff_has_tty; then
@@ -4050,9 +4065,27 @@ cmd_rollback() {
     fi
   fi
 
+  # The question is asked before the lock, so nothing waits on an answer.
+  # An update may have moved on meanwhile: what is done is worked out again
+  # from the record as it is under the lock, and anything other than what
+  # was asked about is refused.
   if ! _ff_lock; then
     _ff_stop 1 "$FF_BUSY, so the rollback did not start. Nothing was changed." \
       "wait a few minutes for it to finish, then run sudo freeframe rollback again."
+  fi
+  seen=$rec seen_started=$started
+  if ! _rollback_check; then
+    say "There is no update to roll back any more: while this rollback was getting ready, the update it was for ended (or another rollback finished it), so nothing was changed."
+    say "To see how FreeFrame is now, run: sudo freeframe status"
+    return 0
+  fi
+  if [[ -n $started && -z $seen_started ]]; then
+    _ff_stop 1 "While this rollback was getting ready, the update went on to start its new version, which may have changed the database. Rolling it back now replaces the database, which this rollback did not say or ask, so it did not start. Nothing was changed." \
+      "run sudo freeframe rollback again: it says what it will do and asks first."
+  fi
+  if [[ $rec != "$seen" ]]; then
+    _ff_stop 1 "The record of the update ($(_update_undo_file)) changed while this rollback was getting ready, so what this rollback said it would do may not be what it would do now. It did not start. Nothing was changed." \
+      "run sudo freeframe rollback again to see what it would do now."
   fi
   FF_ACTOR="the rollback"
   FF_STOPPED=()

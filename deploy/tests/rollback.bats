@@ -350,3 +350,85 @@ assert_database_untouched() {
   [ "$status" -eq 1 ]
   assert_out "sudo freeframe restore --yes '$UPDATE_BACKUP'"
 }
+
+# ---------------------------------------------------------------- the record read under the lock
+
+# snapshot_state DIR: the setup files, the settings and the record as they are.
+snapshot_state() {
+  local f
+  mkdir -p "$1"
+  for f in docker-compose.prod.yml docker-compose.images.yml docker-compose.https.yml docker-compose.storage.yml .env.prod; do
+    cp "$FF_ROOT/$f" "$1/$f"
+  done
+  if [[ -e $FF_ROOT/.update-undo ]]; then cp "$FF_ROOT/.update-undo" "$1/.update-undo"; fi
+}
+
+# assert_state_is DIR: nothing changed since snapshot_state DIR.
+assert_state_is() {
+  local f
+  for f in docker-compose.prod.yml docker-compose.images.yml docker-compose.https.yml docker-compose.storage.yml .env.prod; do
+    cmp "$1/$f" "$FF_ROOT/$f" || { echo "$f was changed"; return 1; }
+  done
+  if [[ -e $1/.update-undo ]]; then
+    cmp "$1/.update-undo" "$FF_ROOT/.update-undo" || { echo "the record was changed"; return 1; }
+  else
+    [ ! -e "$FF_ROOT/.update-undo" ] || { echo "a record appeared"; return 1; }
+  fi
+}
+
+@test "rollback: a never-started update that ends before the lock is taken is not rolled back" {
+  unstarted_update
+  # While the rollback gets ready, the update finishes: its new version is
+  # up, the database migrated, the record cleared and the lock released.
+  export STUB_AT_LOCK='for f in docker-compose.prod.yml docker-compose.images.yml docker-compose.https.yml docker-compose.storage.yml; do cp "$STUB_REMOTE/$f" "$FF_ROOT/$f"; done; rm -f "$FF_ROOT/.update-undo"; mkdir -p "$STUB_DIR/after" && for f in docker-compose.prod.yml docker-compose.images.yml docker-compose.https.yml docker-compose.storage.yml .env.prod; do cp "$FF_ROOT/$f" "$STUB_DIR/after/$f"; done'
+  ff rollback
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_state_is "$STUB_DIR/after"
+  assert_not_called "dc "
+  assert_not_called "docker "
+  assert_out "There is no update to roll back any more"
+  assert_out "nothing was changed"
+  assert_no_out "Rolling back"
+  assert_no_out "is back on"
+}
+
+@test "rollback: a never-started update that starts its new version before the lock is refused, not restored unasked" {
+  unstarted_update
+  export STUB_AT_LOCK='sed -i "s/^phase=saved$/phase=started/" "$FF_ROOT/.update-undo"; mkdir -p "$STUB_DIR/after" && for f in docker-compose.prod.yml docker-compose.images.yml docker-compose.https.yml docker-compose.storage.yml .env.prod .update-undo; do cp "$FF_ROOT/$f" "$STUB_DIR/after/$f"; done'
+  ff rollback --yes
+  [ "$status" -eq 1 ]
+  assert_state_is "$STUB_DIR/after"
+  grep -qx "phase=started" "$FF_ROOT/.update-undo"
+  assert_database_untouched
+  assert_not_called "dc "
+  assert_out "went on to start its new version"
+  assert_out "Nothing was changed."
+  assert_out "run sudo freeframe rollback again"
+  assert_no_out "is back on"
+}
+
+@test "rollback: a started update whose record is cleared after the yes is not rolled back" {
+  failed_update
+  printf 'y\n' >"$BATS_TEST_TMPDIR/tty"
+  export FF_TTY="$BATS_TEST_TMPDIR/tty"
+  export STUB_AT_LOCK='rm -f "$FF_ROOT/.update-undo"; mkdir -p "$STUB_DIR/after" && for f in docker-compose.prod.yml docker-compose.images.yml docker-compose.https.yml docker-compose.storage.yml .env.prod; do cp "$FF_ROOT/$f" "$STUB_DIR/after/$f"; done'
+  ff rollback
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "Roll back now?"
+  assert_state_is "$STUB_DIR/after"
+  assert_database_untouched
+  assert_not_called "dc "
+  assert_out "There is no update to roll back any more"
+}
+
+@test "rollback: a record replaced by another update's after the yes is refused" {
+  failed_update
+  export STUB_AT_LOCK='sed -i "s/^time=.*/time=2026-10-27 04:00:00 +0000/" "$FF_ROOT/.update-undo"; mkdir -p "$STUB_DIR/after" && for f in docker-compose.prod.yml docker-compose.images.yml docker-compose.https.yml docker-compose.storage.yml .env.prod .update-undo; do cp "$FF_ROOT/$f" "$STUB_DIR/after/$f"; done'
+  ff rollback --yes
+  [ "$status" -eq 1 ]
+  assert_state_is "$STUB_DIR/after"
+  assert_database_untouched
+  assert_not_called "dc "
+  assert_out "changed while this rollback was getting ready"
+  assert_out "Nothing was changed."
+}
