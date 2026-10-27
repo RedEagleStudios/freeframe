@@ -95,8 +95,11 @@ if [[ -z ${STUB_REAL_REEXEC:-} ]]; then
   }
 fi
 
+# STUB_TIMER_HANG: refreshing the timer hangs (a signal after the update
+# succeeded).
 install_backup_timer() {
   _stub_log install_backup_timer
+  [[ -z ${STUB_TIMER_HANG:-} ]] || _stub_hang timer
   [[ -z ${STUB_TIMER_FAIL:-} ]]
 }
 

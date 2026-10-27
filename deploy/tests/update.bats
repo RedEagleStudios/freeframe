@@ -669,3 +669,14 @@ killed_update_state() {
   assert_not_called fetch
   assert_not_called "dc "
 }
+
+@test "update: a signal after the new version answered does not advise a rollback that has nothing to do" {
+  export STUB_TIMER_HANG=1
+  ff_signal TERM timer update
+  [ "$status" -eq 1 ]
+  [ ! -e "$FF_ROOT/.update-undo" ]
+  assert_out "stopped (SIGTERM) while refreshing the nightly backups"
+  assert_no_out "rollback"
+  assert_out "FreeFrame 1.22.0 runs and answers"
+  assert_out "What to try: the update itself is done."
+}

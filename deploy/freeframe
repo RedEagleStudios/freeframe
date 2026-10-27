@@ -3832,9 +3832,11 @@ cmd_update() {
     install_fail "FreeFrame did not come back after the update to $new." \
       "see why with: sudo freeframe logs (the API's messages: sudo freeframe logs api)."
   fi
-  # It answers: the way back is no longer needed.
+  # It answers: the way back is no longer needed, and no message names it.
   _update_undo_clear
   FF_UPDATE_PHASE=""
+  FF_TRAP_HINT="the update itself is done. To refresh the nightly backup timer too, run sudo freeframe update again."
+  FF_STATE="FreeFrame $new runs and answers at $url; only the nightly backup timer was still being refreshed (the one set up before keeps running)."
   FF_STEP="refreshing the nightly backups"
   if ! _ff_logged install_backup_timer; then
     warn "The nightly backup timer could not be refreshed; the one set up before keeps running. The reason is at the end of $FF_LOG."
