@@ -150,11 +150,13 @@ After the install, the `freeframe` command is on the server. All commands need `
 3. On the new server, create the folder and put the old settings file in it:
    ```bash
    sudo mkdir -p /opt/freeframe
-   sudo cp .env.prod /opt/freeframe/.env.prod
+   sudo install -m 600 .env.prod /opt/freeframe/.env.prod
    ```
+   The `-m 600` makes the file readable by the administrator only, because it holds your passwords. (The installer tightens it to that itself, but it is better never to leave it open.)
 4. Run the install command. It keeps every setting from the file (including the secrets, which the restored database needs) and skips the questions the file already answers. It still asks for an admin account; the restore in the next step replaces it with your old accounts.
 5. Run `sudo freeframe restore /path/to/the-copied-file.dump` and answer yes.
-6. If footage was kept on the old server, copy the media to the new one as well; the restore brings back the database only. Using your own S3 bucket avoids this: the new server simply uses the same bucket.
+6. Give the new server its own web address. The settings file carries the old server's address, and the installer does not check or change an address that comes from a copied file. If the old server used the free `sslip.io` address or "this network only", the new server would keep the old address, which does not lead to it. Run `sudo freeframe configure` and enter the new server's domain (or choose the new automatic address). If you moved with the same domain, point its DNS at the new server (step 2); no change is needed then.
+7. If footage was kept on the old server, copy the media to the new one as well; the restore brings back the database only. Using your own S3 bucket avoids this: the new server simply uses the same bucket.
 
 ### Unattended installs (cloud-init, Ansible)
 
@@ -169,7 +171,7 @@ For a script with nobody at the keyboard, give every answer ahead of time. Each 
 | `FREEFRAME_S3_ENDPOINT`, `_BUCKET`, `_ACCESS_KEY`, `_SECRET_KEY`, `_REGION` | Your bucket, when storage is `s3`. |
 | `FREEFRAME_SMTP_HOST`, `_PORT`, `_USER`, `_PASSWORD`, `_FROM` | Your mail server. Leave them all out for no email. |
 | `FREEFRAME_ADMIN_NAME`, `_EMAIL`, `_PASSWORD` | The admin account. The email is required. |
-| `FREEFRAME_CHANNEL` | `latest` or `stable` (or a version tag such as `v1.22.0`). |
+| `FREEFRAME_CHANNEL` | `latest` or `stable` (or a release tag that includes the installer). |
 | `FREEFRAME_YES` | `1` to run without asking anything. |
 
 Example, as cloud-init runs it (as root, so no `sudo`):
