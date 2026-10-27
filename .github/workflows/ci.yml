@@ -417,6 +417,57 @@ jobs:
           fi
           bats --timing deploy/tests
 
+  # Whether the installer end to end has anything to test: on a pull request,
+  # only when it touches the installer, the compose files, the prod images or
+  # this workflow (plain git diff against the PR base, no third-party action).
+  # A push to main always runs it. When in doubt (no base, a failed diff) it
+  # runs. Skipped, installer-e2e shows as skipped, not failed.
+  installer-changes:
+    name: Installer E2E Gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      e2e: ${{ steps.gate.outputs.e2e }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The whole history, so the PR base commit is there to diff against.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Does this change touch the installer, compose files or prod images?
+        id: gate
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          e2e=false
+          if [ "$EVENT" != pull_request ]; then
+            echo "A $EVENT event: the installer e2e always runs."
+            e2e=true
+          elif [ -z "$BASE" ] || ! files=$(git diff --name-only "$BASE" HEAD); then
+            echo "::warning::Could not list the files changed against the PR base (${BASE:-none}), so the installer e2e runs."
+            e2e=true
+          else
+            echo "Files changed against the PR base $BASE:"
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              case $f in
+                deploy/* | install.sh | docker-compose*.yml | apps/*/Dockerfile.prod* | *.dockerignore | .github/workflows/ci.yml)
+                  echo "  $f (the installer e2e covers it)"
+                  e2e=true
+                  ;;
+                *) echo "  $f" ;;
+              esac
+            done <<<"$files"
+          fi
+          echo "Installer e2e: $e2e"
+          echo "e2e=$e2e" >>"$GITHUB_OUTPUT"
+
   # The installer for real, on a fresh runner (Docker 24+ with compose is
   # preinstalled, so it installs no Docker): both prod images are built from
   # this checkout as version `ci`, so nothing comes from the registry, and
@@ -424,6 +475,8 @@ jobs:
   # checks. About 15 minutes, most of it the two image builds.
   installer-e2e:
     name: Installer End to End
+    needs: installer-changes
+    if: needs.installer-changes.outputs.e2e == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
