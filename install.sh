@@ -113,7 +113,10 @@ stdin_is_terminal() { [ -t 0 ]; }
 
 # started_by_sudo_rs: 0 when sudo-rs started this script. The parent process
 # says which sudo it is; when /proc cannot be read, sudo --version does.
-# SUDO_USER is set only under sudo, so root's own shell never counts.
+# SUDO_USER is set only under sudo, so root's own shell never counts. Only
+# the direct parent counts: measured on Ubuntu 26.04, sudo sh -c 'curl |
+# bash' and a pipe typed in a sudo -i shell both read the keyboard fine;
+# only curl | sudo bash freezes.
 started_by_sudo_rs() {
   [ -n "${SUDO_USER:-}" ] || return 1
   if parent=$(readlink "/proc/$PPID/exe" 2>/dev/null) && [ -n "$parent" ]; then

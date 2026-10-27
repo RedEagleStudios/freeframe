@@ -1931,6 +1931,15 @@ SUDO_C_LATEST='sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Tech
   assert_out "ran: install --channel latest -x --yes"
 }
 
+@test "install.sh: under sudo-rs a sudo started further up (sudo sh -c 'curl | bash') is not stopped" {
+  # Measured on Ubuntu 26.04: only a direct curl ... | sudo bash freezes.
+  bootstrap_setup
+  export SUDO_USER=ada STUB_PARENT_EXE=/usr/bin/dash STUB_SUDO_VERSION="sudo-rs 0.2.13"
+  run_bootstrap
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "ran: install --channel latest"
+}
+
 # ---------------------------------------------------------------- hints and state lines
 
 @test "install: a program is listed as stopped only when stopping it worked" {
