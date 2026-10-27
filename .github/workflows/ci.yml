@@ -460,5 +460,5 @@ jobs:
         run: bash deploy/tests/ci-e2e.sh status
 
       - name: Diagnostics
-        if: failure()
+        if: failure() || cancelled()
         run: bash deploy/tests/ci-e2e.sh diagnose
