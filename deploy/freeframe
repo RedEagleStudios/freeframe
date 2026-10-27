@@ -3859,6 +3859,60 @@ _ff_stop_project_app() {
   _ff_logged docker stop "${ids[@]}"
 }
 
+# _rollback_unstarted OLD: the rollback of an update whose new version was
+# never started. The old version still runs on a database nothing has
+# changed, so the setup files and the pin go back, the old version is
+# started again (only what the files changed is recreated), and the
+# database is left alone. Called with the lock, the log and the traps set.
+_rollback_unstarted() {
+  local old=$1 root file newv url mode host
+  root=$(ff_root)
+  file="$root/.env.prod"
+  newv=$(ff_version)
+  [[ $newv != "$old" ]] || newv=""
+  say "The new version${newv:+ ($newv)} of that update never started, so the database is left as it is."
+  FF_STATE="FreeFrame still runs $old and its database was not changed; its setup files may be partly the new release's. Running sudo freeframe rollback again is safe."
+  FF_STEP="putting the setup files from before back"
+  if ! _update_put_back; then
+    install_fail "The setup files from before the update could not all be put back." \
+      "check that the disk is not full, then run: sudo freeframe rollback"
+  fi
+  FF_STATE="FreeFrame still runs $old and its database was not changed. Its setup files are back as they were before the update; its version is not pinned yet. Running sudo freeframe rollback again is safe."
+  FF_STEP="pinning version $old"
+  if [[ $(env_get "$file" FREEFRAME_VERSION) != "$old" ]]; then
+    if ! env_backup "$file" >/dev/null || ! env_set "$file" FREEFRAME_VERSION "$old"; then
+      install_fail "FREEFRAME_VERSION could not be set to $old in $file." \
+        "check that the disk is not full, then run: sudo freeframe rollback"
+    fi
+  fi
+  say "Pinned version $old (FREEFRAME_VERSION in $file)."
+  FF_STATE="The setup files and the version ($old) are back as they were before the update, and the database was not changed. Running sudo freeframe rollback again is safe."
+  FF_STEP="starting FreeFrame $old"
+  url=$(env_get "$file" FRONTEND_URL)
+  host=$(_ff_url_host "$url")
+  mode=$(env_get "$file" FREEFRAME_HTTPS)
+  say "Starting FreeFrame $old with its setup files from before..."
+  if ! _ff_logged dc up -d --no-build --remove-orphans; then
+    install_fail "FreeFrame $old could not be started." "see why with: sudo freeframe logs"
+  fi
+  FF_STEP="waiting for FreeFrame to answer"
+  if ! _ff_wait_healthy "${mode:-off}" "$host"; then
+    install_fail "FreeFrame $old did not answer after the rollback." "see why with: sudo freeframe logs"
+  fi
+  if ! _ff_logged install_backup_timer; then
+    warn "The nightly backup timer could not be refreshed; the one set up before keeps running. The reason is at the end of $FF_LOG."
+  fi
+  _update_undo_clear
+  trap - ERR INT TERM HUP
+  say ""
+  say "FreeFrame is back on $old."
+  say "The database was not changed: the new version${newv:+ ($newv)} never ran, so nothing written since the update began is lost."
+  say "It answers at $url."
+  say "This server now stays on $old. To try the update again later, delete the FREEFRAME_VERSION line from"
+  say "$file, then run sudo freeframe update."
+  _install_log_stop
+}
+
 # cmd_rollback: `freeframe rollback`: take the server back to the version
 # it had before an update that did not end well, with the database as it was
 # just before that update. In order: stop the app containers, put the setup
@@ -3867,8 +3921,12 @@ _ff_stop_project_app() {
 # early failure here: the old version must not run on the database the
 # update left), then start and wait for health, and drop the record. Every
 # step can be repeated, so running it again after a failure is safe.
+# When the record says the new version was never started (phase saved),
+# nothing has changed the database: then only the setup files and the pin go
+# back and the old version is started again; the database is not touched,
+# so nothing written since the update began is lost, and no yes is needed.
 cmd_rollback() {
-  local root file old backup when out s url mode host answers f
+  local root file old backup when out s url mode host answers f started=1 rec_q unsaved_try
   local -a all=() svcs=()
   root=$(ff_root)
   file="$root/.env.prod"
@@ -3886,28 +3944,36 @@ cmd_rollback() {
     return 0
   fi
   old=$FF_UNDO_VERSION backup=$FF_UNDO_BACKUP
+  [[ $FF_UNDO_PHASE != saved ]] || started=""
+  rec_q=$(_ff_q "$(_update_undo_file)")
   if [[ ! $old =~ ^[A-Za-z0-9._-]+$ || $old == unknown ]]; then
     _ff_stop 1 "The record of the last update ($(_update_undo_file)) does not say which version it came from, so nothing was changed." \
       "to put the database back as it was before that update, run: sudo freeframe restore --yes $(_ff_q "$backup")"
   fi
-  if ! _ff_is_pg_dump "$backup"; then
+  # A new version that never started changed nothing in the database, so its
+  # rollback needs no backup, and a restore is never the advice for it.
+  unsaved_try="to put the database back as it was before the update, run: sudo freeframe restore --yes $(_ff_q "$backup")"
+  if [[ -z $started ]]; then
+    unsaved_try="the new version of that update never ran, so the database was not changed and $old still runs. To try the update again, remove the record and run it: sudo rm $rec_q && sudo freeframe update"
+  fi
+  if [[ -n $started ]] && ! _ff_is_pg_dump "$backup"; then
     _ff_stop 1 "The backup taken before the update ($backup) is not there any more, so the database cannot be put back and nothing was changed." \
       "if you have a copy of it, put it back at that path, then run sudo freeframe rollback again."
   fi
   if [[ ! -d $root/rollback ]]; then
     _ff_stop 1 "The setup files saved before the update ($root/rollback) are missing, so nothing was changed." \
-      "to put the database back as it was before the update, run: sudo freeframe restore --yes $(_ff_q "$backup")"
+      "$unsaved_try"
   fi
   # A file missing from the saved set reads as "new in that release" and is
   # removed when the set goes back, so the two every server has must be there.
   for f in docker-compose.prod.yml docker-compose.images.yml; do
     if [[ ! -s $root/rollback/$f ]]; then
       _ff_stop 1 "The setup files saved before the update ($root/rollback) are incomplete: $f is missing, so nothing was changed." \
-        "to put the database back as it was before the update, run: sudo freeframe restore --yes $(_ff_q "$backup")"
+        "$unsaved_try"
     fi
   done
   when=$(_ff_stamp_date "${backup##*/}")
-  if [[ -z ${FF_YES:-} ]]; then
+  if [[ -n $started && -z ${FF_YES:-} ]]; then
     if ! _ff_has_tty; then
       _ff_stop 2 "Rolling back replaces FreeFrame's database, so it needs a yes, and there is no terminal here to ask." \
         "run sudo freeframe rollback in a terminal, or add --yes to it."
@@ -3937,6 +4003,10 @@ cmd_rollback() {
   _install_log_start rollback
   _ff_cmd_traps
   say "Rolling back to $old..."
+  if [[ -z $started ]]; then
+    _rollback_unstarted "$old"
+    return 0
+  fi
 
   FF_STEP="stopping FreeFrame"
   say "Stopping FreeFrame (its web address shows an error until the rollback is done)..."

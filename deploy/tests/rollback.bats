@@ -45,6 +45,8 @@ assert_not_started() {
 
 @test "rollback: stops, puts the setup files back, pins the old version, restores the backup, then starts" {
   failed_update
+  # The update had started its new version, which may have changed the database.
+  grep -qx "phase=started" "$FF_ROOT/.update-undo"
   ff rollback --yes
   [ "$status" -eq 0 ] || { echo "$output"; cat "$CALLS"; false; }
   # Stopped while the new release's files were still in place.
@@ -261,4 +263,71 @@ assert_not_started() {
   [ "$status" -eq 1 ]
   assert_out "To try again, run: sudo freeframe rollback"
   assert_no_out "rollback --yes"
+}
+
+# ---------------------------------------------------------------- a new version that never started
+
+# unstarted_update: the mixed-set update of round 2: the new files could not
+# all be put in place, and the old ones not all back either, so the record
+# stays, written before the new version was started.
+unstarted_update() {
+  STUB_MV_FAIL=docker-compose.storage.yml STUB_MV_OLD_FAIL=docker-compose.images.yml STUB_PUTBACK_FAIL=1 ff update
+  [ "$status" -eq 1 ] || { echo "$output"; return 1; }
+  grep -qx "phase=saved" "$FF_ROOT/.update-undo"
+  # The way it came out: some of the new release's files are on disk.
+  grep -q 1.22.0 "$FF_ROOT/docker-compose.images.yml"
+  : >"$CALLS"
+}
+
+assert_database_untouched() {
+  local c
+  for c in dropdb createdb pg_restore pg_dump; do assert_not_called "$c"; done
+  [ ! -e "$STUB_DIR/restored" ]
+  [ ! -e "$FF_ROOT/.restore-undo" ]
+}
+
+@test "rollback: a new version that never started gets its files and pin back and a restart, the database untouched" {
+  unstarted_update
+  # No yes is needed: nothing is lost.
+  ff rollback
+  [ "$status" -eq 0 ] || { echo "$output"; cat "$CALLS"; false; }
+  assert_database_untouched
+  assert_files_from_before
+  assert_has "$ENV" "FREEFRAME_VERSION=1.21.0"
+  assert_order "dc up -d --no-build --remove-orphans" "localhost:8000/health" install_backup_timer
+  [ ! -e "$FF_ROOT/.update-undo" ]
+  assert_out "FreeFrame is back on 1.21.0."
+  assert_out "The database was not changed: the new version (1.22.0) never ran, so nothing written since the update began is lost."
+  assert_no_out "as it was just before the update"
+  assert_out "delete the FREEFRAME_VERSION line"
+}
+
+@test "rollback: a new version that never started needs neither the backup nor a yes" {
+  unstarted_update
+  rm -f "$(sed -n 's/^backup=//p' "$FF_ROOT/.update-undo")"
+  ff rollback
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_database_untouched
+  assert_files_from_before
+}
+
+@test "rollback: a never-started update whose saved files are gone is not sent to a restore" {
+  unstarted_update
+  rm -rf "$FF_ROOT/rollback"
+  ff rollback
+  [ "$status" -eq 1 ]
+  assert_no_out "sudo freeframe restore"
+  assert_out "sudo rm '$FF_ROOT/.update-undo'"
+  assert_database_untouched
+  assert_not_called "dc "
+}
+
+@test "rollback: a record without the started flag (an older freeframe) restores, the safe choice" {
+  failed_update
+  sed -i '/^phase=/d' "$FF_ROOT/.update-undo"
+  ff rollback --yes
+  [ "$status" -eq 0 ] || { echo "$output"; cat "$CALLS"; false; }
+  grep -q "dc exec -T postgres pg_restore" "$CALLS"
+  cmp "$UPDATE_BACKUP" "$STUB_DIR/restored"
+  assert_out "with the database as it was just before the update"
 }
