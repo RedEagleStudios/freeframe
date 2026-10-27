@@ -4014,7 +4014,15 @@ _rollback_check() {
   # rollback needs no backup, and a restore is never the advice for it.
   unsaved_try="to put the database back as it was before the update, run: sudo freeframe restore --yes $(_ff_q "$backup")"
   if [[ -z $started ]]; then
-    unsaved_try="the new version of that update never ran, so the database was not changed and the version from before still runs. To try the update again, remove the record and run it: sudo rm $rec_q && sudo freeframe update"
+    # With the saved set whole, update puts it back itself (it does for a
+    # record in this phase) and goes on. Without it, update would refuse or
+    # remove files, so the record goes first and update's running-version
+    # check then takes the running release's files as the way back.
+    if [[ -s $root/rollback/docker-compose.prod.yml && -s $root/rollback/docker-compose.images.yml ]]; then
+      unsaved_try="the new version of that update never ran, so the database was not changed and the version from before still runs. To put its setup files from before back and try the update again (update puts them back first), run: sudo freeframe update"
+    else
+      unsaved_try="the new version of that update never ran, so the database was not changed and the version from before still runs. To try the update again, remove the record and run it: sudo rm $rec_q && sudo freeframe update"
+    fi
   fi
   if [[ ! $old =~ ^[A-Za-z0-9._-]+$ || $old == unknown ]]; then
     _ff_stop 1 "The record of the last update ($(_update_undo_file)) does not say which version it came from, so nothing was changed." \

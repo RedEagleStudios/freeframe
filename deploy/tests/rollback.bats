@@ -355,8 +355,15 @@ assert_database_untouched() {
   [ "$status" -eq 1 ]
   assert_out "does not say which version"
   assert_no_out "sudo freeframe restore"
-  assert_out "sudo rm '$FF_ROOT/.update-undo' && sudo freeframe update"
   assert_database_untouched
+  # The saved set is whole, so update puts it back itself: removing the
+  # record first would leave the new release's files in place.
+  assert_out "run: sudo freeframe update"
+  assert_no_out "sudo rm"
+  ff update
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "putting its setup files from before back first"
+  assert_out "FreeFrame was updated from 1.21.0 to 1.22.0."
 }
 
 @test "rollback: a started record without its version still points at the restore" {
