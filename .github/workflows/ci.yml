@@ -457,7 +457,7 @@ jobs:
             while IFS= read -r f; do
               [ -n "$f" ] || continue
               case $f in
-                deploy/* | install.sh | docker-compose*.yml | apps/*/Dockerfile.prod* | *.dockerignore | .github/workflows/ci.yml)
+                deploy/* | install.sh | docker-compose*.yml | apps/*/Dockerfile.prod* | apps/*/docker-entrypoint.sh | *.dockerignore | .github/workflows/ci.yml)
                   echo "  $f (the installer e2e covers it)"
                   e2e=true
                   ;;
