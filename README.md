@@ -140,11 +140,10 @@ No clone and no build: the server needs only the compose files and your settings
 
 ```bash
 mkdir freeframe && cd freeframe
-for f in docker-compose.prod.yml docker-compose.images.yml .env.example; do
-  curl -fsSLO "https://raw.githubusercontent.com/Techiebutler/freeframe/latest/$f" \
-    || { echo "Could not download $f: stop here and check the ref." >&2; break; }
-done
-cp .env.example .env.prod
+( set -e; for f in docker-compose.prod.yml docker-compose.images.yml .env.example; do
+    curl -fsSLO "https://raw.githubusercontent.com/Techiebutler/freeframe/latest/$f" \
+      || { echo "Could not download $f: check the ref." >&2; exit 1; }
+  done ) && cp .env.example .env.prod
 # Edit .env.prod: set your credentials, S3, email config
 # For SSL: also download docker-compose.https.yml, set DOMAIN and ACME_EMAIL,
 # and add -f docker-compose.https.yml below (see docs/deployment.md)

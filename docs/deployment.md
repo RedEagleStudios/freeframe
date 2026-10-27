@@ -75,15 +75,15 @@ This works from the first release after v1.21.0, the first that has these compos
 
 ```bash
 mkdir freeframe && cd freeframe
-for f in docker-compose.prod.yml docker-compose.images.yml .env.example; do
-  curl -fsSLO "https://raw.githubusercontent.com/Techiebutler/freeframe/latest/$f" \
-    || { echo "Could not download $f: stop here and check the ref." >&2; break; }
-done
-
-# Create your production environment file and edit it with your actual credentials.
+# Download the files, then create your production environment file and edit it with your
+# actual credentials. Nothing after the download runs unless every file arrived.
 # At minimum: change passwords, set FRONTEND_URL to your https:// URL, configure S3, email, and JWT_SECRET
-cp .env.example .env.prod
-nano .env.prod
+( set -e; for f in docker-compose.prod.yml docker-compose.images.yml .env.example; do
+    curl -fsSLO "https://raw.githubusercontent.com/Techiebutler/freeframe/latest/$f" \
+      || { echo "Could not download $f: check the ref." >&2; exit 1; }
+  done ) \
+  && cp .env.example .env.prod \
+  && nano .env.prod
 
 # Start all services (pulls the images, builds nothing)
 docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.images.yml up -d
@@ -92,7 +92,7 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose
 docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.images.yml ps
 ```
 
-`docker-compose.images.yml` only adds the image names to `docker-compose.prod.yml`. Its default version is the release the file belongs to, so the compose files and the images always match. Set `FREEFRAME_VERSION` in `.env.prod` (for example `1.21.0`, no leading `v`) to pin another version. Use the same `-f` flags for every later command, and add `-f docker-compose.https.yml` or `-f docker-compose.storage.yml` as you need them (both are downloaded the same way).
+`docker-compose.images.yml` only adds the image names to `docker-compose.prod.yml`. Its default version is the release the file belongs to, so the compose files and the images always match. Set `FREEFRAME_VERSION` in `.env.prod` (for example `1.22.0`, no leading `v`) to pin another version. Use the same `-f` flags for every later command, and add `-f docker-compose.https.yml` or `-f docker-compose.storage.yml` as you need them (both are downloaded the same way).
 
 The published web image is built for the domain root. For a sub-path deployment, a hardware-accelerated transcoder, or your own code changes, build from source.
 
@@ -618,12 +618,12 @@ Your media files are already in S3. For redundancy:
 
 ```bash
 cd freeframe
-for f in docker-compose.prod.yml docker-compose.images.yml; do
-  curl -fsSLO "https://raw.githubusercontent.com/Techiebutler/freeframe/latest/$f" \
-    || { echo "Could not download $f: stop here and check the ref." >&2; break; }
-done
-docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.images.yml pull
-docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.images.yml up -d
+( set -e; for f in docker-compose.prod.yml docker-compose.images.yml; do
+    curl -fsSLO "https://raw.githubusercontent.com/Techiebutler/freeframe/latest/$f" \
+      || { echo "Could not download $f: check the ref." >&2; exit 1; }
+  done ) \
+  && docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.images.yml pull \
+  && docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.images.yml up -d
 ```
 
 Download `docker-compose.https.yml` and `docker-compose.storage.yml` again too if you use them, and keep their `-f` flags in both commands. If you set `FREEFRAME_VERSION` in `.env.prod`, change it to the version you want (or remove it to follow the downloaded file). Keep your own changes in an extra `-f` file rather than editing the downloaded ones, so downloading again does not overwrite them.
