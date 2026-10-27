@@ -325,7 +325,7 @@ SCRIPT
 
 # ---------------------------------------------------------------- channel
 
-@test "update: --channel wins, is saved after a backup, and the command and files come from it" {
+@test "update: --channel wins, is saved with a settings backup, and the command and files come from it" {
   ff update --channel stable
   [ "$status" -eq 0 ] || { echo "$output"; false; }
   grep -qx "fetch stable deploy/freeframe" "$CALLS"
@@ -333,6 +333,42 @@ SCRIPT
   assert_not_called "fetch latest"
   assert_has "$ENV" "FREEFRAME_CHANNEL=stable"
   assert_has "$FF_ROOT/$(env_backups | head -1)" "FREEFRAME_CHANNEL=latest"
+}
+
+@test "update: --channel is not saved when the update fails, at any step" {
+  local knob
+  for knob in pull setup-files start; do
+    : >"$CALLS"
+    case $knob in
+      pull) STUB_PULL_FAIL=1 ff update --channel stable ;;
+      # The setup files of the channel cannot be downloaded (the command
+      # itself comes from the same ref, so only its files fail).
+      setup-files) STUB_FETCH_FAIL=docker-compose.prod.yml ff update --channel stable ;;
+      start) STUB_API_DOWN=1 FF_API_WAIT=10 ff update --channel stable ;;
+    esac
+    [ "$status" -eq 1 ] || { echo "$knob: $output"; false; }
+    assert_eq "$(env_get "$ENV" FREEFRAME_CHANNEL)" latest
+    assert_no_out "The channel is now stable"
+    rm -f "$FF_ROOT/.update-undo"
+  done
+}
+
+@test "update: --channel is not written by the settings fill of an update that then fails" {
+  # A settings file with no channel line (it follows latest).
+  grep -v '^FREEFRAME_CHANNEL=' "$ENV" >"$ENV.tmp"
+  mv "$ENV.tmp" "$ENV"
+  chmod 600 "$ENV"
+  STUB_API_DOWN=1 FF_API_WAIT=10 ff update --channel stable
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  [ "$(env_get "$ENV" FREEFRAME_CHANNEL)" != stable ]
+}
+
+@test "update: --channel is saved once the new version answers" {
+  ff update --channel stable
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_order "localhost:8000/health" "probe_health"
+  assert_has "$ENV" "FREEFRAME_CHANNEL=stable"
+  assert_out "The channel is now stable"
 }
 
 @test "update: without --channel the server's channel is used for the command and the files" {

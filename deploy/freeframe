@@ -403,6 +403,13 @@ _ff_check_channel() {
   fi
 }
 
+# ff_channel_saved FILE: the channel FILE keeps, ignoring --channel.
+ff_channel_saved() {
+  local ch
+  ch=$(env_get "$1" FREEFRAME_CHANNEL)
+  printf '%s' "${ch:-latest}"
+}
+
 # ff_save_channel FILE CH: make CH the channel saved in FILE (an explicit
 # --channel wins), backing FILE up first. Does nothing when it is already.
 ff_save_channel() {
@@ -3948,13 +3955,6 @@ cmd_update() {
   say "Saved the backup: $FF_UPDATE_BACKUP"
   FF_STATE+=" The backup taken first is $FF_UPDATE_BACKUP"
 
-  # An explicit --channel is saved now, so a re-run without it keeps it.
-  FF_STEP="saving the channel"
-  if ! ff_save_channel "$file" "$ch"; then
-    install_fail "The channel could not be saved in $file." \
-      "check that the disk is not full, then run sudo freeframe update --channel $ch again."
-  fi
-
   # Before anything is replaced: the setup files in use now, and the record
   # `freeframe rollback` goes back with.
   FF_STEP="saving the setup files in use"
@@ -3997,7 +3997,9 @@ cmd_update() {
   new=$(ff_version)
 
   FF_STEP="adding the settings the new release needs"
-  if ! fill_settings "$file"; then
+  # Without --channel: a file with no channel line gets the one it followed
+  # (latest), and --channel is saved only once the update has worked.
+  if ! FF_CHANNEL="" fill_settings "$file"; then
     _update_fail_undone "The settings could not be completed for the new release." \
       "fix what the message above says, then run sudo freeframe update again."
   fi
@@ -4037,6 +4039,11 @@ cmd_update() {
   # It answers: the way back is no longer needed, and no message names it.
   _update_undo_clear
   FF_UPDATE_PHASE=""
+  # An explicit --channel is saved only now, once the update worked, so a
+  # failed update leaves the channel as it was; later updates keep it.
+  if ! ff_save_channel "$file" "$ch"; then
+    warn "FreeFrame $new runs, but the $ch channel could not be saved in $file, so the next update follows $(ff_channel_saved "$file") again. To save it, run: sudo freeframe configure --yes --channel $ch"
+  fi
   FF_TRAP_HINT="the update itself is done. To refresh the nightly backup timer too, run sudo freeframe update again."
   FF_STATE="FreeFrame $new runs and answers at $url; only the nightly backup timer was still being refreshed (the one set up before keeps running)."
   FF_STEP="refreshing the nightly backups"
