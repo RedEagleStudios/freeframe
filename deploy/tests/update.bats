@@ -707,3 +707,44 @@ killed_update_state() {
   assert_no_out "FreeFrame runs version"
   assert_out "FreeFrame was updated from 1.21.0 to 1.22.0."
 }
+
+@test "update: a version pin edited by hand is named as such, not as an update that stopped" {
+  printf 'FREEFRAME_VERSION=1.22.5\n' >>"$ENV"
+  export STUB_RUNNING_IMAGE=ghcr.io/techiebutler/freeframe-api:1.22.0
+  ff update
+  assert_out "FreeFrame runs version 1.22.0, but FREEFRAME_VERSION in $ENV asks for 1.22.5."
+  assert_no_out "stopped part-way"
+}
+
+@test "update: files from another release under the running one are named without guessing why" {
+  local f
+  for f in $SETUP_NAMES; do cp "$STUB_REMOTE/$f" "$FF_ROOT/$f"; done
+  export STUB_RUNNING_IMAGE=ghcr.io/techiebutler/freeframe-api:1.21.0
+  ff update
+  assert_out "FreeFrame runs version 1.21.0, but the setup files here are for 1.22.0."
+  assert_no_out "stopped part-way"
+}
+
+@test "update: an earlier update's files put back, then a refusal, does not say nothing was changed" {
+  killed_update_state
+  printf 'FREEFRAME_VERSION=1.21.0\n' >>"$ENV"
+  ff update
+  [ "$status" -eq 1 ]
+  local f
+  for f in $SETUP_NAMES; do cmp "$FF_ROOT/rollback/$f" "$FF_ROOT/$f"; done
+  [ ! -e "$FF_ROOT/.update-undo" ]
+  assert_out "after 1.21.0"
+  assert_out "the setup files from before an earlier update that stopped part-way were put back first"
+  assert_no_out "othing was changed"
+  assert_no_out "othing has been changed"
+}
+
+@test "update: after an earlier update's files were put back, a failed command download says so" {
+  killed_update_state
+  export STUB_FETCH_FAIL=deploy/freeframe
+  ff update
+  [ "$status" -eq 1 ]
+  assert_out "Could not download the freeframe command"
+  assert_out "were put back first"
+  assert_no_out "othing was changed"
+}

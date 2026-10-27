@@ -3462,6 +3462,7 @@ _ff_reexec() {
   export FF_SELF_UPDATED=1
   # The update holds the lock; the new command carries on with it.
   if [[ -n ${FF_LOCK_FD:-} ]]; then export FF_LOCK_FD; fi
+  if [[ -n ${FF_UPDATE_PUT_BACK:-} ]]; then export FF_UPDATE_PUT_BACK; fi
   exec bash "$path" "$@"
 }
 
@@ -3479,17 +3480,17 @@ update_self() {
   say "Checking for a newer freeframe command on the $ch channel..."
   if ! { mkdir -p "$dir" && fetch "$ch" deploy/freeframe "$new" 2>/dev/null; }; then
     rm -f "$new"
-    _ff_stop 1 "Could not download the freeframe command for the $ch channel, so nothing was changed." \
+    _ff_stop 1 "Could not download the freeframe command for the $ch channel, so $(_update_unchanged)." \
       "check that this server can reach raw.githubusercontent.com, then run sudo freeframe update again."
   fi
   if [[ $(head -n 1 "$new") != '#!/usr/bin/env bash' ]] || ! bash -n "$new" 2>/dev/null; then
     rm -f "$new"
-    _ff_stop 1 "What was downloaded for the $ch channel is not a complete freeframe command, so nothing was changed." \
+    _ff_stop 1 "What was downloaded for the $ch channel is not a complete freeframe command, so $(_update_unchanged)." \
       "run sudo freeframe update again in a few minutes. If it keeps happening, report it at https://github.com/Techiebutler/freeframe/issues"
   fi
   if ! grep -qx "FF_SCRIPT_KIND=$FF_SCRIPT_KIND" "$new" || ! grep -q '^cmd_update() {' "$new"; then
     rm -f "$new"
-    _ff_stop 1 "What was downloaded for the $ch channel is not the freeframe command, so nothing was changed." \
+    _ff_stop 1 "What was downloaded for the $ch channel is not the freeframe command, so $(_update_unchanged)." \
       "check that the channel is right (--channel stable or --channel latest), then run sudo freeframe update again."
   fi
   # Compared before the command is replaced: the script running now is
@@ -3500,7 +3501,7 @@ update_self() {
   else
     if ! { chmod 755 "$new" && mv -f "$new" "$target"; }; then
       rm -f "$new"
-      _ff_stop 1 "The freeframe command could not be replaced in $dir, so nothing was changed." \
+      _ff_stop 1 "The freeframe command could not be replaced in $dir, so $(_update_unchanged)." \
         "check that the disk is not full or read-only, then run sudo freeframe update again."
     fi
     say "The freeframe command was updated; continuing with the new one."
@@ -3650,6 +3651,16 @@ _ff_running_version() {
   printf '%s' "${tag#v}"
 }
 
+# _update_unchanged: "nothing was changed", or, once this update has put an
+# earlier one's setup files back (FF_UPDATE_PUT_BACK), what it did change.
+_update_unchanged() {
+  if [[ -n ${FF_UPDATE_PUT_BACK:-} ]]; then
+    printf 'nothing else was changed (the setup files from before an earlier update that stopped part-way were put back first)'
+  else
+    printf 'nothing was changed'
+  fi
+}
+
 # cmd_update: `freeframe update`. Updates the freeframe command itself first
 # (and runs the new one), then: a database backup, the channel's setup files
 # and backup units, the fill-missing settings merge, the new images, a
@@ -3670,6 +3681,7 @@ cmd_update() {
       "to change the web address, email or storage, run: sudo freeframe configure"
   fi
   _ff_need_finished_install update
+  FF_UPDATE_PUT_BACK=${FF_SELF_UPDATED:+${FF_UPDATE_PUT_BACK:-}}
   # The lock comes before anything is read or changed: a second update (from
   # another SSH session, say) must not touch a running one's files or record.
   if ! _ff_lock; then
@@ -3687,6 +3699,7 @@ cmd_update() {
           "to put everything back as it was before that update, run: sudo freeframe rollback"
       fi
       _update_undo_clear
+      FF_UPDATE_PUT_BACK=1
     else
       # Its new version was started (and did not come up): removing the
       # record is right only when that new version works, so it is offered
@@ -3708,12 +3721,12 @@ cmd_update() {
   if [[ -n $pinned ]]; then
     ref="v${pinned#v}"
     if ! _ff_valid_ref "$ref"; then
-      _ff_stop 1 "FREEFRAME_VERSION in $file ('$pinned') is not a release number, so nothing was changed." \
+      _ff_stop 1 "FREEFRAME_VERSION in $file ('$pinned') is not a release number, so $(_update_unchanged)." \
         "set it to a release such as 1.22.0, or delete the FREEFRAME_VERSION line to follow the $ch channel."
     fi
     # Releases up to 1.21.0 have no setup files for this command.
     if ! _ff_version_gt "$pinned" 1.21.0; then
-      _ff_stop 1 "This server is pinned to version $pinned (FREEFRAME_VERSION in $file), and freeframe update can only manage releases after 1.21.0, which have the setup files it needs. Nothing was changed." \
+      _ff_stop 1 "This server is pinned to version $pinned (FREEFRAME_VERSION in $file), and freeframe update can only manage releases after 1.21.0, which have the setup files it needs, so $(_update_unchanged)." \
         "delete the FREEFRAME_VERSION line from $file to follow the $ch channel, then run sudo freeframe update."
     fi
   fi
@@ -3726,6 +3739,9 @@ cmd_update() {
   FF_ADMIN_CREATED="" FF_PW_GENERATED=""
   FF_RERUN="sudo freeframe update"
   FF_STATE="Nothing has been changed; FreeFrame is running as before."
+  if [[ -n $FF_UPDATE_PUT_BACK ]]; then
+    FF_STATE="FreeFrame is running as before; the setup files from before an earlier update that stopped part-way were put back first."
+  fi
   FF_UPDATE_PHASE="" FF_TRAP_HINT=""
   _install_log_start update
   _ff_cmd_traps
@@ -3736,7 +3752,13 @@ cmd_update() {
   old=$(ff_version)
   running=$(_ff_running_version)
   if [[ -n $running && $running != "$old" ]]; then
-    say "FreeFrame runs version $running, but the setup files here are for $old (an earlier update stopped part-way)."
+    # Said as it is: the files may be another release's because an update
+    # stopped part-way, or FREEFRAME_VERSION may have been edited by hand.
+    if [[ -n $pinned ]]; then
+      say "FreeFrame runs version $running, but FREEFRAME_VERSION in $file asks for $old."
+    else
+      say "FreeFrame runs version $running, but the setup files here are for $old."
+    fi
     say "The setup files of release v$running are kept as the way back."
     save_ref="v$running"
     new=$old
@@ -3751,7 +3773,7 @@ cmd_update() {
   fi
   FF_UPDATE_BACKUP=$FF_BACKUP_MADE
   say "Saved the backup: $FF_UPDATE_BACKUP"
-  FF_STATE="Nothing has been changed; FreeFrame is running as before. The backup taken first is $FF_UPDATE_BACKUP"
+  FF_STATE+=" The backup taken first is $FF_UPDATE_BACKUP"
 
   # An explicit --channel is saved now, so a re-run without it keeps it.
   FF_STEP="saving the channel"
