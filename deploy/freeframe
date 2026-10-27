@@ -3476,7 +3476,7 @@ remote_version() {
   if [[ -n ${FF_FETCH_FROM_DIR:-} ]]; then
     out=$(cat "$FF_FETCH_FROM_DIR/docker-compose.images.yml" 2>/dev/null) || return 1
   else
-    out=$(curl -fsSL --max-time 10 "$FF_RAW_BASE/$1/docker-compose.images.yml" 2>/dev/null) || return 1
+    out=$(curl -fsSL --retry 2 --max-time 10 "$FF_RAW_BASE/$1/docker-compose.images.yml" 2>/dev/null) || return 1
   fi
   _ff_version_in "$out"
 }
