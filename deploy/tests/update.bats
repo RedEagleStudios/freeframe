@@ -560,3 +560,6 @@ assert_put_back() {
   assert_out "delete the FREEFRAME_VERSION line"
 }
 
+@test "every rollback hint uses the same command, sudo freeframe rollback" {
+  if grep -n 'freeframe rollback --yes' "$FF_SCRIPT"; then false; fi
+}

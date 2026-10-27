@@ -109,7 +109,7 @@ assert_not_started() {
   ff rollback --yes
   [ "$status" -eq 1 ]
   assert_not_started
-  assert_out "To try again, run: sudo freeframe rollback --yes"
+  assert_out "To try again, run: sudo freeframe rollback"
   # The other undo command (the copy of what the update left) is not offered.
   assert_no_out "sudo freeframe restore --yes"
   [ -e "$FF_ROOT/.update-undo" ]
@@ -220,4 +220,42 @@ assert_not_started() {
   ff status
   [ "$status" -eq 0 ]
   assert_out "An update did not finish. To go back to 1.21.0, run: sudo freeframe rollback"
+}
+
+@test "rollback: compose files that do not parse are no dead end: it stops by project label" {
+  failed_update
+  export STUB_CONFIG_FAIL_NEW=1
+  ff rollback --yes
+  [ "$status" -eq 0 ] || { echo "$output"; cat "$CALLS"; false; }
+  grep -q "^docker ps --filter label=com.docker.compose.project=freeframe" "$CALLS"
+  grep -qx "docker stop c1 c4" "$CALLS"
+  assert_files_from_before
+}
+
+@test "rollback: a saved set without the main compose files is refused before anything changes" {
+  failed_update
+  rm "$FF_ROOT/rollback/docker-compose.images.yml"
+  cp "$FF_ROOT/docker-compose.images.yml" "$BATS_TEST_TMPDIR/images.now"
+  ff rollback --yes
+  [ "$status" -eq 1 ]
+  assert_out "incomplete"
+  cmp "$BATS_TEST_TMPDIR/images.now" "$FF_ROOT/docker-compose.images.yml"
+  assert_not_called "dc "
+}
+
+@test "rollback: install answers are refused, as update does" {
+  failed_update
+  ff rollback --yes --domain review.yourstudio.com
+  [ "$status" -eq 2 ]
+  assert_out "sudo freeframe configure"
+  assert_not_called "dc "
+}
+
+@test "rollback: failure hints use sudo freeframe rollback, not a --yes form" {
+  failed_update
+  export STUB_RESTORE_FAIL=1
+  ff rollback --yes
+  [ "$status" -eq 1 ]
+  assert_out "To try again, run: sudo freeframe rollback"
+  assert_no_out "rollback --yes"
 }

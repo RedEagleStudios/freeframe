@@ -3833,6 +3833,25 @@ cmd_update() {
   _install_log_stop
 }
 
+# _ff_stop_project_app: stop this install's containers (compose project
+# freeframe) except postgres and traefik, found by their labels, without
+# reading the compose files.
+_ff_stop_project_app() {
+  local out line
+  local -a ids=()
+  out=$(docker ps --filter label=com.docker.compose.project=freeframe \
+    --format '{{.ID}}|{{.Label "com.docker.compose.service"}}' 2>>"${FF_LOG:-/dev/null}") || return 1
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    case ${line#*|} in
+      postgres | traefik) ;;
+      *) ids+=("${line%%|*}") ;;
+    esac
+  done <<<"$out"
+  ((${#ids[@]})) || return 0
+  _ff_logged docker stop "${ids[@]}"
+}
+
 # cmd_rollback: `freeframe rollback`: take the server back to the version
 # it had before an update that did not end well, with the database as it was
 # just before that update. In order: stop the app containers, put the setup
@@ -3842,13 +3861,18 @@ cmd_update() {
 # update left), then start and wait for health, and drop the record. Every
 # step can be repeated, so running it again after a failure is safe.
 cmd_rollback() {
-  local root file old backup when out s url mode host
+  local root file old backup when out s url mode host answers f
   local -a all=() svcs=()
   root=$(ff_root)
   file="$root/.env.prod"
   if ((${#FF_ARGS[@]})); then _ff_bad_usage "freeframe rollback takes no other words."; fi
   _ff_need_root rollback
   _ff_need_install
+  answers=$(_ff_given_answers)
+  if [[ -n $answers ]]; then
+    _ff_stop 2 "freeframe rollback takes no answers ($answers was given), so nothing was changed." \
+      "to change the web address, email or storage, run: sudo freeframe configure"
+  fi
   if ! _update_undo_read; then
     say "There is no update to roll back: the last update finished (or none was made), so nothing was changed."
     say "To put back an older copy of the database instead, see: sudo freeframe restore"
@@ -3867,11 +3891,19 @@ cmd_rollback() {
     _ff_stop 1 "The setup files saved before the update ($root/rollback) are missing, so nothing was changed." \
       "to put the database back as it was before the update, run: sudo freeframe restore --yes $(_ff_q "$backup")"
   fi
+  # A file missing from the saved set reads as "new in that release" and is
+  # removed when the set goes back, so the two every server has must be there.
+  for f in docker-compose.prod.yml docker-compose.images.yml; do
+    if [[ ! -s $root/rollback/$f ]]; then
+      _ff_stop 1 "The setup files saved before the update ($root/rollback) are incomplete: $f is missing, so nothing was changed." \
+        "to put the database back as it was before the update, run: sudo freeframe restore --yes $(_ff_q "$backup")"
+    fi
+  done
   when=$(_ff_stamp_date "${backup##*/}")
   if [[ -z ${FF_YES:-} ]]; then
     if ! _ff_has_tty; then
       _ff_stop 2 "Rolling back replaces FreeFrame's database, so it needs a yes, and there is no terminal here to ask." \
-        "run it in a terminal, or add --yes: sudo freeframe rollback --yes"
+        "run sudo freeframe rollback in a terminal, or add --yes to it."
     fi
     say "This takes FreeFrame back to version $old, as it was before the update${FF_UNDO_TIME:+ of $FF_UNDO_TIME}:"
     say "  the setup files and the version go back to $old, and the database goes back to the backup"
@@ -3891,7 +3923,7 @@ cmd_rollback() {
   FF_ACTOR="the rollback"
   FF_STOPPED=()
   FF_ADMIN_CREATED="" FF_PW_GENERATED=""
-  FF_RERUN="sudo freeframe rollback --yes"
+  FF_RERUN="sudo freeframe rollback"
   FF_STATE="Nothing has been changed."
   FF_STATE_PREFIX=""
   FF_RECORD_NEW="" FF_DROP_STARTED="" FF_RESTORE_FILE=$backup
@@ -3910,7 +3942,9 @@ cmd_rollback() {
     if ((${#svcs[@]})) && ! _ff_logged dc stop "${svcs[@]}"; then
       install_fail "FreeFrame could not be stopped." "the reason is at the end of $FF_LOG. Then run: sudo freeframe rollback"
     fi
-  elif ! _ff_logged dc stop; then
+  # The compose files in place may be the very thing that is broken: then
+  # the containers are found by their compose project instead.
+  elif ! _ff_stop_project_app; then
     install_fail "FreeFrame could not be stopped." "the reason is at the end of $FF_LOG. Then run: sudo freeframe rollback"
   fi
   FF_STATE="FreeFrame is stopped; nothing else has been changed. Running sudo freeframe rollback again is safe."
