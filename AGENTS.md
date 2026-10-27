@@ -104,6 +104,31 @@ pnpm --filter web exec tsc --noEmit   # type check
 pnpm --filter web lint
 ```
 
+**Installer** (`install.sh`, `deploy/freeframe`; CI's `installer` job runs these on
+Ubuntu 24.04 with pinned ShellCheck 0.11.0 and bats-core 1.14.0):
+
+```bash
+shellcheck -x install.sh deploy/freeframe deploy/tests/ci-e2e.sh
+bats --count deploy/tests   # CI fails below 450 tests, a floor against deleted tests
+bats --timing deploy/tests  # needs bats-core 1.5 or newer (Ubuntu 22.04's apt bats is too old)
+
+# without a recent bats, or on macOS (the Alpine image skips the few tests that
+# need flock, setsid or systemd-analyze):
+docker run --rm -v "$PWD:/code" -w /code bats/bats:latest deploy/tests
+```
+
+The installer end-to-end job (`installer-e2e`) runs `bash deploy/tests/ci-e2e.sh PHASE`
+for each of `prepare`, `foreign`, `build`, `install`, `api`, `backup-restore`, `update`,
+`rerun` and `status` (and `diagnose` on failure), in that order, on a GitHub runner.
+**Never run it on your machine:** it uses sudo, writes `/opt/freeframe` and
+`/usr/local/bin/freeframe`, and starts a compose project named `freeframe`, the name a dev
+FreeFrame uses too (it refuses to run outside GitHub Actions). On a pull request it runs
+only when the change touches `deploy/**`, `install.sh`, `docker-compose*.yml`,
+`apps/*/Dockerfile.prod*`, `apps/*/docker-entrypoint.sh`, `*.dockerignore` or
+`.github/workflows/ci.yml`; every push to main runs it.
+
+After #585 merges, CI also lints the workflows: run `actionlint` from the repo root.
+
 > **Use the Node version in [`.nvmrc`](.nvmrc).** CI reads it, and so do `nvm use` and `fnm`.
 > A different system Node can fail tests that pass in CI. CI also checks that npm, which
 > `docker-compose.dev.yml` installs `apps/web` with, can still resolve `apps/web/package.json`.
