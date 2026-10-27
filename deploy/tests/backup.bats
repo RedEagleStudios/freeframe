@@ -770,6 +770,37 @@ dumps() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null) || true; }
   assert_eq "$(cat "$FF_ROOT/.restore-undo")" "$BK/$safety"
 }
 
+@test "restore: an early stop while an earlier restore is unfinished keeps FreeFrame stopped and names the command that works" {
+  old_backup 20261019-030000 "the copy from before"
+  old_backup 20261020-030000
+  # An earlier restore left the database empty, with its undo record.
+  printf '%s\n' "$BK/freeframe-20261019-030000.dump" >"$FF_ROOT/.restore-undo"
+  printf 'empty' >"$STUB_DIR/dbstate"
+  export STUB_STOP_FAIL=1
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  # Not started on a database that may be empty, and restart (which refuses
+  # then) is not what it suggests.
+  [ "$(grep -c '^dc up -d --no-build$' "$CALLS")" -eq 0 ]
+  if [[ $output == *"sudo freeframe restart"* ]]; then echo "$output"; false; fi
+  assert_out "an earlier restore did not finish"
+  assert_out "To finish, run: sudo freeframe restore --yes '$BK/freeframe-20261020-030000.dump'"
+  assert_out "sudo freeframe restore --yes '$BK/freeframe-20261019-030000.dump'"
+  assert_eq "$(cat "$FF_ROOT/.restore-undo")" "$BK/freeframe-20261019-030000.dump"
+}
+
+@test "restore: interrupted while stopping with an earlier restore unfinished, it does not suggest restart" {
+  old_backup 20261019-030000
+  old_backup 20261020-030000
+  printf '%s\n' "$BK/freeframe-20261019-030000.dump" >"$FF_ROOT/.restore-undo"
+  printf 'empty' >"$STUB_DIR/dbstate"
+  export STUB_STOP_HANG=1
+  ff_signal TERM stop restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 1 ]
+  if [[ $output == *"sudo freeframe restart"* ]]; then echo "$output"; false; fi
+  assert_out "To finish, run: sudo freeframe restore --yes '$BK/freeframe-20261020-030000.dump'"
+}
+
 @test "restore: createdb failing after the drop says the database is gone and how to retry" {
   old_backup 20261020-030000
   export STUB_CREATE_FAIL=1

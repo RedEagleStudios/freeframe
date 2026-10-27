@@ -2948,9 +2948,31 @@ _restore_fail() {
   install_fail "$2" "$3"
 }
 
+# _restore_start_hint: how to get FreeFrame going after a restore stopped
+# before the drop: restart, unless an earlier restore that did not finish
+# left the database possibly empty (restart refuses then, and starting
+# FreeFrame would open its setup page): then finish or undo that restore.
+_restore_start_hint() {
+  local undo
+  undo=$(_restore_undo_path)
+  if [[ -z $undo ]]; then
+    printf 'To start FreeFrame again as it was, run: sudo freeframe restart'
+    return 0
+  fi
+  printf 'FreeFrame stays stopped: an earlier restore did not finish, so the database may be empty. To finish, run: %s' "$FF_RERUN"
+  if [[ $undo != "${FF_RESTORE_FILE:-}" ]]; then
+    printf '. To go back to the data as it was before that restore instead, run: sudo freeframe restore --yes %s' "$(_ff_q "$undo")"
+  fi
+}
+
 # _restore_restart: start FreeFrame again after a step that changed nothing
-# failed, and print the sentence that says whether that worked.
+# failed, and print the sentence that says whether that worked. While an
+# earlier restore's undo record stands it starts nothing and says why.
 _restore_restart() {
+  if [[ -n $(_restore_undo_path) ]]; then
+    _restore_start_hint
+    return 0
+  fi
   if _ff_logged dc up -d --no-build; then
     printf 'FreeFrame has been started again.'
   else
@@ -3075,12 +3097,12 @@ cmd_restore() {
     if [[ -n $s && $s != postgres && $s != traefik ]]; then svcs+=("$s"); fi
   done
   say "Stopping FreeFrame (its web address shows an error until the restore is done)..."
-  FF_STATE="FreeFrame may be partly stopped; the database has not been changed. To start FreeFrame again as it was, run: sudo freeframe restart"
+  FF_STATE="FreeFrame may be partly stopped; the database has not been changed. $(_restore_start_hint)"
   if ((${#svcs[@]})) && ! _ff_logged dc stop "${svcs[@]}"; then
     _restore_fail "$(_restore_restart)" "FreeFrame could not be stopped, so nothing was changed." \
       "run: $FF_RERUN. The reason is at the end of the log."
   fi
-  FF_STATE="FreeFrame is stopped and the database has not been changed. To start FreeFrame again as it was, run: sudo freeframe restart"
+  FF_STATE="FreeFrame is stopped and the database has not been changed. $(_restore_start_hint)"
 
   # Whether a copy is needed is asked through the maintenance database: an
   # absent or empty database has nothing to save, and one that exists but
