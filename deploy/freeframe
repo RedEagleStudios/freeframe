@@ -3615,11 +3615,12 @@ _update_undo_change() {
   return 1
 }
 
-# _update_fail_undone MESSAGE WHAT_TO_TRY: an update that stops before the
-# new version started: the setup files from before go back first, and the
-# advice is the rollback when they could not.
+# _update_fail_undone MESSAGE WHAT_TO_TRY [MESSAGE_IF_PUT_BACK]: an update
+# that stops before the new version started: the setup files from before go
+# back first, and the advice is the rollback when they could not. When they
+# went back, MESSAGE_IF_PUT_BACK (if given) replaces MESSAGE.
 _update_fail_undone() {
-  if _update_undo_change "$FF_UPDATE_OLD"; then install_fail "$1" "$2"; fi
+  if _update_undo_change "$FF_UPDATE_OLD"; then install_fail "${3:-$1}" "$2"; fi
   install_fail "$1" "$FF_TRAP_HINT"
 }
 
@@ -3777,7 +3778,9 @@ cmd_update() {
     if [[ -n $pinned && $FF_FETCH_STAGE == download ]]; then
       try="check that this server can reach raw.githubusercontent.com. If it can, release $ref does not have these files: delete the FREEFRAME_VERSION line from $file to follow the $ch channel, then run sudo freeframe update."
     fi
-    _update_fail_undone "$(_ff_fetch_failure "$([[ -n $pinned ]] && printf 'release %s' "$ref" || printf 'the %s channel' "$ch")")" "$try"
+    # A mixed set the saved copy then put back whole is not reported as mixed.
+    _update_fail_undone "$(_ff_fetch_failure "$([[ -n $pinned ]] && printf 'release %s' "$ref" || printf 'the %s channel' "$ch")")" "$try" \
+      "$([[ -n $FF_FETCH_MIXED ]] && printf 'The new %s could not be put in place; the setup files from before were put back from the copy saved before the update.' "${FF_FETCH_FAILED:-setup files}")"
   fi
   new=$(ff_version)
 

@@ -575,7 +575,9 @@ started_record() {
   export STUB_MV_FAIL=docker-compose.storage.yml STUB_MV_OLD_FAIL=docker-compose.images.yml
   ff update
   [ "$status" -eq 1 ]
-  assert_out "could not be put back either"
+  # The saved copy put them back, so the headline does not say otherwise.
+  assert_no_out "could not be put back either"
+  assert_out "The new docker-compose.storage.yml could not be put in place; the setup files from before were put back from the copy saved before the update."
   assert_put_back
 }
 
