@@ -4,6 +4,217 @@ This guide covers deploying FreeFrame to a production server using Docker Compos
 
 ---
 
+## Install on a fresh server
+
+This is the easiest way to run FreeFrame, and the one we recommend if you have not run a server before. You rent a small Linux server, paste one command, and answer five questions. The installer does the rest: it sets up Docker (the program FreeFrame runs inside), starts FreeFrame, gets a free HTTPS certificate, creates your admin account and turns on nightly backups. It takes a few minutes.
+
+The manual ways further down this guide ([run the published images](#run-the-published-images) and [build from source](#build-from-source)) stay fully supported. Use them if you already run servers your own way, or if your server cannot use the installer.
+
+### 1. Rent a server
+
+You need a server that nothing else important runs on, with:
+
+- **Operating system:** Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13. The processor can be amd64 (also called x86_64) or arm64. Pick "Ubuntu 24.04" when the provider asks which system to install.
+- **Size:** the [hardware table](#hardware-requirements) below has the details. For a small team, 2 CPU cores, 4 GB of memory and 20 GB of disk is the minimum, and 4 cores, 8 GB and 50 GB is a good start. The installer refuses a server with less than about 2 GB of memory, and warns below 4 GB. If you keep footage on the server itself, more disk helps: roughly 20 GB per hour of 1080p footage, counting the original and the copies FreeFrame makes for reviewing.
+- **Ports 80 and 443 reachable from the internet.** Port 80 is plain web traffic and port 443 is secure (HTTPS) web traffic. Most providers call this the "firewall" or "security group" of the server; open both. FreeFrame needs port 80 even when it serves HTTPS, because that is how the certificate is issued.
+- **A way to log in as an administrator,** usually SSH with a user that can run `sudo` (or the root user). Your provider shows you how.
+
+Any provider works: Hetzner, DigitalOcean, AWS, Google Cloud, Azure, Hostinger, or a server in your own office. See [Deployment Options](#deployment-options) for sizes and prices.
+
+### 2. Run the command
+
+Log in to the server and run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/latest/install.sh | sudo bash
+```
+
+This downloads a small script and runs it as the administrator (`sudo`). The script runs `freeframe install`, which checks the server first and changes nothing if a check fails. You can read the script before running it: it is [`install.sh`](../install.sh) in this repository.
+
+`latest` is the newest published release. We will switch this command to `stable`, the release we have validated for production, once the first release containing the installer has been promoted there.
+
+If you need to set a variable (see [Unattended installs](#unattended-installs-cloud-init-ansible) below), put it after `sudo`, because `sudo` drops variables set before it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/latest/install.sh | sudo FREEFRAME_CHANNEL=latest bash
+```
+
+What the installer does, in order:
+
+1. Checks the system, the memory and disk, that nothing else is using ports 80 and 443, and that the server can reach the internet.
+2. Asks you the questions below, and shows a summary to confirm.
+3. Installs Docker from Docker's own repository if the server has none. If the server has less than 4 GB of memory and no swap (spare memory on disk), it adds a 2 GB swap file. If the `ufw` firewall is on, it allows web traffic and SSH.
+4. Waits for your domain's DNS to point at the server, if you gave a domain.
+5. Downloads FreeFrame (about 2 GB, a few minutes), starts it, and creates your admin account before opening it to the outside.
+6. Waits for the HTTPS certificate and turns on the nightly backup.
+
+Everything it does is also written to `/opt/freeframe/install.log`. FreeFrame lives in `/opt/freeframe` from now on.
+
+### 3. The questions
+
+**1. Web address.** The address your team types in the browser. You have three choices:
+
+- **Your own domain**, for example `review.yourstudio.com`. This is the right choice for real use. You will need to point the domain at the server first; see [The DNS step](#the-dns-step) below.
+- **The free automatic address**: press Enter, and FreeFrame uses an address of the form `<your-server-ip>.sslip.io` (for example `203.0.113.10.sslip.io`) with a real HTTPS certificate. sslip.io is a free public service that turns any IP address into a name. It is temporary: it is fine for trying FreeFrame, but it belongs to the IP address, so use your own domain for production. You can switch later with `sudo freeframe configure`.
+- **This network only.** For a server inside an office that people reach only from the office network. FreeFrame then uses plain HTTP on the server's own address, with no certificate. See [A server in your office](#a-server-in-your-office-behind-a-router-nat) below.
+
+**2. Email for certificate notices.** Only asked when you use HTTPS. Let's Encrypt, the free service that issues the HTTPS certificate, writes to this address if something needs attention, such as a certificate that cannot be renewed. Use an address that someone reads.
+
+**3. Where footage is kept.**
+
+- **On this server** (the simplest). Uploaded files live on the server's disk. The installer tells you roughly how many hours of 1080p footage fit.
+- **In an S3 bucket you already have** (AWS S3, Cloudflare R2, Backblaze B2, DigitalOcean Spaces). "S3" is the standard way storage services share files. The installer asks for the bucket's address (endpoint; press Enter for AWS S3), bucket name, access key, secret key and region (for Cloudflare R2 type `auto`), all of which your storage provider shows you. For AWS S3 the installer prints, at the end, the CORS rules to paste into the bucket so that browsers may upload to it (AWS does not set them for you).
+
+**4. Email (SMTP).** FreeFrame sends sign-in codes and invitations by email. Type your mail provider's server address (for example `smtp.postmarkapp.com`), then its port (usually 587), user name, password and the address emails are sent from. Press Enter at the first question to skip it and add email later with `sudo freeframe configure`.
+
+> **Without email, sign-in codes and invitation emails are not sent, and there is no password reset.** Invitation links can still be copied from the admin page and sent by hand. You sign in as the admin with the password you choose, so you are not locked out. Setting up email is worth doing before you invite a team.
+
+**5. Your admin account.** Your name, your email address, and a password of 8 to 72 characters. If you press Enter instead of choosing a password, the installer makes a strong one for you, **shows it once on the screen at the end, and saves it nowhere**. Write it down before you close the window.
+
+Then the installer shows what it is about to do and asks `Install now? [Y/n]`.
+
+### The DNS step
+
+If you chose your own domain, FreeFrame needs the domain to lead to your server before it can get a certificate.
+
+**DNS** is the internet's address book. It says which server a name like `review.yourstudio.com` belongs to. An **A record** is one entry in it: a name, and the IP address of the server.
+
+You manage DNS at the company where you bought the domain, or at whoever you pointed it to (a "nameserver" provider such as Cloudflare). Look for a menu called **DNS**, **DNS records**, **DNS management** or **Advanced DNS**:
+
+- **GoDaddy:** My Products, next to your domain choose DNS.
+- **Namecheap:** Domain List, Manage next to your domain, then the Advanced DNS tab.
+- **Cloudflare:** pick the domain, then DNS, then Records.
+- **Google Domains, Squarespace Domains and most others:** open the domain, then look for DNS or DNS settings.
+- **Hetzner, DigitalOcean, AWS Route 53 and other cloud providers:** their DNS or Networking section, under the domain.
+
+Add an A record with the name of your address and the server's IP address as the value. The installer prints exactly what to add, for example:
+
+```
+Add an A record with the name review and the value 203.0.113.10   (for review.yourstudio.com)
+Add an A record with the name storage.review and the value 203.0.113.10   (for storage.review.yourstudio.com)
+```
+
+The second line appears when footage is kept on the server: uploads go to a second name, `storage.` followed by your address. If a name already has an AAAA record (the IPv6 version of an A record), remove it unless it points at this server. If you use Cloudflare, set the records to "DNS only" (grey cloud, not the orange proxied cloud): the installer checks that the name leads to the server itself, and the certificate is issued to the server.
+
+New records usually work within a few minutes, and sometimes take up to an hour. The installer **waits until DNS points at the server**, checking every 15 seconds, so a typing mistake never uses up Let's Encrypt's limited attempts. With a terminal you can press Enter to check now, type `c` and Enter to continue anyway (the certificate then waits until the records work), or type `s` and Enter to use the free automatic address instead. Without a terminal it waits up to 30 minutes, then stops and tells you to run it again once the records work.
+
+### A server in your office (behind a router, NAT)
+
+A server in an office or at home usually sits behind a router. It has a private address on the office network (like `192.168.1.50`) and shares one public address with everything else. This is called NAT. The installer notices it and, at the first question, offers **this network only** (type `local`).
+
+- **To use FreeFrame inside the office only,** choose `local`. FreeFrame then answers on plain HTTP at the server's own address, for example `http://192.168.1.50`. Browsers mark it "Not secure"; that is normal on a private network. If footage is kept on the server, uploads also use port 9000 on the server.
+- **To reach FreeFrame from outside the office,** the router must **forward ports 80 and 443 to the server** (a "port forward" or "virtual server" rule in the router's settings), and you should use a domain pointing at the office's public address. The automatic `sslip.io` address also needs the same forwarding. If ports 80 and 443 are not forwarded, the certificate cannot be issued, and the installer falls back to plain HTTP on the server's local address after a few minutes. It says so when it does.
+
+Cloud servers (AWS, Google Cloud, Azure) behave like normal public servers: open ports 80 and 443 in the provider's firewall or security group and everything works as described above. Because these servers have a private address inside the provider's network, the installer may show the same "router" hint; ignore it and press Enter or type your domain.
+
+### When it finishes
+
+The installer ends with a summary: your web address, your admin email, where the settings, backups and log are, and the commands you will need. Open the address in a browser and **sign in** with the admin email and password.
+
+Then:
+
+1. **Invite people.** Open the admin area, add their email addresses and choose their role. Without [email set up](#3-the-questions), copy each invitation link from the admin page and send it yourself.
+2. **Create a project** and upload a first clip to see it work.
+3. **Copy the backups somewhere else** from time to time; see [Backups](#backups-with-the-installer) below.
+
+### Looking after FreeFrame
+
+After the install, the `freeframe` command is on the server. All commands need `sudo`. `sudo freeframe help` lists them.
+
+| Command | What it does |
+|---|---|
+| `sudo freeframe status` | Shows the version, whether everything is running, disk space, backups, and whether a newer release is out. |
+| `sudo freeframe update` | Backs up the database, then moves to the newest release on your channel (it updates the `freeframe` command first). |
+| `sudo freeframe rollback` | After an update that did not come up: goes back to the version from before, with the database as it was just before the update. |
+| `sudo freeframe configure` | Changes the answers you gave: web address, email, storage. With `--yes`, give only the new answers as options. |
+| `sudo freeframe backup` | Saves a copy of the database to `/opt/freeframe/backups` now (this also runs every night at 3:00; the newest 7 are kept). |
+| `sudo freeframe restore` | Lists the backups. `sudo freeframe restore FILE` puts one back (replaces the current database, after saving a copy of it). |
+| `sudo freeframe logs` | Shows FreeFrame's recent messages and follows new ones (Ctrl-C stops). `sudo freeframe logs api` shows one part only. |
+| `sudo freeframe restart` | Restarts every part of FreeFrame and waits until it answers. |
+
+**Updating.** Run `sudo freeframe update`. It saves a backup of the database first, then downloads and starts the new version, and prints the version before and after. If the new version does not come up, it says so and tells you to run `sudo freeframe rollback`. The rollback puts back the previous version and the database as it was just before the update, so anything people did in FreeFrame after the update began is lost. It keeps the server on the old version until you remove the `FREEFRAME_VERSION` line from `/opt/freeframe/.env.prod`.
+
+**Changing settings later.** To add email, move to your own domain or change storage keys, run `sudo freeframe configure`. It saves a copy of the settings file first and changes only what you changed. It does not move uploaded media between storage places.
+
+### Backups with the installer
+
+- **Nightly at 03:00** (server time), the installer's timer saves a copy of the database and of the settings file to `/opt/freeframe/backups`. The newest 7 are kept. `sudo freeframe backup` makes one right now.
+- **They are on the same server.** If the server is lost, so are they. Copy the newest `.dump` file and `/opt/freeframe/.env.prod` to another computer or storage now and then. The files are readable by the administrator only, so copy them as that user, for example with `sudo cat` or by logging in as root.
+- **Uploaded media is not in these backups** when footage is kept on the server (it can be very large). If you use your own S3 bucket, the media stays in the bucket; see [S3 Media Backup](#s3-media-backup) for keeping a second copy.
+- **To put a backup back:** `sudo freeframe restore` lists them; `sudo freeframe restore FILE` restores one. It asks first, saves a copy of the current database, and then replaces it.
+
+### Moving to a new server
+
+1. On the old server run `sudo freeframe backup`, then copy the newest `.dump` file from `/opt/freeframe/backups` and the file `/opt/freeframe/.env.prod` to your computer.
+2. Rent the new server as above. Point your domain's DNS at the new server's address.
+3. On the new server, create the folder and put the old settings file in it:
+   ```bash
+   sudo mkdir -p /opt/freeframe
+   sudo cp .env.prod /opt/freeframe/.env.prod
+   ```
+4. Run the install command. It keeps every setting from the file (including the secrets, which the restored database needs) and skips the questions the file already answers. It still asks for an admin account; the restore in the next step replaces it with your old accounts.
+5. Run `sudo freeframe restore /path/to/the-copied-file.dump` and answer yes.
+6. If footage was kept on the old server, copy the media to the new one as well; the restore brings back the database only. Using your own S3 bucket avoids this: the new server simply uses the same bucket.
+
+### Unattended installs (cloud-init, Ansible)
+
+For a script with nobody at the keyboard, give every answer ahead of time. Each question has an environment variable and a matching option (`--domain`, `--admin-email` and so on; an option wins over its variable). Add `FREEFRAME_YES=1` (or `--yes`) so the installer does not wait for a terminal.
+
+| Variable | Meaning |
+|---|---|
+| `FREEFRAME_DOMAIN` | Your domain, for example `review.yourstudio.com`. |
+| `FREEFRAME_HTTPS` | `auto` (the default), `own`, `sslip` or `off`. `auto` uses your domain when you give one, otherwise the automatic address on a public server, otherwise plain HTTP. |
+| `FREEFRAME_ACME_EMAIL` | Email for certificate notices (the admin email when left out). |
+| `FREEFRAME_STORAGE` | `bundled` (on this server, the default) or `s3`. |
+| `FREEFRAME_S3_ENDPOINT`, `_BUCKET`, `_ACCESS_KEY`, `_SECRET_KEY`, `_REGION` | Your bucket, when storage is `s3`. |
+| `FREEFRAME_SMTP_HOST`, `_PORT`, `_USER`, `_PASSWORD`, `_FROM` | Your mail server. Leave them all out for no email. |
+| `FREEFRAME_ADMIN_NAME`, `_EMAIL`, `_PASSWORD` | The admin account. The email is required. |
+| `FREEFRAME_CHANNEL` | `latest` or `stable` (or a version tag such as `v1.22.0`). |
+| `FREEFRAME_YES` | `1` to run without asking anything. |
+
+Example, as cloud-init runs it (as root, so no `sudo`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/latest/install.sh | \
+  FREEFRAME_YES=1 \
+  FREEFRAME_DOMAIN=review.yourstudio.com \
+  FREEFRAME_ADMIN_EMAIL=you@yourstudio.com \
+  FREEFRAME_ADMIN_PASSWORD='a-long-password-you-chose' \
+  bash
+```
+
+Two rules for unattended installs:
+
+- **Set `FREEFRAME_ADMIN_PASSWORD` yourself.** If you leave it out, the installer makes a password and prints it, and in an unattended run that output lands in the cloud-init log, where other people may read it.
+- **Pass secrets as variables, not as options.** Anything on a command line (`--admin-password`, `--smtp-password`, `--s3-secret-key`) can be seen by other users of the server with `ps`; variables cannot.
+
+If a required answer is missing, the installer stops before changing anything and names the variable to set. With a domain, an unattended run waits up to 30 minutes for the DNS records (see [The DNS step](#the-dns-step)); add the records first, or leave the domain out and use `FREEFRAME_HTTPS=sslip`.
+
+### If you already run FreeFrame
+
+**The installer refuses a server that already runs FreeFrame set up by hand** (a clone, or the published-images compose files), and leaves it completely alone: it changes nothing and tells you so. Keep updating that server with the manual steps in the rest of this guide; they are fully supported and unchanged. The installer is for new servers.
+
+### Troubleshooting the installer
+
+Everything the installer does is written to **`/opt/freeframe/install.log`**. Every stop message also says what was already done and what to try. It is safe to run the install command again: it keeps your settings and continues from where it stopped.
+
+| What you see | What it means |
+|---|---|
+| "This server runs ... which is not supported yet" | The system is not Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13, or the processor is not amd64 or arm64. Nothing was changed. Use a supported server, or follow the manual steps below. |
+| "This server has ... MB of memory. FreeFrame needs at least 2 GB" | The server is too small. Choose one with 4 GB or more. |
+| "This server already runs FreeFrame that was set up by hand" | See [If you already run FreeFrame](#if-you-already-run-freeframe) above. |
+| "Port 80 (or 443) is used by ..." | Another program, often Apache or nginx, uses the web ports. With a terminal, the installer offers to stop it; otherwise stop it yourself and run the command again. |
+| "This server cannot reach ghcr.io" | The server has no internet, or the provider's firewall blocks outgoing HTTPS (port 443). FreeFrame is downloaded from ghcr.io. |
+| "Docker on this server was installed with snap" or "needs Docker 24 or newer" | The Docker already on the server cannot be used. The message says how to remove or update it. |
+| "There is no terminal here to answer the installer's questions" | The command ran without a terminal (a script). Add `--yes` and give the answers ahead of time; see [Unattended installs](#unattended-installs-cloud-init-ansible). |
+| "The DNS records for ... do not point at this server" | The A record is missing or has not spread yet. Add the records the installer printed, wait, and run the command again. |
+| Browser warns about the certificate | The certificate has not arrived yet. Check the DNS records and that ports 80 and 443 are open, then run `sudo freeframe restart`. `sudo freeframe status` shows the certificate. |
+| "Could not download the freeframe command" | The server cannot reach `raw.githubusercontent.com`, or the channel has no installer yet. |
+
+Still stuck? Open an issue at <https://github.com/Techiebutler/freeframe/issues> and attach the end of `/opt/freeframe/install.log`. The log is private to the administrator, and it does not hold the admin password the installer makes for you.
+
+---
+
 ## Hardware Requirements
 
 | | Minimum | Recommended | Heavy Workload |
@@ -67,7 +278,7 @@ FreeFrame is fully self-contained. Install Docker on any Linux server (Ubuntu 22
 
 ## Quick Setup
 
-There are two ways to run FreeFrame in production: **run the published images** (no clone, no build) or **build from source**. Both use the same `.env.prod` and the same data. If you already run FreeFrame from a clone, nothing changes for you: build from source stays fully supported.
+These are the manual ways, fully supported next to the [installer](#install-on-a-fresh-server). There are two: **run the published images** (no clone, no build) or **build from source**. Both use the same `.env.prod` and the same data. If you already run FreeFrame from a clone, nothing changes for you: build from source stays fully supported.
 
 ### Run the published images
 

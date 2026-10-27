@@ -46,6 +46,12 @@ release (soak it as `latest`, smoke-test, watch for breakage reports).
   all `success`). Use `force: true` only for a tag that legitimately has no CI
   (e.g. docs-only).
 
+**The installer's command uses `latest` for now.** The install command in the
+README and `docs/deployment.md` (`curl ... /latest/install.sh | sudo bash`) names
+the `latest` ref. When the first release containing the installer is promoted to
+`stable`, switch that command to `stable` in a one-line docs PR (ledger row M4 of
+the installer deploy ledger).
+
 ## Rolling back a bad release
 
 `stable` is just a pointer — move it back to the last good tag:
