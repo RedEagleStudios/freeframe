@@ -1913,6 +1913,15 @@ SUDO_C_LATEST='sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Tech
   done
 }
 
+@test "install.sh: under sudo-rs a sudo started further up (sudo sh -c 'curl | bash') is not stopped" {
+  # Measured on Ubuntu 26.04: only a direct curl ... | sudo bash freezes.
+  bootstrap_setup
+  export SUDO_USER=ada STUB_PARENT_EXE=/usr/bin/dash STUB_SUDO_VERSION="sudo-rs 0.2.13"
+  run_bootstrap
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "ran: install --channel latest"
+}
+
 @test "install.sh: a good download prints nothing, so the banner comes first" {
   bootstrap_setup
   run_bootstrap
@@ -1929,15 +1938,6 @@ SUDO_C_LATEST='sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Tech
   assert_out "ran: install --channel latest -q --yes"
   run env PATH="$BIN:$PATH" bash -c "$script" -x --yes
   assert_out "ran: install --channel latest -x --yes"
-}
-
-@test "install.sh: under sudo-rs a sudo started further up (sudo sh -c 'curl | bash') is not stopped" {
-  # Measured on Ubuntu 26.04: only a direct curl ... | sudo bash freezes.
-  bootstrap_setup
-  export SUDO_USER=ada STUB_PARENT_EXE=/usr/bin/dash STUB_SUDO_VERSION="sudo-rs 0.2.13"
-  run_bootstrap
-  [ "$status" -eq 0 ] || { echo "$output"; false; }
-  assert_out "ran: install --channel latest"
 }
 
 @test "screens: a number or a stray dot at a menu is not taken as a domain or mail server" {
@@ -1971,6 +1971,37 @@ SUDO_C_LATEST='sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Tech
   [ "$(grep -o "Choose 1 or 2" <<<"$output" | wc -l | tr -d ' ')" -eq 3 ] || { echo "$output"; false; }
   if grep -q "^SMTP_HOST=." "$ENV"; then grep "^SMTP_HOST" "$ENV"; false; fi
   assert_out "To add email later, run: sudo freeframe configure"
+}
+
+@test "screens: a command in a wrapped message gets a line of its own" {
+  export FREEFRAME_DOMAIN=review.example.com STUB_DNS_FAILS=1000
+  tty_answers "certs@example.com" "${REST[@]}" "s"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -A1 -xF " Using the temporary address 203-0-113-7.sslip.io instead. Change it later with:" <<<"$output" |
+    grep -qxF "   sudo freeframe configure" || { echo "$output"; false; }
+  # Wrapped, the command still never shares a line with the sentence.
+  rm -rf "$FF_ROOT" && mkdir -p "$FF_ROOT"
+  : >"$STUB_DIR/dns-count"
+  export COLUMNS=60
+  tty_answers "certs@example.com" "${REST[@]}" "s"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  if grep -E "later with: *sudo|[a-z.] sudo freeframe configure" <<<"$output" | grep -v "To add email later, run:"; then
+    echo "$output"; false
+  fi
+  grep -qxF "   sudo freeframe configure" <<<"$output" || { echo "$output"; false; }
+}
+
+@test "_ff_lines wraps each line of a text with several lines, keeping the breaks" {
+  FF_WIDTH=12
+  assert_eq "$(_ff_lines "> " "  " "" $'one two three\nfour five six')" \
+    "$(printf '%s\n' "> one two" "  three" "  four five" "  six")"
+  FF_WIDTH=0
+  assert_eq "$(_ff_lines "> " "  " "" $'one two three\nfour five six')" \
+    "$(printf '%s\n' "> one two three" "  four five six")"
+  FF_WIDTH=12
+  assert_eq "$(_ff_lines "> " "  " "" $'one\n\ntwo')" "$(printf '%s\n' "> one" "" "  two")"
 }
 
 # ---------------------------------------------------------------- hints and state lines

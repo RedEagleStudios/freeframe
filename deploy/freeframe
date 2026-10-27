@@ -1206,10 +1206,20 @@ _ff_style() {
 # _ff_lines FIRST REST SGR TEXT: TEXT wrapped to FF_WIDTH columns. The first
 # line starts with FIRST and the others with REST, and the text is in style
 # SGR. Lines break only between words; a word longer than a line gets a
-# line to itself. With FF_WIDTH 0, TEXT is printed as one line.
+# line to itself. With FF_WIDTH 0, each line of TEXT is printed whole.
 _ff_lines() {
-  local first=$1 rest=$2 sgr=$3 text=$4 width=${FF_WIDTH:-0} pre line="" word
+  local first=$1 rest=$2 sgr=$3 text=$4 width=${FF_WIDTH:-0} pre line="" word part
   local -a words=()
+  # Several lines: each is wrapped on its own, and the breaks (and empty
+  # lines) are kept; the lines after the first start with REST.
+  if [[ $text == *$'\n'* ]]; then
+    pre=$first
+    while IFS= read -r part; do
+      if [[ -z $part ]]; then printf '\n'; else _ff_lines "$pre" "$rest" "$sgr" "$part"; fi
+      pre=$rest
+    done <<<"$text"
+    return 0
+  fi
   if ((width <= 0)); then
     printf '%s%s\n' "$first" "$(_ff_style "$sgr" "$text")"
     return 0
@@ -2526,7 +2536,8 @@ _install_dns_step() {
             if [[ ${FF_CMD:-install} == configure ]]; then
               _ff_p "Using the temporary address $FF_HOST instead."
             else
-              _ff_p "Using the temporary address $FF_HOST instead. Change it later with: sudo freeframe configure"
+              _ff_p "Using the temporary address $FF_HOST instead. Change it later with:"
+              say "   sudo freeframe configure"
             fi
             return 0
           fi
