@@ -62,7 +62,8 @@ newest_dump() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null | tail -1)
 }
 
 @test "update: the real re-exec runs the new command once, with the same options" {
-  printf '#!/usr/bin/env bash\necho "new freeframe: FF_SELF_UPDATED=$FF_SELF_UPDATED args: $*"\n' \
+  # A stand-in that carries the marks of a freeframe script.
+  printf '#!/usr/bin/env bash\nFF_SCRIPT_KIND=freeframe-management-script\ncmd_update() { :; }\necho "new freeframe: FF_SELF_UPDATED=$FF_SELF_UPDATED args: $*"\n' \
     >"$STUB_REMOTE/deploy/freeframe"
   export STUB_REAL_REEXEC=1
   ff update --channel latest
@@ -84,6 +85,21 @@ newest_dump() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null | tail -1)
   cmp "$ENV" "$BATS_TEST_TMPDIR/env.before"
   assert_not_called "dc "
   [ ! -d "$BK" ]
+}
+
+@test "update: a download that is valid bash but not the freeframe script is refused" {
+  printf '#!/usr/bin/env bash\necho "some other script"\n' >"$STUB_REMOTE/deploy/freeframe"
+  ff update
+  [ "$status" -eq 1 ]
+  assert_out "is not the freeframe command"
+  assert_out "nothing was changed"
+  cmp "$FF_SCRIPT" "$FF_BIN_DIR/freeframe"
+  assert_not_called "dc "
+  # With the marker but without the update command, it is refused too.
+  printf '#!/usr/bin/env bash\nFF_SCRIPT_KIND=freeframe-management-script\n' >"$STUB_REMOTE/deploy/freeframe"
+  ff update
+  [ "$status" -eq 1 ]
+  cmp "$FF_SCRIPT" "$FF_BIN_DIR/freeframe"
 }
 
 @test "update: a failed command download stops before anything changes" {

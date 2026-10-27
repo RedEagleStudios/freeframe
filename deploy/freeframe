@@ -16,6 +16,10 @@
 # shell options. Every function below is written to work under strict mode.
 # ============================================================
 
+# Marks this file as the freeframe management script: `freeframe update`
+# installs a download only when it carries this line (and cmd_update).
+FF_SCRIPT_KIND=freeframe-management-script
+
 # ------------------------------------------------------------
 # Messages
 # ------------------------------------------------------------
@@ -3335,6 +3339,11 @@ update_self() {
     rm -f "$new"
     _ff_stop 1 "What was downloaded for the $ch channel is not a complete freeframe command, so nothing was changed." \
       "run sudo freeframe update again in a few minutes. If it keeps happening, report it at https://github.com/Techiebutler/freeframe/issues"
+  fi
+  if ! grep -qx "FF_SCRIPT_KIND=$FF_SCRIPT_KIND" "$new" || ! grep -q '^cmd_update() {' "$new"; then
+    rm -f "$new"
+    _ff_stop 1 "What was downloaded for the $ch channel is not the freeframe command, so nothing was changed." \
+      "check that the channel is right (--channel stable or --channel latest), then run sudo freeframe update again."
   fi
   # Compared before the command is replaced: the script running now is
   # usually that very file.
