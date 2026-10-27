@@ -148,7 +148,7 @@ Log in to the server and run:
 curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/latest/install.sh | sudo bash
 ```
 
-`latest` is the newest published release; the command will move to `stable` once the first release with the installer has been promoted there. To set a variable, put it after `sudo`: `curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/latest/install.sh | sudo FREEFRAME_CHANNEL=latest bash`.
+The command works from the first release after v1.21.0, the first that has the installer. `latest` is the newest published release; the command will move to `stable` once the first release with the installer has been promoted there. To set a variable, put it after `sudo`: `curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/latest/install.sh | sudo FREEFRAME_CHANNEL=latest bash`.
 
 When it finishes, open the address it prints and sign in with your admin account, then invite your team from the admin area. Without email set up, sign-in codes and invitations are not sent and there is no password reset; invitation links can still be copied from the admin page.
 

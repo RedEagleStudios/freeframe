@@ -31,7 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/latest/insta
 
 This downloads a small script and runs it as the administrator (`sudo`). The script runs `freeframe install`, which checks the server first and changes nothing if a check fails. You can read the script before running it: it is [`install.sh`](../install.sh) in this repository.
 
-`latest` is the newest published release. We will switch this command to `stable`, the release we have validated for production, once the first release containing the installer has been promoted there.
+The command works from the first release after v1.21.0, the first that has the installer. `latest` is the newest published release. We will switch this command to `stable`, the release we have validated for production, once the first release containing the installer has been promoted there.
 
 If you need to set a variable (see [Unattended installs](#unattended-installs-cloud-init-ansible) below), put it after `sudo`, because `sudo` drops variables set before it:
 

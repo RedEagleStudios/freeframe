@@ -25,6 +25,19 @@
 # ============================================================
 
 RAW=https://raw.githubusercontent.com/Techiebutler/freeframe
+GUIDE=https://github.com/Techiebutler/freeframe/blob/main/docs/deployment.md
+
+# not_yet LEAD IF: a "What to try" (LEAD, then IF, as "If it can,") for a
+# channel that may not have the installer yet. On latest there is no other
+# channel to suggest.
+not_yet() {
+  if [ "$ref" = latest ]; then
+    echo "What to try: $1 $2 the latest release may not have the installer yet (it needs a release after v1.21.0): wait for the next release, or set FreeFrame up by hand as the guide explains: $GUIDE" >&2
+  else
+    echo "What to try: $1 $2 the '$ref' channel may not have the installer yet:" >&2
+    echo "  curl -fsSL $RAW/latest/install.sh | sudo FREEFRAME_CHANNEL=latest bash" >&2
+  fi
+}
 
 main() {
   ref=${FREEFRAME_CHANNEL:-latest}
@@ -66,15 +79,13 @@ main() {
   if ! curl -fsSL --retry 3 --max-time 60 "$url" -o "$tmp"; then
     rm -f "$tmp"
     echo "Could not download the freeframe command from $url" >&2
-    echo "What to try: check that this server can reach raw.githubusercontent.com, then run the install command again. If it can, the '$ref' channel may not have the installer yet:" >&2
-    echo "  curl -fsSL $RAW/latest/install.sh | sudo FREEFRAME_CHANNEL=latest bash" >&2
+    not_yet "check that this server can reach raw.githubusercontent.com, then run the install command again." "If it can,"
     exit 1
   fi
   if [ "$(head -n 1 "$tmp")" != '#!/usr/bin/env bash' ] || ! bash -n "$tmp" 2>/dev/null; then
     rm -f "$tmp"
     echo "What was downloaded from $url is not a complete freeframe command." >&2
-    echo "What to try: run the install command again in a few minutes. If it keeps happening, the '$ref' channel may not have the installer yet:" >&2
-    echo "  curl -fsSL $RAW/latest/install.sh | sudo FREEFRAME_CHANNEL=latest bash" >&2
+    not_yet "run the install command again in a few minutes." "If it keeps happening,"
     exit 1
   fi
 

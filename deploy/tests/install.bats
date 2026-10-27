@@ -1142,6 +1142,18 @@ assert_root_untouched() {
   assert_not_called derive_env
 }
 
+@test "install: a failed download on latest does not suggest latest; on another channel it does" {
+  plain_answers
+  export STUB_FETCH_FAIL=docker-compose.https.yml
+  ff_install --yes --channel latest
+  [ "$status" -eq 1 ]
+  assert_out "a release after v1.21.0"
+  if [[ $output == *"try --channel latest"* ]]; then echo "$output"; false; fi
+  ff_install --yes --channel stable
+  [ "$status" -eq 1 ]
+  assert_out "try --channel latest"
+}
+
 # ---------------------------------------------------------------- real helpers
 
 @test "fetch copies from FF_FETCH_FROM_DIR instead of downloading" {
@@ -1338,8 +1350,13 @@ run_bootstrap() {
   run_bootstrap
   [ "$status" -eq 1 ]
   assert_out "What to try"
-  assert_out "sudo FREEFRAME_CHANNEL=latest bash"
+  # Already on latest: no circular "try latest".
+  if [[ $output == *"FREEFRAME_CHANNEL=latest"* ]]; then echo "$output"; false; fi
+  assert_out "a release after v1.21.0"
   [ -z "$(ls -A "$TMPDIR")" ]
+  FREEFRAME_CHANNEL=stable run_bootstrap
+  [ "$status" -eq 1 ]
+  assert_out "sudo FREEFRAME_CHANNEL=latest bash"
 }
 
 @test "install.sh: a cut-off download (bash -n fails) is refused and not run" {
@@ -1355,6 +1372,11 @@ run_bootstrap() {
   bootstrap_setup
   export CURL_FAIL=1
   run_bootstrap
+  [ "$status" -eq 1 ]
+  assert_out "Could not download the freeframe command"
+  if [[ $output == *"FREEFRAME_CHANNEL=latest"* ]]; then echo "$output"; false; fi
+  assert_out "a release after v1.21.0"
+  FREEFRAME_CHANNEL=stable run_bootstrap
   [ "$status" -eq 1 ]
   assert_out "sudo FREEFRAME_CHANNEL=latest bash"
 }

@@ -2205,8 +2205,13 @@ _install_fetch_step() {
   FF_STEP="downloading the setup files"
   say "Downloading the setup files for the $FF_CHANNEL channel..."
   if ! fetch_setup_files "$FF_CHANNEL"; then
-    install_fail "$(_ff_fetch_failure "the $FF_CHANNEL channel")" \
-      "check that this server can reach raw.githubusercontent.com, then run sudo freeframe install again. If it can, the $FF_CHANNEL channel may not have this file yet (the installer needs a release after v1.21.0): try --channel latest."
+    local try="check that this server can reach raw.githubusercontent.com, then run sudo freeframe install again."
+    if [[ $FF_CHANNEL == latest ]]; then
+      try+=" If it can, the latest release may not have this file yet (the installer needs a release after v1.21.0): wait for the next release."
+    else
+      try+=" If it can, the $FF_CHANNEL channel may not have this file yet (the installer needs a release after v1.21.0): try --channel latest."
+    fi
+    install_fail "$(_ff_fetch_failure "the $FF_CHANNEL channel")" "$try"
   fi
   _install_done "downloaded the setup files into $root"
 }
