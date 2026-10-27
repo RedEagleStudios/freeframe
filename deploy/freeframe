@@ -367,10 +367,12 @@ _ff_bad_usage() {
 # install command, and hints must name that instead.
 _ff_cmd_installed() { [[ -x ${FF_BIN_DIR:-/usr/local/bin}/freeframe ]]; }
 
-# _ff_bootstrap_cmd ARGS: the one-line install command for this channel,
+# _ff_bootstrap_cmd ARGS: the one-line install command for this run's
+# channel (ff_channel: --channel, else the settings file's, else latest),
 # passing ARGS on to freeframe install.
 _ff_bootstrap_cmd() {
-  local ch=${FF_CHANNEL:-latest}
+  local ch
+  ch=$(ff_channel "$(ff_root)/.env.prod")
   _ff_valid_ref "$ch" || ch=latest
   printf 'curl -fsSL %s/%s/install.sh | sudo bash -s -- %s' "$FF_RAW_BASE" "$ch" "$*"
 }

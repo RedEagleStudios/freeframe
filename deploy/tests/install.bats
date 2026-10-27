@@ -1480,3 +1480,13 @@ run_bootstrap() {
   assert_out "downloaded the setup files into $FF_ROOT"
   if [[ $output == *"installed Docker"* ]]; then echo "$output"; false; fi
 }
+
+@test "install: the one-line install command in a hint follows the settings file's channel" {
+  printf 'FREEFRAME_CHANNEL=stable\n' >"$ENV"
+  run bash -c 'source "$1"; main install --bogus' ff "$FF_SCRIPT"
+  [ "$status" -eq 2 ]
+  assert_out "/freeframe/stable/install.sh | sudo bash -s -- --help"
+  # An explicit --channel still wins.
+  run bash -c 'source "$1"; main install --channel v1.22.0 --bogus' ff "$FF_SCRIPT"
+  assert_out "/freeframe/v1.22.0/install.sh | sudo bash -s -- --help"
+}
