@@ -137,3 +137,28 @@ assert_no_out() {
 
 # env_backups: the .env.prod.<stamp> copies, oldest first.
 env_backups() { (cd "$FF_ROOT" && LC_ALL=C ls .env.prod.2* 2>/dev/null) || true; }
+
+# ff_signal SIG STEP ARGS...: run `freeframe ARGS` in its own session, wait
+# until the stubbed STEP hangs (_stub_hang STEP), then send SIG to the whole
+# process group, as Ctrl-C, a closed SSH session or systemctl stop do.
+ff_signal() {
+  local sig=$1 step=$2 pid n=0
+  shift 2
+  command -v setsid >/dev/null || skip "no setsid"
+  setsid bash -c 'set -Eeuo pipefail; source "$1"; source "$2"; shift 2; main "$@"' \
+    ff-run "$FF_SCRIPT" "$STUBS" "$@" >"$BATS_TEST_TMPDIR/out" 2>&1 &
+  pid=$!
+  while [[ ! -e $STUB_DIR/hanging-$step ]]; do
+    sleep 0.1
+    n=$((n + 1))
+    if ((n > 150)); then
+      echo "the step $step never started"
+      cat "$BATS_TEST_TMPDIR/out"
+      return 1
+    fi
+  done
+  kill -"$sig" -- -"$(cat "$STUB_DIR/pgid")"
+  status=0
+  wait "$pid" || status=$?
+  output=$(cat "$BATS_TEST_TMPDIR/out")
+}

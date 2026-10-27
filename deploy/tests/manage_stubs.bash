@@ -20,11 +20,66 @@ public_ip() {
 }
 local_ip() { printf '%s\n' "${STUB_LOCAL_IP:-203.0.113.7}"; }
 
+# A ref with its own folder ($STUB_REMOTE_REFS/REF) is served from there;
+# every other ref from $STUB_REMOTE. STUB_FETCH_FAIL_REF fails a whole ref.
 eval "_real_fetch() $(declare -f fetch | tail -n +2)"
 fetch() {
   _stub_log "fetch $1 $2"
   [[ -z ${STUB_FETCH_FAIL:-} || $2 != "$STUB_FETCH_FAIL" ]] || return 1
-  FF_FETCH_FROM_DIR=$STUB_REMOTE _real_fetch "$@"
+  [[ -z ${STUB_FETCH_FAIL_REF:-} || $1 != "$STUB_FETCH_FAIL_REF" ]] || return 1
+  if [[ -n ${STUB_REMOTE_REFS:-} && -d $STUB_REMOTE_REFS/$1 ]]; then
+    FF_FETCH_FROM_DIR=$STUB_REMOTE_REFS/$1 _real_fetch "$@"
+  else
+    FF_FETCH_FROM_DIR=$STUB_REMOTE _real_fetch "$@"
+  fi
+}
+
+# _stub_hang NAME: for the signal tests. Note this process group (the test
+# signals all of it, as Ctrl-C and a closed SSH session do), say the long
+# step has started, and wait.
+_stub_hang() {
+  local -a st
+  read -r -a st </proc/$BASHPID/stat
+  printf '%s' "${st[4]}" >"$STUB_DIR/pgid"
+  : >"$STUB_DIR/hanging-$1"
+  sleep 30
+}
+
+# STUB_UNDO_SET_HANG: hang right after the update record is written.
+if [[ -n ${STUB_UNDO_SET_HANG:-} ]]; then
+  eval "_real_update_undo_set() $(declare -f _update_undo_set | tail -n +2)"
+  _update_undo_set() {
+    _real_update_undo_set "$@" || return 1
+    _stub_hang undo-set
+  }
+fi
+
+# STUB_PUTBACK_FAIL: the setup files from before cannot be put back.
+if [[ -n ${STUB_PUTBACK_FAIL:-} ]]; then
+  _update_put_back() {
+    _stub_log _update_put_back
+    return 1
+  }
+fi
+
+# STUB_SAY_FAIL=TEXT: printing a line containing TEXT fails, an unexpected
+# failure in the middle of the flow (the ERR trap's case).
+if [[ -n ${STUB_SAY_FAIL:-} ]]; then
+  eval "_real_say() $(declare -f say | tail -n +2)"
+  say() {
+    if [[ $* == *"$STUB_SAY_FAIL"* ]]; then return 1; fi
+    _real_say "$@"
+  }
+fi
+
+# docker itself (rollback stops by project label when the compose files in
+# place cannot be read).
+docker() {
+  _stub_log "docker $*"
+  case "$*" in
+    "ps "*) printf '%s\n' 'c1|api' 'c2|postgres' 'c3|traefik' 'c4|worker' ;;
+  esac
+  return 0
 }
 
 # The self-update's re-exec, followed in this process (the real one would
@@ -91,7 +146,15 @@ dc() {
   case "$*" in
     "config --services")
       [[ -z ${STUB_DOCKER_DOWN:-} ]] || return 1
+      # STUB_CONFIG_FAIL_NEW: the new release's compose files do not parse.
+      if [[ -n ${STUB_CONFIG_FAIL_NEW:-} ]] && grep -q 1.22.0 "$FF_ROOT/docker-compose.images.yml"; then
+        return 1
+      fi
       printf '%s\n' traefik postgres redis api worker email_worker maintenance_worker beat web minio minio-init
+      ;;
+    "ps --format {{.Image}} api")
+      # The image the running api container was started from.
+      [[ -z ${STUB_RUNNING_IMAGE:-} ]] || printf '%s\n' "$STUB_RUNNING_IMAGE"
       ;;
     "ps "*)
       [[ -z ${STUB_DOCKER_DOWN:-} ]] || return 1
@@ -121,8 +184,14 @@ dc() {
       [[ -z ${STUB_PG_DOWN:-} ]] || return 1
       printf 'PGDMP current database %s\n' "$(_ff_version_in "$(cat "$FF_ROOT/docker-compose.images.yml")" 2>/dev/null)"
       ;;
-    *"localhost:8000/health"*) [[ -z ${STUB_API_DOWN:-} && ! -e $STUB_DIR/api-down ]] ;;
-    pull*) [[ -z ${STUB_PULL_FAIL:-} ]] ;;
+    *"localhost:8000/health"*)
+      [[ -z ${STUB_HEALTH_HANG:-} ]] || _stub_hang health
+      [[ -z ${STUB_API_DOWN:-} ]]
+      ;;
+    pull*)
+      [[ -z ${STUB_PULL_HANG:-} ]] || _stub_hang pull
+      [[ -z ${STUB_PULL_FAIL:-} ]]
+      ;;
     "up -d"*) [[ -z ${STUB_UP_FAIL:-} ]] ;;
     "logs "*) printf 'api-1  | started\n' ;;
     *) return 0 ;;
@@ -136,11 +205,16 @@ derive_env() {
   _real_derive_env "$@"
 }
 
-# STUB_MV_FAIL=NAME: moving a file onto $FF_ROOT/NAME fails (a full or read-only
+# STUB_MV_FAIL=NAME: moving a downloaded file onto $FF_ROOT/NAME fails (a full or read-only
 # disk at just the wrong moment). Every other mv is real.
-if [[ -n ${STUB_MV_FAIL:-} ]]; then
+# STUB_MV_OLD_FAIL=NAME: putting NAME back from a download's stage/old fails.
+# STUB_MV_HANG=NAME: moving onto $FF_ROOT/NAME hangs first (a signal in the
+# middle of the replace).
+if [[ -n ${STUB_MV_FAIL:-}${STUB_MV_OLD_FAIL:-}${STUB_MV_HANG:-} ]]; then
   mv() {
-    if [[ ${!#} == "$FF_ROOT/$STUB_MV_FAIL" ]]; then return 1; fi
+    if [[ -n ${STUB_MV_FAIL:-} && ${!#} == "$FF_ROOT/$STUB_MV_FAIL" && $* == *"/.download."* ]]; then return 1; fi
+    if [[ -n ${STUB_MV_OLD_FAIL:-} && ${!#} == "$FF_ROOT/$STUB_MV_OLD_FAIL" && $* == */old/* ]]; then return 1; fi
+    if [[ -n ${STUB_MV_HANG:-} && ${!#} == "$FF_ROOT/$STUB_MV_HANG" ]]; then _stub_hang mv; fi
     command mv "$@"
   }
 fi

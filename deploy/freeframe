@@ -2128,6 +2128,9 @@ fetch_setup_files() {
     rm -rf "$stage"
     return 1
   }
+  # The replace takes a moment and must not be cut in half: a Ctrl-C, a
+  # closed SSH session or a TERM is held until it is done, then delivered.
+  _ff_hold_signals
   for f in "${FF_SETUP_FILES[@]}"; do
     dest=$(_ff_setup_dest "$f")
     name=${f##*/}
@@ -2148,9 +2151,31 @@ fetch_setup_files() {
       fi
     done
     rm -rf "$stage"
+    _ff_release_signals
     return 1
   done
   rm -rf "$stage"
+  _ff_release_signals
+}
+
+# _ff_hold_signals / _ff_release_signals: hold INT, TERM and HUP during a
+# short step that must finish once begun; afterwards the traps that were
+# set come back, and a signal that arrived meanwhile is delivered then.
+_ff_hold_signals() {
+  FF_HELD_TRAPS=$(trap -p INT TERM HUP)
+  FF_SIG_PENDING=""
+  trap 'FF_SIG_PENDING=INT' INT
+  trap 'FF_SIG_PENDING=TERM' TERM
+  trap 'FF_SIG_PENDING=HUP' HUP
+}
+
+_ff_release_signals() {
+  local sig=${FF_SIG_PENDING:-}
+  trap - INT TERM HUP
+  eval "${FF_HELD_TRAPS:-}"
+  FF_SIG_PENDING="" FF_HELD_TRAPS=""
+  if [[ -n $sig ]]; then kill -s "$sig" "$$"; fi
+  return 0
 }
 
 # _ff_fetch_failure CHANNEL_WORDS: the message for a failed fetch_setup_files.
@@ -3376,8 +3401,9 @@ _ff_cmd_on_error() {
   _ff_backup_cleanup
   _restore_forget_new_record
   rm -rf "$(ff_root)"/.download.??????
+  if [[ ${FF_UPDATE_PHASE:-} == saved ]]; then _update_undo_change "$FF_UPDATE_OLD" || true; fi
   _restore_report "The ${FF_CMD:-command} stopped unexpectedly while ${FF_STEP:-working} (error $code)." \
-    "look at the end of ${FF_LOG:-the output above} for the reason."
+    "${FF_TRAP_HINT:-look at the end of ${FF_LOG:-the output above} for the reason.}"
 }
 
 _ff_cmd_on_signal() {
@@ -3386,8 +3412,11 @@ _ff_cmd_on_signal() {
   _ff_backup_cleanup
   _restore_forget_new_record
   rm -rf "$(ff_root)"/.download.??????
+  # An update that has not started the new version is undone, so its
+  # re-run is safe.
+  if [[ ${FF_UPDATE_PHASE:-} == saved ]]; then _update_undo_change "$FF_UPDATE_OLD" || true; fi
   _restore_report "The ${FF_CMD:-command} was stopped (SIG$1) while ${FF_STEP:-working}, before it finished." \
-    "to finish it, run: ${FF_RERUN:-the command} again"
+    "${FF_TRAP_HINT:-to finish it, run: ${FF_RERUN:-the command} again}"
 }
 
 _ff_cmd_traps() {
@@ -3479,43 +3508,64 @@ update_self() {
 # stands, update refuses and backup never prunes that backup.
 _update_undo_file() { printf '%s/.update-undo' "$(ff_root)"; }
 
-# _update_undo_read: FF_UNDO_VERSION, FF_UNDO_BACKUP and FF_UNDO_TIME from
-# the record. 1 when there is none.
+# _update_undo_read: FF_UNDO_VERSION, FF_UNDO_BACKUP, FF_UNDO_TIME and
+# FF_UNDO_PHASE from the record. 1 when there is none. The phase is saved
+# (the files from before are kept; the new version has not started, so the
+# old one is still what runs) or started (the new version was started). A
+# record without one is read as started, the careful choice.
 _update_undo_read() {
   local f line
   f=$(_update_undo_file)
-  FF_UNDO_VERSION="" FF_UNDO_BACKUP="" FF_UNDO_TIME=""
+  FF_UNDO_VERSION="" FF_UNDO_BACKUP="" FF_UNDO_TIME="" FF_UNDO_PHASE=started
   [[ -f $f ]] || return 1
   while IFS= read -r line || [[ -n $line ]]; do
     case $line in
       version=*) FF_UNDO_VERSION=${line#version=} ;;
       backup=*) FF_UNDO_BACKUP=${line#backup=} ;;
       time=*) FF_UNDO_TIME=${line#time=} ;;
+      phase=*) FF_UNDO_PHASE=${line#phase=} ;;
     esac
   done <"$f"
   return 0
 }
 
+# _update_undo_set VERSION BACKUP PHASE [TIME]
 _update_undo_set() {
   local f
   f=$(_update_undo_file)
-  (umask 077 && printf 'version=%s\nbackup=%s\ntime=%s\n' "$1" "$2" "$(date '+%Y-%m-%d %H:%M:%S %z')" >"$f.tmp") &&
+  (umask 077 && printf 'version=%s\nbackup=%s\ntime=%s\nphase=%s\n' "$1" "$2" \
+    "${4:-$(date '+%Y-%m-%d %H:%M:%S %z')}" "$3" >"$f.tmp") &&
     chmod 600 "$f.tmp" && mv -f "$f.tmp" "$f"
+}
+
+# _update_undo_phase PHASE: the same record, now in PHASE.
+_update_undo_phase() {
+  _update_undo_read || return 1
+  _update_undo_set "$FF_UNDO_VERSION" "$FF_UNDO_BACKUP" "$1" "$FF_UNDO_TIME"
 }
 
 _update_undo_clear() { rm -f "$(_update_undo_file)"; }
 
-# _update_save_setup: keep the setup files in use now (the compose files and
-# the backup units) in $FF_ROOT/rollback, replacing an older copy only once
-# the new one is complete.
+# _update_save_setup [REF]: keep the setup files in use now (the compose
+# files and the backup units) in $FF_ROOT/rollback, replacing an older copy
+# only once the new one is complete. With REF they are downloaded from that
+# ref instead (the release that runs, when the files on disk are already
+# another one's).
 _update_save_setup() {
-  local root new f dest
+  local ref=${1:-} root new f dest
   root=$(ff_root)
   new="$root/rollback.new"
   rm -rf "$new" "$root/rollback.old" || return 1
   (umask 077 && mkdir "$new") || return 1
   chmod 700 "$new" || return 1
   for f in "${FF_SETUP_FILES[@]}"; do
+    if [[ -n $ref ]]; then
+      if ! _ff_logged fetch "$ref" "$f" "$new/${f##*/}"; then
+        rm -rf "$new"
+        return 1
+      fi
+      continue
+    fi
     dest=$(_ff_setup_dest "$f")
     if [[ -e $dest ]] && ! cp -p "$dest" "$new/${f##*/}"; then
       rm -rf "$new"
@@ -3552,12 +3602,34 @@ _update_put_back() {
 # version puts the setup files from before back and drops its record, so
 # FreeFrame is as it was and a plain re-run works.
 _update_undo_change() {
+  FF_UPDATE_PHASE=""
   if _update_put_back; then
     _update_undo_clear
     FF_STATE="FreeFrame is running the version it had ($1), with its setup files from before. Running sudo freeframe update again is safe."
-  else
-    FF_STATE="FreeFrame is still running the version it had ($1), but its setup files from before could not all be put back. To put everything back, run: sudo freeframe rollback"
+    return 0
   fi
+  FF_STATE="FreeFrame is still running the version it had ($1), but its setup files from before could not all be put back, so the record of this update is kept. To put everything back, run: sudo freeframe rollback"
+  FF_TRAP_HINT="to put the setup files from before back, run: sudo freeframe rollback"
+  return 1
+}
+
+# _update_fail_undone MESSAGE WHAT_TO_TRY: an update that stops before the
+# new version started: the setup files from before go back first, and the
+# advice is the rollback when they could not.
+_update_fail_undone() {
+  if _update_undo_change "$FF_UPDATE_OLD"; then install_fail "$1" "$2"; fi
+  install_fail "$1" "$FF_TRAP_HINT"
+}
+
+# _ff_running_version: the release the running api container was started
+# from (its image tag), or nothing when that cannot be told.
+_ff_running_version() {
+  local img tag
+  img=$(dc ps --format '{{.Image}}' api 2>/dev/null | head -n 1) || img=""
+  [[ $img == */*:* || $img == *:* ]] || return 0
+  tag=${img##*:}
+  [[ $tag =~ ^v?[0-9][A-Za-z0-9._-]*$ ]] || return 0
+  printf '%s' "${tag#v}"
 }
 
 # cmd_update: `freeframe update`. Updates the freeframe command itself first
@@ -3566,7 +3638,7 @@ _update_undo_change() {
 # restart and the health checks. If the new version does not come up, it
 # prints the line that goes back, rather than guessing.
 cmd_update() {
-  local root file ch ref old new answers pinned url mode host
+  local root file ch ref old new answers pinned url mode host running save_ref="" try
   root=$(ff_root)
   file="$root/.env.prod"
   if ((${#FF_ARGS[@]})); then
@@ -3582,8 +3654,21 @@ cmd_update() {
   _ff_need_finished_install update
   _ff_refuse_unfinished_restore update
   if _update_undo_read; then
-    _ff_stop 1 "An earlier update did not finish (it started ${FF_UNDO_TIME:-earlier}, from version ${FF_UNDO_VERSION:-unknown}), so this update did not start. Nothing was changed." \
-      "to go back to ${FF_UNDO_VERSION:-the version from before}, run: sudo freeframe rollback. If FreeFrame works well as it is now, remove the record instead: sudo rm $(_ff_q "$(_update_undo_file)"), then run sudo freeframe update again."
+    if [[ $FF_UNDO_PHASE == saved ]]; then
+      # Killed (power loss, SIGKILL) before it started the new version: the
+      # old version still runs, so its files go back and the update goes on.
+      say "An earlier update stopped before it started the new version; putting its setup files from before back first..."
+      if ! _update_put_back; then
+        _ff_stop 1 "An earlier update stopped part-way and its setup files from before could not be put back, so this update did not start." \
+          "to put everything back as it was before that update, run: sudo freeframe rollback"
+      fi
+      _update_undo_clear
+    else
+      # Its new version was started (and did not come up): removing the
+      # record is right only when that new version works.
+      _ff_stop 1 "An earlier update did not finish (it started ${FF_UNDO_TIME:-earlier}, from version ${FF_UNDO_VERSION:-unknown}), so this update did not start. Nothing was changed." \
+        "to go back to ${FF_UNDO_VERSION:-the version from before}, run: sudo freeframe rollback. If FreeFrame works well on the new version as it is now, remove the record instead: sudo rm $(_ff_q "$(_update_undo_file)"), then run sudo freeframe update again."
+    fi
   fi
   ch=$(ff_channel "$file")
   _ff_check_channel "$ch"
@@ -3611,9 +3696,22 @@ cmd_update() {
   FF_ADMIN_CREATED="" FF_PW_GENERATED=""
   FF_RERUN="sudo freeframe update"
   FF_STATE="Nothing has been changed; FreeFrame is running as before."
+  FF_UPDATE_PHASE="" FF_TRAP_HINT=""
   _install_log_start update
   _ff_cmd_traps
+  # The version from before is what runs. When the running containers are
+  # another release than the files on disk say (an earlier update stopped
+  # part-way and its record was removed by hand), the running one counts,
+  # and its own release's setup files become the way back.
   old=$(ff_version)
+  running=$(_ff_running_version)
+  if [[ -n $running && $running != "$old" ]]; then
+    say "FreeFrame runs version $running, but the setup files here are for $old (an earlier update stopped part-way)."
+    say "The setup files of release v$running are kept as the way back."
+    save_ref="v$running"
+    new=$old
+    old=$running
+  fi
 
   FF_STEP="backing up the database"
   say "Saving a backup of the database first..."
@@ -3635,11 +3733,24 @@ cmd_update() {
   # Before anything is replaced: the setup files in use now, and the record
   # `freeframe rollback` goes back with.
   FF_STEP="saving the setup files in use"
-  if ! _update_save_setup || ! _update_undo_set "$old" "$FF_UPDATE_BACKUP"; then
-    _update_undo_clear
+  if ! _update_save_setup "$save_ref"; then
+    if [[ -n $save_ref ]]; then
+      install_fail "FreeFrame runs version $old, but the setup files in $root are for $new, and the setup files of release $save_ref could not be downloaded to keep as the way back, so nothing was changed." \
+        "check that this server can reach raw.githubusercontent.com, then run sudo freeframe update again."
+    fi
     install_fail "The setup files in use could not be saved for a rollback, so the update stopped before changing anything." \
       "check that the disk is not full, then run sudo freeframe update again."
   fi
+  # From the record on, until the new version starts, any stop (a failure, a
+  # signal, an error) puts the setup files from before back and drops the
+  # record (_update_undo_change), since the old version is still what runs.
+  FF_UPDATE_OLD=$old
+  FF_UPDATE_PHASE=saved
+  if ! _update_undo_set "$old" "$FF_UPDATE_BACKUP" saved; then
+    _update_fail_undone "The setup files in use could not be saved for a rollback, so the update stopped before changing anything." \
+      "check that the disk is not full, then run sudo freeframe update again."
+  fi
+  FF_STATE="FreeFrame is running $old as before; its setup files are saved for a rollback."
 
   FF_STEP="downloading the setup files"
   if [[ -n $pinned ]]; then
@@ -3650,17 +3761,17 @@ cmd_update() {
     say "Downloading the setup files for the $ch channel..."
   fi
   if ! fetch_setup_files "$ref"; then
-    if [[ -z $FF_FETCH_MIXED ]]; then _update_undo_clear; fi
-    install_fail "$(_ff_fetch_failure "$([[ -n $pinned ]] && printf 'release %s' "$ref" || printf 'the %s channel' "$ch")")" \
-      "check that this server can reach raw.githubusercontent.com and that the disk is not full, then run sudo freeframe update again."
+    try="check that this server can reach raw.githubusercontent.com and that the disk is not full, then run sudo freeframe update again."
+    if [[ -n $pinned && $FF_FETCH_STAGE == download ]]; then
+      try="check that this server can reach raw.githubusercontent.com. If it can, release $ref does not have these files: delete the FREEFRAME_VERSION line from $file to follow the $ch channel, then run sudo freeframe update."
+    fi
+    _update_fail_undone "$(_ff_fetch_failure "$([[ -n $pinned ]] && printf 'release %s' "$ref" || printf 'the %s channel' "$ch")")" "$try"
   fi
   new=$(ff_version)
-  FF_STATE="The setup files for $new are in place, but FreeFrame is still running the version it had ($old). To put them back, run: sudo freeframe rollback"
 
   FF_STEP="adding the settings the new release needs"
   if ! fill_settings "$file"; then
-    _update_undo_change "$old"
-    install_fail "The settings could not be completed for the new release." \
+    _update_fail_undone "The settings could not be completed for the new release." \
       "fix what the message above says, then run sudo freeframe update again."
   fi
 
@@ -3668,8 +3779,7 @@ cmd_update() {
     FF_STEP="downloading FreeFrame $new"
     say "Downloading FreeFrame $new (this can take a few minutes)..."
     if ! _ff_logged dc pull; then
-      _update_undo_change "$old"
-      install_fail "FreeFrame $new could not be downloaded." \
+      _update_fail_undone "FreeFrame $new could not be downloaded." \
         "check that this server can reach ghcr.io, then run sudo freeframe update again."
     fi
   fi
@@ -3678,7 +3788,15 @@ cmd_update() {
   host=$(_ff_url_host "$url")
   mode=$(env_get "$file" FREEFRAME_HTTPS)
   FF_STEP="starting FreeFrame $new"
+  # From here the new version may change the database: the way back is the
+  # rollback, and the record says so.
+  if ! _update_undo_phase started; then
+    _update_fail_undone "The update could not note that it is starting the new version, so it stopped before starting it." \
+      "check that the disk is not full, then run sudo freeframe update again."
+  fi
+  FF_UPDATE_PHASE=started
   FF_STATE="FreeFrame has been moved to $new. To go back to $old with the database as it was just before the update, run: sudo freeframe rollback"
+  FF_TRAP_HINT="see why with: sudo freeframe logs. To go back to $old, run: sudo freeframe rollback"
   say "Starting FreeFrame $new..."
   if ! _ff_logged dc up -d --no-build; then
     install_fail "FreeFrame $new could not be started." "see why with: sudo freeframe logs"
@@ -3691,6 +3809,7 @@ cmd_update() {
   fi
   # It answers: the way back is no longer needed.
   _update_undo_clear
+  FF_UPDATE_PHASE=""
   FF_STEP="refreshing the nightly backups"
   if ! _ff_logged install_backup_timer; then
     warn "The nightly backup timer could not be refreshed; the one set up before keeps running. The reason is at the end of $FF_LOG."

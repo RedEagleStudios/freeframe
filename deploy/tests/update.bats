@@ -369,3 +369,175 @@ newest_dump() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null | tail -1)
   [ "$status" -eq 2 ]
   assert_not_called fetch
 }
+
+# ---------------------------------------------------------------- interrupted updates
+
+SETUP_NAMES="docker-compose.prod.yml docker-compose.images.yml docker-compose.https.yml docker-compose.storage.yml"
+
+keep_files() {
+  local f
+  mkdir -p "$BATS_TEST_TMPDIR/before"
+  for f in $SETUP_NAMES; do cp "$FF_ROOT/$f" "$BATS_TEST_TMPDIR/before/$f"; done
+  cp "$FF_ROOT/systemd/freeframe-backup.service" "$BATS_TEST_TMPDIR/before/"
+}
+
+assert_files_before() {
+  local f
+  for f in $SETUP_NAMES; do
+    cmp "$BATS_TEST_TMPDIR/before/$f" "$FF_ROOT/$f" || { echo "$f is not as before"; return 1; }
+  done
+  cmp "$BATS_TEST_TMPDIR/before/freeframe-backup.service" "$FF_ROOT/systemd/freeframe-backup.service"
+}
+
+# The update stopped before the new version started: as if it never ran.
+assert_put_back() {
+  assert_files_before
+  [ ! -e "$FF_ROOT/.update-undo" ] || { echo "record left:"; cat "$FF_ROOT/.update-undo"; return 1; }
+  [ -z "$(ls -A "$FF_ROOT" | grep '^\.download')" ]
+  assert_out "FreeFrame is running the version it had (1.21.0), with its setup files from before."
+  assert_out "Running sudo freeframe update again is safe."
+  assert_no_out "Nothing has been changed"
+  assert_no_out "sudo rm"
+}
+
+@test "update: stopped (TERM) during the image download, the old files are back and a re-run works" {
+  keep_files
+  export STUB_PULL_HANG=1
+  ff_signal TERM pull update
+  [ "$status" -eq 1 ]
+  assert_out "The update was stopped (SIGTERM) while downloading FreeFrame 1.22.0"
+  assert_put_back
+  unset STUB_PULL_HANG
+  ff update
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "FreeFrame was updated from 1.21.0 to 1.22.0."
+}
+
+@test "update: stopped (HUP) in the middle of replacing the setup files, none of the new ones stays" {
+  keep_files
+  export STUB_MV_HANG=docker-compose.storage.yml
+  ff_signal HUP mv update
+  [ "$status" -eq 1 ]
+  assert_out "stopped (SIGHUP)"
+  assert_put_back
+}
+
+@test "update: stopped (TERM) right after the record is written, nothing stays changed" {
+  keep_files
+  export STUB_UNDO_SET_HANG=1
+  ff_signal TERM undo-set update
+  [ "$status" -eq 1 ]
+  assert_put_back
+}
+
+@test "update: an unexpected failure (ERR) after the record is written puts the old files back" {
+  keep_files
+  export STUB_SAY_FAIL="Downloading FreeFrame 1.22.0"
+  ff update
+  [ "$status" -eq 1 ]
+  assert_out "The update stopped unexpectedly while"
+  assert_put_back
+}
+
+@test "update: stopped once the new version is starting, the record stays and names the rollback" {
+  export STUB_HEALTH_HANG=1
+  ff_signal TERM health update
+  [ "$status" -eq 1 ]
+  [ -e "$FF_ROOT/.update-undo" ]
+  grep -qx "phase=started" "$FF_ROOT/.update-undo"
+  assert_out "run: sudo freeframe rollback"
+  assert_no_out "update again"
+}
+
+@test "update: a record left by a killed update before the new version started is put back first" {
+  keep_files
+  # What a SIGKILL during the image download leaves: new files in place, the
+  # saved set, and the record.
+  mkdir -p "$FF_ROOT/rollback"
+  local f
+  for f in $SETUP_NAMES; do cp "$FF_ROOT/$f" "$FF_ROOT/rollback/$f"; cp "$STUB_REMOTE/$f" "$FF_ROOT/$f"; done
+  cp "$FF_ROOT/systemd/"freeframe-backup.* "$FF_ROOT/rollback/"
+  mkdir -p "$BK"
+  printf 'PGDMP before\n' >"$BK/freeframe-20261020-030000.dump"
+  printf 'version=1.21.0\nbackup=%s\ntime=2026-10-20 03:00:00 +0000\nphase=saved\n' "$BK/freeframe-20261020-030000.dump" \
+    >"$FF_ROOT/.update-undo"
+  ff update
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "An earlier update stopped before it started the new version"
+  assert_out "FreeFrame was updated from 1.21.0 to 1.22.0."
+  [ ! -e "$FF_ROOT/.update-undo" ]
+}
+
+@test "update: a record of an update whose new version started is refused, and removing it is offered" {
+  mkdir -p "$BK"
+  printf 'PGDMP before\n' >"$BK/freeframe-20261020-030000.dump"
+  printf 'version=1.21.0\nbackup=%s\ntime=2026-10-20 03:00:00 +0000\nphase=started\n' "$BK/freeframe-20261020-030000.dump" \
+    >"$FF_ROOT/.update-undo"
+  ff update
+  [ "$status" -eq 1 ]
+  assert_out "sudo freeframe rollback"
+  assert_out "sudo rm '$FF_ROOT/.update-undo'"
+  # A record without a phase (written by an older freeframe) is treated the same.
+  sed -i '/^phase=/d' "$FF_ROOT/.update-undo"
+  ff update
+  [ "$status" -eq 1 ]
+  assert_out "sudo freeframe rollback"
+  assert_not_called "fetch latest docker-compose"
+}
+
+@test "update: new files on disk under the old running version take the way back from the old release's tag" {
+  # A record removed by hand after an update stopped part-way: the files are
+  # the new release's, the containers still the old one's.
+  local f
+  for f in $SETUP_NAMES; do cp "$STUB_REMOTE/$f" "$FF_ROOT/$f"; done
+  export STUB_RUNNING_IMAGE=ghcr.io/techiebutler/freeframe-api:1.21.0
+  export STUB_REMOTE_REFS="$BATS_TEST_TMPDIR/refs"
+  # The old release's files at its tag.
+  mkdir -p "$STUB_REMOTE_REFS/v1.21.0/deploy/systemd"
+  sed 's/1.22.0/1.21.0/g' "$STUB_REMOTE/docker-compose.images.yml" >"$STUB_REMOTE_REFS/v1.21.0/docker-compose.images.yml"
+  for f in docker-compose.prod.yml docker-compose.https.yml docker-compose.storage.yml; do
+    cp "$STUB_REMOTE/$f" "$STUB_REMOTE_REFS/v1.21.0/$f"
+  done
+  cp "$STUB_REMOTE"/deploy/systemd/* "$STUB_REMOTE_REFS/v1.21.0/deploy/systemd/"
+  export STUB_API_DOWN=1 FF_API_WAIT=10
+  ff update
+  [ "$status" -eq 1 ]
+  grep -qx "fetch v1.21.0 docker-compose.images.yml" "$CALLS"
+  grep -qx "version=1.21.0" "$FF_ROOT/.update-undo"
+  grep -q '1.21.0' "$FF_ROOT/rollback/docker-compose.images.yml"
+  assert_out "To go back to 1.21.0"
+}
+
+@test "update: when the old release's files cannot be had, it stops before changing anything" {
+  local f
+  for f in $SETUP_NAMES; do cp "$STUB_REMOTE/$f" "$FF_ROOT/$f"; done
+  export STUB_RUNNING_IMAGE=ghcr.io/techiebutler/freeframe-api:1.21.0 STUB_FETCH_FAIL_REF=v1.21.0
+  ff update
+  [ "$status" -eq 1 ]
+  assert_out "FreeFrame runs version 1.21.0, but the setup files in $FF_ROOT are for 1.22.0"
+  assert_out "nothing was changed"
+  assert_not_called "dc pull"
+  [ ! -e "$FF_ROOT/.update-undo" ]
+}
+
+# ---------------------------------------------------------------- minors (round 2)
+
+@test "update: a mixed set that can be put back from the saved copy ends true and safe" {
+  keep_files
+  export STUB_MV_FAIL=docker-compose.storage.yml STUB_MV_OLD_FAIL=docker-compose.images.yml
+  ff update
+  [ "$status" -eq 1 ]
+  assert_out "could not be put back either"
+  assert_put_back
+}
+
+@test "update: a mixed set that cannot be put back keeps the record and names the rollback" {
+  export STUB_MV_FAIL=docker-compose.storage.yml STUB_MV_OLD_FAIL=docker-compose.images.yml STUB_PUTBACK_FAIL=1
+  ff update
+  [ "$status" -eq 1 ]
+  [ -e "$FF_ROOT/.update-undo" ]
+  assert_out "run: sudo freeframe rollback"
+  assert_no_out "Nothing has been changed"
+  assert_no_out "update again"
+}
+
