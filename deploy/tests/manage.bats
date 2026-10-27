@@ -181,6 +181,32 @@ setup() {
   assert_eq "$(cat "$FF_ROOT/.restore-undo")" "$BK/freeframe-20261020-030000.dump"
 }
 
+@test "restart: an inherited FF_LOCK_FD on another file is not taken for the lock" {
+  command -v flock >/dev/null || skip "no flock"
+  # Another freeframe command holds the lock...
+  exec 9>>"$FF_ROOT/.freeframe.lock"
+  flock -n 9
+  # ...and this one inherits a descriptor on some other file under the name.
+  exec 8>>"$BATS_TEST_TMPDIR/not-the-lock"
+  FF_LOCK_FD=8 ff restart
+  exec 8>&- 9>&-
+  [ "$status" -eq 1 ]
+  assert_out "is running right now, so FreeFrame was not restarted."
+  assert_not_called "dc up"
+}
+
+@test "restart: an inherited FF_LOCK_FD on the lock file it holds carries on with that lock" {
+  command -v flock >/dev/null || skip "no flock"
+  # As the update's re-exec hands it on: the descriptor is open on the lock
+  # file and holds the lock.
+  exec 9>>"$FF_ROOT/.freeframe.lock"
+  flock -n 9
+  FF_LOCK_FD=9 ff restart
+  exec 9>&-
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -q "^dc up -d --no-build --force-recreate" "$CALLS"
+}
+
 @test "status, logs and restart need root and an installed FreeFrame" {
   local c
   for c in status logs restart; do
