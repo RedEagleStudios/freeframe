@@ -1280,7 +1280,10 @@ cp "$DOWNLOAD" "$out"
 EOF
   # A Docker with nothing on it, for runs of the real script.
   printf '%s\n' '#!/bin/sh' 'exit 0' >"$BIN/docker"
-  chmod +x "$BIN/curl" "$BIN/docker"
+  # Root, as under sudo, whoever runs the suite (CI runs it as a normal
+  # user). The not-root test replaces this with a normal user's id.
+  printf '%s\n' '#!/bin/sh' "if [ \"\$1\" = -u ]; then echo 0; else exec $(command -v id) \"\$@\"; fi" >"$BIN/id"
+  chmod +x "$BIN/curl" "$BIN/docker" "$BIN/id"
 }
 
 run_bootstrap() {
