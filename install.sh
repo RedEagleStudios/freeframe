@@ -2,23 +2,33 @@
 # ============================================================
 # FreeFrame installer: one command on a fresh Ubuntu or Debian server.
 #
-#   curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/latest/install.sh | sudo bash
+#   sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/latest/install.sh)"
 #
 # This small script downloads the freeframe command from the same branch or
 # tag and runs `freeframe install` from that download, with the terminal
-# attached, so its questions work even though this script arrives through a
-# pipe. It writes nothing itself: `freeframe install` puts the command at
-# /usr/local/bin/freeframe once its checks have passed and the install goes
-# ahead, so a refused run leaves the server as it was.
+# attached, so its questions can be answered. It writes nothing itself:
+# `freeframe install` puts the command at /usr/local/bin/freeframe once its
+# checks have passed and the install goes ahead, so a refused run leaves the
+# server as it was.
+#
+# Answers can be given ahead of time. With bash -c, the word right after the
+# script is only its name, so write install there and the options after it.
+# sudo drops variables set before it, so put them after it:
+#
+#   sudo bash -c "$(curl -fsSL .../install.sh)" install --domain review.yourstudio.com
+#   sudo FREEFRAME_CHANNEL=stable bash -c "$(curl -fsSL .../stable/install.sh)"
+#
+# Without a terminal (cloud-init, CI) every answer must be given ahead of
+# time with --yes, and the script can then also arrive through a pipe:
+#
+#   curl -fsSL .../install.sh | sudo FREEFRAME_ADMIN_EMAIL=you@yourstudio.com bash -s -- --yes
+#
+# A piped run that asks questions does not work under sudo-rs (Ubuntu
+# 26.04's sudo): the questions freeze. This script then stops before it
+# downloads anything and shows the bash -c form instead.
 #
 # The branch or tag is --channel when given, otherwise FREEFRAME_CHANNEL,
-# otherwise latest. sudo drops variables set before it, so put them after it:
-#
-#   curl -fsSL .../install.sh | sudo FREEFRAME_CHANNEL=stable bash
-#   curl -fsSL .../install.sh | sudo bash -s -- --yes --domain review.yourstudio.com
-#
-# Without a terminal (cloud-init, CI) it runs without one, and every answer
-# must be given ahead of time.
+# otherwise latest.
 #
 # Everything sits in main(), which runs on the last line, so a download that
 # is cut short never runs half a script.
@@ -26,6 +36,37 @@
 
 RAW=https://raw.githubusercontent.com/Techiebutler/freeframe
 GUIDE=https://github.com/Techiebutler/freeframe/blob/main/docs/deployment.md
+
+# quote WORD: WORD as the shell needs it typed (in single quotes when it
+# holds anything but plain characters).
+quote() {
+  case $1 in
+    "" | *[!A-Za-z0-9._/=:@,+-]*) printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+# install_cmd REF [ARGS...]: the interactive install command for REF, which
+# works with every sudo. FREEFRAME_CHANNEL is named for any ref but latest,
+# because the script cannot see the address it was downloaded from.
+# The $( ) is printed for the reader to type, never run here.
+# shellcheck disable=SC2016
+install_cmd() {
+  cmd_ref=$1
+  shift
+  if [ "$cmd_ref" = latest ]; then
+    printf 'sudo bash -c "$(curl -fsSL %s/%s/install.sh)"' "$RAW" "$cmd_ref"
+  else
+    printf 'sudo FREEFRAME_CHANNEL=%s bash -c "$(curl -fsSL %s/%s/install.sh)"' "$cmd_ref" "$RAW" "$cmd_ref"
+  fi
+  if [ $# -gt 0 ]; then
+    printf ' install'
+    for cmd_arg in "$@"; do
+      printf ' %s' "$(quote "$cmd_arg")"
+    done
+  fi
+  printf '\n'
+}
 
 # not_yet LEAD IF: a "What to try" (LEAD, then IF, as "If it can,") for a
 # channel that may not have the installer yet. On latest there is no other
@@ -35,11 +76,55 @@ not_yet() {
     echo "What to try: $1 $2 the latest release may not have the installer yet (it needs a release after v1.21.0): wait for the next release, or set FreeFrame up by hand as the guide explains: $GUIDE" >&2
   else
     echo "What to try: $1 $2 the '$ref' channel may not have the installer yet:" >&2
-    echo "  curl -fsSL $RAW/latest/install.sh | sudo FREEFRAME_CHANNEL=latest bash" >&2
+    echo "  sudo FREEFRAME_CHANNEL=latest bash -c \"\$(curl -fsSL $RAW/latest/install.sh)\"" >&2
   fi
 }
 
+stdin_is_terminal() { [ -t 0 ]; }
+
+# started_by_sudo_rs: 0 when sudo-rs started this script. The parent process
+# says which sudo it is; when /proc cannot be read, sudo --version does.
+# SUDO_USER is set only under sudo, so root's own shell never counts.
+started_by_sudo_rs() {
+  [ -n "${SUDO_USER:-}" ] || return 1
+  if parent=$(readlink "/proc/$PPID/exe" 2>/dev/null) && [ -n "$parent" ]; then
+    case $parent in
+      *sudo-rs* | /usr/lib/cargo/bin/sudo) return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
+  case $(sudo --version 2>/dev/null | head -n 1) in
+    sudo-rs*) return 0 ;;
+  esac
+  return 1
+}
+
+# sudo_rs_would_freeze ARGS...: 0 when this run would ask questions with
+# the script arriving through a pipe under sudo-rs. sudo-rs cannot pass the
+# keyboard on then, so the first question would freeze with nothing shown.
+# A run that asks nothing (--yes, FREEFRAME_YES, --help) is fine.
+sudo_rs_would_freeze() {
+  case ${FREEFRAME_YES:-} in
+    1 | [Tt]rue | TRUE | [Yy]es | YES | [Yy]) return 1 ;;
+  esac
+  for arg in "$@"; do
+    case $arg in
+      -y | --yes | -h | --help) return 1 ;;
+    esac
+  done
+  if stdin_is_terminal; then return 1; fi
+  started_by_sudo_rs
+}
+
 main() {
+  # Run as bash -c "$(curl ...)" WORD ARGS, WORD is $0. The documented WORD
+  # is install; an option there (the word left out) would be lost, so it is
+  # taken back. A leading install word among the arguments is dropped too.
+  case $0 in
+    --?* | -y | -h) set -- "$0" "$@" ;;
+  esac
+  if [ "${1:-}" = install ]; then shift; fi
+
   ref=${FREEFRAME_CHANNEL:-latest}
   # The script must come from the channel it installs: --channel wins.
   prev=""
@@ -54,15 +139,23 @@ main() {
     "" | -* | *[!A-Za-z0-9._/-]* | *..*)
       echo "The channel must be a branch or tag name such as stable or latest (it is '$ref')." >&2
       echo "What to try: leave it out, or use stable or latest, for example:" >&2
-      echo "  curl -fsSL $RAW/latest/install.sh | sudo FREEFRAME_CHANNEL=latest bash" >&2
+      echo "  $(install_cmd latest)" >&2
       exit 2
       ;;
   esac
 
+  if sudo_rs_would_freeze "$@"; then
+    echo "This server's sudo (sudo-rs, which Ubuntu 26.04 uses) cannot pass the keyboard to a script that arrives through a pipe, so the installer's questions would freeze. Nothing was changed." >&2
+    echo "What to try: run the installer this way instead, which works with every sudo:" >&2
+    echo "  $(install_cmd "$ref" "$@")" >&2
+    echo "To install without questions, keep the pipe and give every answer ahead of time with --yes; the guide shows how: $GUIDE" >&2
+    exit 1
+  fi
+
   if [ "$(id -u)" != 0 ]; then
     echo "Please run the installer as root." >&2
     echo "What to try: put sudo in front of bash:" >&2
-    echo "  curl -fsSL $RAW/$ref/install.sh | sudo FREEFRAME_CHANNEL=$ref bash" >&2
+    echo "  $(install_cmd "$ref")" >&2
     exit 2
   fi
 
@@ -101,4 +194,6 @@ main() {
   exit "$rc"
 }
 
-main "$@"
+# FREEFRAME_INSTALL_SH_NO_MAIN: for the tests, which source this file to
+# check the functions above.
+[ -n "${FREEFRAME_INSTALL_SH_NO_MAIN:-}" ] || main "$@"

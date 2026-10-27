@@ -374,12 +374,17 @@ _ff_cmd_installed() { [[ -x ${FF_BIN_DIR:-/usr/local/bin}/freeframe ]]; }
 
 # _ff_bootstrap_cmd ARGS: the one-line install command for this run's
 # channel (ff_channel: --channel, else the settings file's, else latest),
-# passing ARGS on to freeframe install.
+# passing ARGS on to freeframe install. It is the bash -c form, which works
+# with every sudo (a piped script cannot ask questions under sudo-rs); the
+# word after the script is its name, hence install. FREEFRAME_CHANNEL is
+# named for any channel but latest: install.sh cannot see its own address.
+# shellcheck disable=SC2016
 _ff_bootstrap_cmd() {
-  local ch
+  local ch env=""
   ch=$(ff_channel "$(ff_root)/.env.prod")
   _ff_valid_ref "$ch" || ch=latest
-  printf 'curl -fsSL %s/%s/install.sh | sudo bash -s -- %s' "$FF_RAW_BASE" "$ch" "$*"
+  [[ $ch == latest ]] || env="FREEFRAME_CHANNEL=$ch "
+  printf 'sudo %sbash -c "$(curl -fsSL %s/%s/install.sh)" install %s' "$env" "$FF_RAW_BASE" "$ch" "$*"
 }
 
 # _ff_valid_ref REF: 0 for a usable branch or tag name (stable, latest,
@@ -1390,7 +1395,7 @@ _install_check_system() {
   local id ver pretty arch
   if ! ff_is_root; then
     _ff_stop 2 "Please run the installer as root." \
-      "put sudo in front of the command: sudo freeframe install (in the one-line install command: ... | sudo bash)."
+      "put sudo in front of the command: sudo freeframe install (in the one-line install command: sudo bash -c \"\$(curl ...)\")."
   fi
   id=$(_ff_os_field ID)
   ver=$(_ff_os_field VERSION_ID)

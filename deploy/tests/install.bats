@@ -1295,12 +1295,37 @@ EOF
   # Root, as under sudo, whoever runs the suite (CI runs it as a normal
   # user). The not-root test replaces this with a normal user's id.
   printf '%s\n' '#!/bin/sh' "if [ \"\$1\" = -u ]; then echo 0; else exec $(command -v id) \"\$@\"; fi" >"$BIN/id"
-  chmod +x "$BIN/curl" "$BIN/docker" "$BIN/id"
+  # The parent process's program, as /proc/<pid>/exe names it: STUB_PARENT_EXE
+  # (sudo-rs is /usr/lib/cargo/bin/sudo), or unreadable with STUB_NO_PROC.
+  # Any other readlink is the real one.
+  cat >"$BIN/readlink" <<EOF
+#!/bin/sh
+case "\$1" in
+  /proc/*/exe)
+    [ -z "\${STUB_NO_PROC:-}" ] || exit 1
+    if [ -n "\${STUB_PARENT_EXE:-}" ]; then echo "\$STUB_PARENT_EXE"; exit 0; fi ;;
+esac
+exec $(command -v readlink) "\$@"
+EOF
+  # sudo --version, for when /proc cannot be read.
+  printf '%s\n' '#!/bin/sh' 'echo "${STUB_SUDO_VERSION:-Sudo version 1.9.16}"' >"$BIN/sudo"
+  chmod +x "$BIN/curl" "$BIN/docker" "$BIN/id" "$BIN/readlink" "$BIN/sudo"
+  # Not started by sudo unless a test says so.
+  unset SUDO_USER
 }
 
 run_bootstrap() {
-  run env PATH="$BIN:$PATH" sh "${BATS_TEST_DIRNAME}/../../install.sh" "$@"
+  run env PATH="$BIN:$PATH" sh "${BATS_TEST_DIRNAME}/../../install.sh" "$@" </dev/null
 }
+
+# under_sudo_rs: what sudo-rs gives the piped script: a parent that is
+# sudo-rs and the user who ran sudo.
+under_sudo_rs() {
+  export SUDO_USER=ada STUB_PARENT_EXE=/usr/lib/cargo/bin/sudo
+}
+
+# The working interactive command for a ref.
+SUDO_C_LATEST='sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/latest/install.sh)"'
 
 @test "install.sh: runs the downloaded install on the latest channel and writes nothing" {
   bootstrap_setup
@@ -1395,8 +1420,12 @@ run_bootstrap() {
   chmod +x "$BIN/id"
   run_bootstrap
   [ "$status" -eq 2 ]
-  assert_out "| sudo FREEFRAME_CHANNEL=latest bash"
+  assert_out "$SUDO_C_LATEST"
   [ ! -s "$CALLS" ]
+  FREEFRAME_CHANNEL=stable run_bootstrap
+  [ "$status" -eq 2 ]
+  assert_out 'sudo FREEFRAME_CHANNEL=stable bash -c "$(curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/stable/install.sh)"'
+  if [[ $output == *"| sudo"* ]]; then echo "$output"; false; fi
 }
 
 @test "install.sh with the real script: a refused run leaves no freeframe command" {
@@ -1424,6 +1453,120 @@ run_bootstrap() {
   cmp "$FF_BIN_DIR/freeframe" "$BATS_TEST_TMPDIR/bin.before"
 }
 
+# ---------------------------------------------------------------- install.sh under sudo-rs
+
+@test "install.sh: piped under sudo-rs and interactive, it stops before downloading and shows the command that works" {
+  bootstrap_setup
+  under_sudo_rs
+  run_bootstrap
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  assert_out "sudo-rs"
+  assert_out "cannot pass the keyboard to a script that arrives through a pipe"
+  assert_out "Nothing was changed."
+  grep -qxF -- "  $SUDO_C_LATEST" <<<"$output" || { echo "$output"; false; }
+  # Nothing was downloaded.
+  [ ! -s "$CALLS" ]
+  [ -z "$(ls -A "$TMPDIR")" ]
+}
+
+@test "install.sh: under sudo-rs the command shown keeps the channel and the answers given" {
+  bootstrap_setup
+  under_sudo_rs
+  FREEFRAME_CHANNEL=stable run_bootstrap --domain review.example.com --admin-name "Ada Lovelace"
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  grep -qxF -- '  sudo FREEFRAME_CHANNEL=stable bash -c "$(curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/stable/install.sh)" install --domain review.example.com --admin-name '"'"'Ada Lovelace'"'"'' <<<"$output" ||
+    { echo "$output"; false; }
+  [ ! -s "$CALLS" ]
+}
+
+@test "install.sh: under sudo-rs a run with --yes, -y or FREEFRAME_YES goes ahead" {
+  bootstrap_setup
+  under_sudo_rs
+  run_bootstrap --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "ran: install --channel latest --yes"
+  run_bootstrap -y
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  FREEFRAME_YES=1 run_bootstrap
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "ran: install --channel latest"
+  # help asks nothing either.
+  run_bootstrap --help
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+}
+
+@test "install.sh: classic sudo, and root without sudo, are never stopped" {
+  bootstrap_setup
+  export SUDO_USER=ada STUB_PARENT_EXE=/usr/bin/sudo.ws
+  run_bootstrap
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "ran: install --channel latest"
+  export STUB_PARENT_EXE=/usr/bin/sudo
+  run_bootstrap
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  # Root's own shell, even on a server whose sudo is sudo-rs.
+  unset SUDO_USER
+  export STUB_PARENT_EXE=/usr/bin/bash STUB_SUDO_VERSION="sudo-rs 0.2.13"
+  run_bootstrap
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+}
+
+@test "install.sh: when /proc cannot be read, sudo --version decides" {
+  bootstrap_setup
+  export SUDO_USER=ada STUB_NO_PROC=1 STUB_SUDO_VERSION="sudo-rs 0.2.13-0ubuntu1.2"
+  run_bootstrap
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  assert_out "$SUDO_C_LATEST"
+  export STUB_SUDO_VERSION="Sudo version 1.9.16p2"
+  run_bootstrap
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+}
+
+@test "install.sh: the guard's decision: only piped, interactive and sudo-rs together stop" {
+  local lib="${BATS_TEST_DIRNAME}/../../install.sh"
+  # sourced without running main; the three inputs stubbed.
+  check() {
+    sh -c '
+      FREEFRAME_INSTALL_SH_NO_MAIN=1 . "$1"; shift
+      stdin_is_terminal() { [ "$T" = 1 ]; }
+      started_by_sudo_rs() { [ "$R" = 1 ]; }
+      if sudo_rs_would_freeze "$@"; then echo stop; else echo go; fi
+    ' check "$lib" "$@"
+  }
+  assert_eq "$(T=0 R=1 check)" stop
+  assert_eq "$(T=1 R=1 check)" go
+  assert_eq "$(T=0 R=0 check)" go
+  assert_eq "$(T=0 R=1 check --yes)" go
+  assert_eq "$(T=0 R=1 check --domain x.example.com -y)" go
+  assert_eq "$(T=0 R=1 FREEFRAME_YES=true check)" go
+  assert_eq "$(T=0 R=1 FREEFRAME_YES=0 check)" stop
+  assert_eq "$(T=0 R=1 check -h)" go
+  assert_eq "$(T=0 R=1 check --domain x.example.com)" stop
+}
+
+@test "install.sh: run as bash -c, a leading install word is dropped and a lost first option is kept" {
+  bootstrap_setup
+  local script
+  script=$(cat "${BATS_TEST_DIRNAME}/../../install.sh")
+  # The documented form: the word after the script is $0.
+  run env PATH="$BIN:$PATH" bash -c "$script" install --yes --domain review.example.com
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "ran: install --channel latest --yes --domain review.example.com"
+  # The install word typed twice, or after --.
+  run env PATH="$BIN:$PATH" bash -c "$script" -- install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "ran: install --channel latest --yes"
+  if [[ $output == *"--yes install"* || $output == *"latest install"* ]]; then echo "$output"; false; fi
+  # The install word left out: the first option would be $0 and lost.
+  run env PATH="$BIN:$PATH" bash -c "$script" --yes --channel stable
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "ran: install --channel stable --yes --channel stable"
+  # The piped form with an install word.
+  run_bootstrap install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "ran: install --channel latest --yes"
+}
+
 # ---------------------------------------------------------------- hints and state lines
 
 @test "install: a program is listed as stopped only when stopping it worked" {
@@ -1443,11 +1586,11 @@ run_bootstrap() {
   run bash -c 'source "$1"; main install --channel stable --bogus' ff "$FF_SCRIPT"
   [ "$status" -eq 2 ]
   assert_out "Unknown option: --bogus"
-  assert_out "curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/stable/install.sh | sudo bash -s -- --help"
+  assert_out 'sudo FREEFRAME_CHANNEL=stable bash -c "$(curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/stable/install.sh)" install --help'
   if [[ $output == *"run 'freeframe help'"* ]]; then echo "$output"; false; fi
   # Without a channel: latest, like install.sh.
   run bash -c 'source "$1"; main install --bogus' ff "$FF_SCRIPT"
-  assert_out "/freeframe/latest/install.sh | sudo bash -s -- --help"
+  assert_out "$SUDO_C_LATEST install --help"
   # Once the command is installed, it is named.
   mkdir -p "$FF_BIN_DIR"
   printf '#!/usr/bin/env bash\n' >"$FF_BIN_DIR/freeframe"
@@ -1462,7 +1605,7 @@ run_bootstrap() {
   plain_answers
   ff_install --channel stable
   [ "$status" -eq 2 ]
-  assert_out "curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/stable/install.sh | sudo bash -s -- --yes --admin-email you@yourstudio.com"
+  assert_out 'sudo FREEFRAME_CHANNEL=stable bash -c "$(curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/stable/install.sh)" install --yes --admin-email you@yourstudio.com'
   if [[ $output == *" freeframe install --yes"* ]]; then echo "$output"; false; fi
   mkdir -p "$FF_BIN_DIR"
   printf '#!/usr/bin/env bash\n' >"$FF_BIN_DIR/freeframe"
@@ -1478,7 +1621,7 @@ run_bootstrap() {
   ff_install --channel stable
   [ "$status" -eq 2 ]
   assert_out "The answers ended before every question was answered"
-  assert_out "/freeframe/stable/install.sh | sudo bash -s -- --help"
+  assert_out '/freeframe/stable/install.sh)" install --help'
   if [[ $output == *"see: freeframe help"* ]]; then echo "$output"; false; fi
 }
 
@@ -1510,8 +1653,8 @@ run_bootstrap() {
   printf 'FREEFRAME_CHANNEL=stable\n' >"$ENV"
   run bash -c 'source "$1"; main install --bogus' ff "$FF_SCRIPT"
   [ "$status" -eq 2 ]
-  assert_out "/freeframe/stable/install.sh | sudo bash -s -- --help"
+  assert_out 'sudo FREEFRAME_CHANNEL=stable bash -c "$(curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/stable/install.sh)" install --help'
   # An explicit --channel still wins.
   run bash -c 'source "$1"; main install --channel v1.22.0 --bogus' ff "$FF_SCRIPT"
-  assert_out "/freeframe/v1.22.0/install.sh | sudo bash -s -- --help"
+  assert_out 'sudo FREEFRAME_CHANNEL=v1.22.0 bash -c "$(curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/v1.22.0/install.sh)" install --help'
 }
