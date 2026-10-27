@@ -687,3 +687,23 @@ killed_update_state() {
   assert_order "sync $FF_ROOT/.update-undo $FF_ROOT [phase=saved]" "dc pull" \
     "sync $FF_ROOT/.update-undo $FF_ROOT [phase=started]" "dc up -d --no-build"
 }
+
+@test "_ff_running_version: an image pinned by digest gives no version" {
+  local img
+  for img in "ghcr.io/techiebutler/freeframe-api@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" \
+    "ghcr.io/techiebutler/freeframe-api:1.21.0@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"; do
+    run env STUB_RUNNING_IMAGE="$img" bash -c 'source "$1"; source "$2"; _ff_running_version' ff "$FF_SCRIPT" "$STUBS"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ] || { echo "$img gave: $output"; return 1; }
+  done
+  run env STUB_RUNNING_IMAGE=ghcr.io/techiebutler/freeframe-api:1.21.0 bash -c 'source "$1"; source "$2"; _ff_running_version' ff "$FF_SCRIPT" "$STUBS"
+  [ "$output" = 1.21.0 ]
+}
+
+@test "update: a digest-pinned running image is not taken for another release" {
+  export STUB_RUNNING_IMAGE="ghcr.io/techiebutler/freeframe-api@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  ff update
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_no_out "FreeFrame runs version"
+  assert_out "FreeFrame was updated from 1.21.0 to 1.22.0."
+}

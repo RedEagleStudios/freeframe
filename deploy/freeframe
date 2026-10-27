@@ -3638,10 +3638,12 @@ _update_fail_undone() {
 }
 
 # _ff_running_version: the release the running api container was started
-# from (its image tag), or nothing when that cannot be told.
+# from (its image tag), or nothing when that cannot be told. An image named
+# by digest (@sha256:...) says nothing reliable about its release.
 _ff_running_version() {
   local img tag
   img=$(dc ps --format '{{.Image}}' api 2>/dev/null | head -n 1) || img=""
+  [[ $img != *@* ]] || return 0
   [[ $img == */*:* || $img == *:* ]] || return 0
   tag=${img##*:}
   [[ $tag =~ ^v?[0-9][A-Za-z0-9._-]*$ ]] || return 0
