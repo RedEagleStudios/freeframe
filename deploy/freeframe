@@ -2051,7 +2051,11 @@ _install_dns_step() {
         s)
           if ((can_switch)); then
             FF_HTTPS=sslip FF_MODE=sslip FF_DOMAIN="" FF_HOST=$(sslip_host "$FF_IP")
-            say "Using the temporary address $FF_HOST instead. Change it later with: sudo freeframe configure"
+            if [[ ${FF_CMD:-install} == configure ]]; then
+              say "Using the temporary address $FF_HOST instead."
+            else
+              say "Using the temporary address $FF_HOST instead. Change it later with: sudo freeframe configure"
+            fi
             return 0
           fi
           ;;

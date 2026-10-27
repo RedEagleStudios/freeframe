@@ -351,3 +351,16 @@ BEFORE() { printf '%s' "$BATS_TEST_TMPDIR/env.before"; }
   [ -z "$(env_backups)" ]
   assert_not_called "dc up"
 }
+
+@test "configure: at the DNS wait, s uses the temporary address without telling you to run configure" {
+  installed_server off bundled
+  export STUB_DNS_FAILS=1000
+  # address, certificate email (plain HTTP had none), email, storage, yes, s.
+  tty "review.yourstudio.com" "certs@example.com" "" "" "y" "s"
+  ff configure
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "Using the temporary address 203-0-113-7.sslip.io instead."
+  assert_no_out "Change it later with: sudo freeframe configure"
+  assert_has "$ENV" "FRONTEND_URL=https://203-0-113-7.sslip.io"
+  assert_has "$ENV" "FREEFRAME_HTTPS=sslip"
+}
