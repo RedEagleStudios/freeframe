@@ -117,3 +117,12 @@ derive_env() {
   _stub_log derive_env
   _real_derive_env "$@"
 }
+
+# STUB_MV_FAIL=NAME: moving a file onto $FF_ROOT/NAME fails (a full or read-only
+# disk at just the wrong moment). Every other mv is real.
+if [[ -n ${STUB_MV_FAIL:-} ]]; then
+  mv() {
+    if [[ ${!#} == "$FF_ROOT/$STUB_MV_FAIL" ]]; then return 1; fi
+    command mv "$@"
+  }
+fi

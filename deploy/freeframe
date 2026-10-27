@@ -2087,15 +2087,26 @@ _install_dns_step() {
 FF_SETUP_FILES=(docker-compose.prod.yml docker-compose.images.yml docker-compose.https.yml docker-compose.storage.yml
   deploy/systemd/freeframe-backup.service deploy/systemd/freeframe-backup.timer)
 
+# _ff_setup_dest PATH: where the setup file PATH (as in the repository) lives
+# on this server: the compose files in $FF_ROOT, the units in $FF_ROOT/systemd.
+_ff_setup_dest() {
+  local root
+  root=$(ff_root)
+  if [[ $1 == deploy/systemd/* ]]; then printf '%s/systemd/%s' "$root" "${1##*/}"; else printf '%s/%s' "$root" "$1"; fi
+}
+
 # fetch_setup_files REF: download the compose files and the nightly backup
 # units from REF into $FF_ROOT (the units into $FF_ROOT/systemd, where
-# install_backup_timer takes them from). All of them are downloaded first
-# and only then moved into place, so a failed download leaves the old set
-# whole. On failure FF_FETCH_FAILED names the file and it returns 1.
+# install_backup_timer takes them from). All or nothing: every file is
+# downloaded first, and when moving one into place fails, those already
+# moved are put back, so the old set stays whole. On failure it returns 1,
+# FF_FETCH_FAILED names the file, FF_FETCH_STAGE is download or move, and
+# FF_FETCH_MIXED=1 says the old set could not be put back completely.
 fetch_setup_files() {
-  local ref=$1 root stage f dest
+  local ref=$1 root stage f dest name i
+  local -a moved=()
   root=$(ff_root)
-  FF_FETCH_FAILED=""
+  FF_FETCH_FAILED="" FF_FETCH_STAGE=download FF_FETCH_MIXED=""
   mkdir -p "$root/systemd" || return 1
   stage=$(mktemp -d "$root/.download.XXXXXX") || return 1
   for f in "${FF_SETUP_FILES[@]}"; do
@@ -2105,16 +2116,45 @@ fetch_setup_files() {
       return 1
     fi
   done
+  FF_FETCH_STAGE=move
+  mkdir "$stage/old" || {
+    rm -rf "$stage"
+    return 1
+  }
   for f in "${FF_SETUP_FILES[@]}"; do
-    dest="$root/$f"
-    [[ $f != deploy/systemd/* ]] || dest="$root/systemd/${f##*/}"
-    if ! mv -f "$stage/${f##*/}" "$dest"; then
-      FF_FETCH_FAILED=$f
-      rm -rf "$stage"
-      return 1
+    dest=$(_ff_setup_dest "$f")
+    name=${f##*/}
+    if { [[ ! -e $dest ]] || cp -p "$dest" "$stage/old/$name"; } && mv -f "$stage/$name" "$dest"; then
+      moved+=("$f")
+      continue
     fi
+    FF_FETCH_FAILED=$f
+    # Put back what was already replaced (a file that was not there before
+    # is removed again).
+    for ((i = ${#moved[@]} - 1; i >= 0; i--)); do
+      dest=$(_ff_setup_dest "${moved[i]}")
+      name=${moved[i]##*/}
+      if [[ -e $stage/old/$name ]]; then
+        mv -f "$stage/old/$name" "$dest" || FF_FETCH_MIXED=1
+      else
+        rm -f "$dest" || FF_FETCH_MIXED=1
+      fi
+    done
+    rm -rf "$stage"
+    return 1
   done
   rm -rf "$stage"
+}
+
+# _ff_fetch_failure CHANNEL_WORDS: the message for a failed fetch_setup_files.
+_ff_fetch_failure() {
+  if [[ $FF_FETCH_STAGE == download ]]; then
+    printf 'Could not download %s for %s, so none of the setup files was replaced.' "${FF_FETCH_FAILED:-the setup files}" "$1"
+  elif [[ -n $FF_FETCH_MIXED ]]; then
+    printf 'The new %s could not be put in place, and some of the setup files from before could not be put back either.' "${FF_FETCH_FAILED:-setup files}"
+  else
+    printf 'The new %s could not be put in place, so none of the setup files was replaced.' "${FF_FETCH_FAILED:-setup files}"
+  fi
 }
 
 _install_fetch_step() {
@@ -2123,7 +2163,7 @@ _install_fetch_step() {
   FF_STEP="downloading the setup files"
   say "Downloading the setup files for the $FF_CHANNEL channel..."
   if ! fetch_setup_files "$FF_CHANNEL"; then
-    install_fail "Could not download ${FF_FETCH_FAILED:-the setup files} for the $FF_CHANNEL channel." \
+    install_fail "$(_ff_fetch_failure "the $FF_CHANNEL channel")" \
       "check that this server can reach raw.githubusercontent.com, then run sudo freeframe install again. If it can, the $FF_CHANNEL channel may not have this file yet (the installer needs a release after v1.21.0): try --channel latest."
   fi
   _install_done "downloaded the setup files into $root"
@@ -3439,8 +3479,8 @@ cmd_update() {
   FF_STEP="downloading the setup files"
   say "Downloading the setup files for the $ch channel..."
   if ! fetch_setup_files "$ch"; then
-    install_fail "Could not download ${FF_FETCH_FAILED:-the setup files} for the $ch channel, so none of the setup files was replaced." \
-      "check that this server can reach raw.githubusercontent.com, then run sudo freeframe update again."
+    install_fail "$(_ff_fetch_failure "the $ch channel")" \
+      "check that this server can reach raw.githubusercontent.com and that the disk is not full, then run sudo freeframe update again."
   fi
   new=$(ff_version)
   FF_STATE="The setup files for $new are in place, but FreeFrame is still running the version it had ($old). Running sudo freeframe update again finishes the move."

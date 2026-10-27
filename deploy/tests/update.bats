@@ -258,6 +258,24 @@ newest_dump() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null | tail -1)
   [ -z "$(ls -A "$FF_ROOT" | grep '^\.download')" ]
 }
 
+@test "update: a setup file that cannot be moved into place puts back the ones already moved" {
+  export STUB_MV_FAIL=docker-compose.storage.yml
+  local f
+  mkdir -p "$BATS_TEST_TMPDIR/before"
+  for f in docker-compose.prod.yml docker-compose.images.yml docker-compose.https.yml docker-compose.storage.yml; do
+    cp "$FF_ROOT/$f" "$BATS_TEST_TMPDIR/before/$f"
+  done
+  ff update
+  [ "$status" -eq 1 ]
+  assert_out "could not be put in place, so none of the setup files was replaced"
+  # The images file was moved in before the storage file failed: it is back.
+  for f in docker-compose.prod.yml docker-compose.images.yml docker-compose.https.yml docker-compose.storage.yml; do
+    cmp "$BATS_TEST_TMPDIR/before/$f" "$FF_ROOT/$f"
+  done
+  assert_not_called "dc pull"
+  [ -z "$(ls -A "$FF_ROOT" | grep '^\.download')" ]
+}
+
 @test "update: a pinned version is kept and said" {
   printf 'FREEFRAME_VERSION=1.20.0\n' >>"$ENV"
   ff update
