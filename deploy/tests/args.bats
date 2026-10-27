@@ -177,14 +177,14 @@ setup() {
   run bash "$FF_SCRIPT" help
   [ "$status" -eq 0 ]
   local c
-  for c in install update configure backup restore status logs restart help; do
+  for c in install update rollback configure backup restore status logs restart help; do
     [[ "$output" == *"$c"* ]]
   done
 }
 
 @test "every subcommand is built: on a server without FreeFrame each one stops before doing anything" {
   local c
-  for c in update configure status logs restart; do
+  for c in update rollback configure status logs restart; do
     run bash "$FF_SCRIPT" "$c"
     # 1: not installed here (FF_ROOT is empty); 2: not root.
     [[ $status -eq 1 || $status -eq 2 ]] || { echo "$c: $status $output"; false; }

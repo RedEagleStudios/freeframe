@@ -4,6 +4,7 @@
 #
 #   sudo freeframe install     set up FreeFrame on a fresh server
 #   sudo freeframe update      move to the newest release (backs up first)
+#   sudo freeframe rollback    go back after an update that did not come up
 #   sudo freeframe status      see whether everything is running
 #   sudo freeframe help        list every command
 #
@@ -856,22 +857,25 @@ dc() {
 # Backups
 # ------------------------------------------------------------
 
-# backup_prune DIR KEEP [PROTECT]: delete all but the newest KEEP
+# backup_prune DIR KEEP [PROTECT...]: delete all but the newest KEEP
 # freeframe-*.dump files in DIR, with their freeframe-*.env.prod settings
 # copies. Backups are named freeframe-<YYYYmmdd-HHMMSS>.dump, so newest is
-# last in name order. PROTECT (a dump path) is never deleted and not counted:
-# restore uses it for the copy an unfinished restore can be undone with.
+# last in name order. Each PROTECT (a dump path) is never deleted and not
+# counted: the copy an unfinished restore can be undone with, and the
+# backup a failed update is rolled back to.
 backup_prune() {
-  local dir=$1 keep=$2 protect=${3:-} f n i=0
+  local dir=$1 keep=$2 f n i=0
   local LC_ALL=C
   local -a dumps=()
+  shift 2
+  local protect=" $* "
   if [[ ! $keep =~ ^[0-9]+$ ]]; then
     warn "backup_prune: the number of backups to keep must be a whole number (got '$keep')."
     return 1
   fi
   [[ -d $dir ]] || return 0
   for f in "$dir"/freeframe-*.dump; do
-    [[ -f $f && $f != "$protect" ]] && dumps+=("$f")
+    [[ -f $f && $protect != *" $f "* ]] && dumps+=("$f")
   done
   n=$((${#dumps[@]} - 10#$keep))
   while ((i < n)); do
@@ -1178,6 +1182,9 @@ install_fail() {
   warn ""
   warn "$1"
   if [[ -n ${2:-} ]]; then warn "What to try: $2"; fi
+  # FF_STATE_PREFIX: the state of a larger job this step belongs to (the
+  # rollback around its restore).
+  if [[ -n ${FF_STATE_PREFIX:-} ]]; then warn "$FF_STATE_PREFIX"; fi
   if [[ -n ${FF_STATE:-} ]]; then warn "$FF_STATE"; fi
   _ff_already_done
   if [[ -n ${FF_LOG:-} ]]; then warn "Everything ${FF_ACTOR:-the installer} did is written to $FF_LOG."; fi
@@ -2685,7 +2692,7 @@ _ff_backup_refused() {
 # less free space than twice the last backup, or 1 GB. Prints its own
 # message and returns 1 when no backup was made.
 backup_create() {
-  local mode=${1:-prune} root dir file base stamp last="" last_bytes=0 need free retry protect f
+  local mode=${1:-prune} root dir file base stamp last="" last_bytes=0 need free retry protect upd f
   local -a dumps=()
   root=$(ff_root)
   dir="$root/backups"
@@ -2709,9 +2716,11 @@ backup_create() {
   # The copy an unfinished restore can be undone with is kept out of the
   # size rule and out of pruning while it is recorded.
   protect=$(_restore_undo_path)
+  upd=""
+  if _update_undo_read; then upd=$FF_UNDO_BACKUP; fi
   mapfile -t dumps < <(_ff_backup_dumps "$dir")
   for f in ${dumps[@]+"${dumps[@]}"}; do
-    if [[ $f != "$protect" ]]; then last=$f; fi
+    if [[ $f != "$protect" && $f != "$upd" ]]; then last=$f; fi
   done
   if [[ -n $last ]]; then
     last_bytes=$(_ff_size_bytes "$last") || last_bytes=0
@@ -2779,7 +2788,7 @@ backup_create() {
   FF_PARTIAL=""
   FF_BACKUP_MADE="$base.dump"
   printf 'backup: saved %s.dump (%s)\n' "$base" "$(_ff_human_size "$(_ff_size_bytes "$base.dump")")" >>"${FF_LOG:-/dev/null}"
-  if [[ $mode == prune ]] && ! backup_prune "$dir" "$FF_BACKUP_KEEP" "$protect"; then
+  if [[ $mode == prune ]] && ! backup_prune "$dir" "$FF_BACKUP_KEEP" "$protect" "$upd"; then
     warn "The backup was saved, but older backups could not be cleared away."
   fi
   return 0
@@ -2945,6 +2954,12 @@ _restore_db_state() {
 # that leaves the database and FreeFrame.
 _restore_fail() {
   FF_STATE=$1
+  if [[ -n ${FF_RESTORE_NO_START:-} ]]; then
+    # Within a rollback the setup files and the version were changed
+    # already (FF_STATE_PREFIX says so); only the database was not.
+    local msg=${2//nothing was changed/the database was not changed}
+    install_fail "${msg//before changing anything/before changing the database}" "$3"
+  fi
   install_fail "$2" "$3"
 }
 
@@ -2954,6 +2969,8 @@ _restore_fail() {
 # FreeFrame would open its setup page): then finish or undo that restore.
 _restore_start_hint() {
   local undo
+  # A rollback's own state line says what to do (FF_STATE_PREFIX).
+  [[ -z ${FF_RESTORE_NO_START:-} ]] || return 0
   undo=$(_restore_undo_path)
   if [[ -z $undo ]]; then
     printf 'To start FreeFrame again as it was, run: sudo freeframe restart'
@@ -2969,6 +2986,9 @@ _restore_start_hint() {
 # failed, and print the sentence that says whether that worked. While an
 # earlier restore's undo record stands it starts nothing and says why.
 _restore_restart() {
+  # Rollback: the old version must not start on the database the update
+  # left, so nothing is started (FF_STATE_PREFIX says what to do).
+  [[ -z ${FF_RESTORE_NO_START:-} ]] || return 0
   if [[ -n $(_restore_undo_path) ]]; then
     _restore_start_hint
     return 0
@@ -3026,8 +3046,7 @@ _restore_on_signal() {
 # database its setup page would be open to anyone) and the message says what
 # state the database is in and the command that tries again.
 cmd_restore() {
-  local root dump when out s state recorded="" undo="" undo_cmd=""
-  local -a all=() svcs=()
+  local root dump when undo undo_cmd
   root=$(ff_root)
   if ((${#FF_ARGS[@]} > 1)); then
     _ff_bad_usage "freeframe restore takes one backup file, for example: sudo freeframe restore $(_ff_q "$root/backups/freeframe-20261026-030000.dump")"
@@ -3067,12 +3086,48 @@ cmd_restore() {
   FF_ADMIN_CREATED="" FF_PW_GENERATED=""
   FF_RERUN="sudo freeframe restore --yes $(_ff_q "$dump")"
   FF_STATE="Nothing has been changed."
-  FF_RECORD_NEW="" FF_DROP_STARTED=""
+  FF_RECORD_NEW="" FF_DROP_STARTED="" FF_RESTORE_NO_START="" FF_STATE_PREFIX=""
   _install_log_start restore
   trap _restore_on_error ERR
   trap '_restore_on_signal INT' INT
   trap '_restore_on_signal TERM' TERM
   trap '_restore_on_signal HUP' HUP
+  restore_database "$dump"
+  undo=$FF_RESTORE_UNDO undo_cmd=$FF_RESTORE_UNDO_CMD
+
+  FF_STATE="The backup has been put back${undo:+ (the database as it was before is saved; to go back to it, run: $undo_cmd)}."
+  FF_STEP="starting FreeFrame again"
+  say "Starting FreeFrame again..."
+  if ! _ff_logged dc up -d --no-build; then
+    install_fail "The backup has been put back, but FreeFrame could not be started again." \
+      "see why with: sudo freeframe logs, then run: sudo freeframe restart"
+  fi
+  if ! _ff_wait_for "${FF_API_WAIT:-600}" 5 _ff_logged dc exec -T api curl -fsS http://localhost:8000/health; then
+    install_fail "The backup has been put back, but FreeFrame did not finish starting within $(((${FF_API_WAIT:-600} + 59) / 60)) minutes." \
+      "see why with: sudo freeframe logs, then run: sudo freeframe restart"
+  fi
+  trap - ERR INT TERM HUP
+  say ""
+  say "The database is back as it was in $dump${when:+ (made $when)}."
+  if [[ -n $undo ]]; then say "The database as it was before is saved; to go back to it, run: $undo_cmd"; fi
+  _install_log_stop
+}
+
+# restore_database DUMP: put DUMP back as FreeFrame's database (spec goal
+# 13). The caller holds the lock, logs and sets the traps, FF_RERUN (the
+# command that tries again) and FF_RESTORE_FILE. Stops every service except
+# postgres and traefik, saves a safety copy when the database has data
+# (recorded in .restore-undo while the database may be empty), drops and
+# recreates the database and restores DUMP in one transaction. FreeFrame is
+# not started: the caller does that. An early failure starts FreeFrame again
+# as it was, unless FF_RESTORE_NO_START (rollback: the old version must not
+# start on the database the update left) or an earlier restore is
+# unfinished. Sets FF_RESTORE_UNDO / FF_RESTORE_UNDO_CMD to the way back.
+restore_database() {
+  local root dump=$1 out s state recorded="" undo="" undo_cmd=""
+  local -a all=() svcs=()
+  root=$(ff_root)
+  FF_RESTORE_UNDO="" FF_RESTORE_UNDO_CMD=""
   _ff_pg_names
   recorded=$(_restore_undo_path)
   if [[ -z $recorded && -f $(_restore_undo_file) ]]; then
@@ -3140,8 +3195,9 @@ cmd_restore() {
     say "The current database is empty or not there, so there is nothing to save before the restore."
   fi
   # Restoring the recorded copy itself is the undo: then there is nothing
-  # further to go back to.
-  if [[ -n $recorded && $recorded != "$dump" ]]; then
+  # further to go back to. A rollback offers none: the copy holds what the
+  # update left, which the old version must not start on.
+  if [[ -n $recorded && $recorded != "$dump" && -z ${FF_RESTORE_NO_START:-} ]]; then
     undo=$recorded
     undo_cmd="sudo freeframe restore --yes $(_ff_q "$undo")"
   fi
@@ -3179,23 +3235,7 @@ cmd_restore() {
   # The database is whole again: the record has done its job. The messages
   # below still name this run's copy as the way back.
   _restore_undo_clear
-
-  FF_STATE="The backup has been put back${undo:+ (the database as it was before is saved; to go back to it, run: $undo_cmd)}."
-  FF_STEP="starting FreeFrame again"
-  say "Starting FreeFrame again..."
-  if ! _ff_logged dc up -d --no-build; then
-    install_fail "The backup has been put back, but FreeFrame could not be started again." \
-      "see why with: sudo freeframe logs, then run: sudo freeframe restart"
-  fi
-  if ! _ff_wait_for "${FF_API_WAIT:-600}" 5 _ff_logged dc exec -T api curl -fsS http://localhost:8000/health; then
-    install_fail "The backup has been put back, but FreeFrame did not finish starting within $(((${FF_API_WAIT:-600} + 59) / 60)) minutes." \
-      "see why with: sudo freeframe logs, then run: sudo freeframe restart"
-  fi
-  trap - ERR INT TERM HUP
-  say ""
-  say "The database is back as it was in $dump${when:+ (made $when)}."
-  if [[ -n $undo ]]; then say "The database as it was before is saved; to go back to it, run: $undo_cmd"; fi
-  _install_log_stop
+  FF_RESTORE_UNDO=$undo FF_RESTORE_UNDO_CMD=$undo_cmd
 }
 
 # ------------------------------------------------------------
@@ -3312,6 +3352,10 @@ _ff_refuse_unfinished_restore() {
   local undo
   undo=$(_restore_undo_path)
   [[ -n $undo ]] || return 0
+  if [[ -f $(_update_undo_file) ]]; then
+    _ff_stop 1 "A restore of the database did not finish, so the database may be empty. Starting FreeFrame on it would open its setup page to anyone, so freeframe $1 did not run." \
+      "finish the rollback, which is safe to run again: sudo freeframe rollback"
+  fi
   _ff_stop 1 "A restore of the database did not finish, so the database may be empty. Starting FreeFrame on it would open its setup page to anyone, so freeframe $1 did not run." \
     "finish the restore by running it again, or go back to the database as it was before it: sudo freeframe restore --yes $(_ff_q "$undo")"
 }
@@ -3330,6 +3374,7 @@ _ff_cmd_on_error() {
   if ((BASH_SUBSHELL > 0)); then exit "$code"; fi
   trap - ERR
   _ff_backup_cleanup
+  _restore_forget_new_record
   rm -rf "$(ff_root)"/.download.??????
   _restore_report "The ${FF_CMD:-command} stopped unexpectedly while ${FF_STEP:-working} (error $code)." \
     "look at the end of ${FF_LOG:-the output above} for the reason."
@@ -3339,6 +3384,7 @@ _ff_cmd_on_signal() {
   trap '' INT TERM HUP
   trap - ERR
   _ff_backup_cleanup
+  _restore_forget_new_record
   rm -rf "$(ff_root)"/.download.??????
   _restore_report "The ${FF_CMD:-command} was stopped (SIG$1) while ${FF_STEP:-working}, before it finished." \
     "to finish it, run: ${FF_RERUN:-the command} again"
@@ -3425,19 +3471,92 @@ update_self() {
   fi
 }
 
-# _update_way_back OLD FILE BACKUP: the lines that take the server back to
-# version OLD with the database from BACKUP (pin first, then restore, which
-# starts the old version on the restored database).
-_update_way_back() {
-  local old=$1 file=$2 backup=$3
-  if [[ $old =~ ^[A-Za-z0-9._-]+$ && $old != unknown ]]; then
-    printf '%s\n  %s\n%s' \
-      "To go back to the version you had ($old), with the database as it was just before the update, run this line:" \
-      "printf '\\nFREEFRAME_VERSION=$old\\n' | sudo tee -a $(_ff_q "$file") >/dev/null && sudo freeframe restore --yes $(_ff_q "$backup")" \
-      "That keeps this server on $old. To follow the channel again later, delete the FREEFRAME_VERSION line from $file and run sudo freeframe update."
+# The update record ($FF_ROOT/.update-undo, mode 600) stands from just
+# before an update replaces the setup files until that update ends well, or
+# until `freeframe rollback` has taken the server back. It holds the version
+# from before, the database backup taken first and the time;
+# $FF_ROOT/rollback (mode 700) holds the setup files from before. While it
+# stands, update refuses and backup never prunes that backup.
+_update_undo_file() { printf '%s/.update-undo' "$(ff_root)"; }
+
+# _update_undo_read: FF_UNDO_VERSION, FF_UNDO_BACKUP and FF_UNDO_TIME from
+# the record. 1 when there is none.
+_update_undo_read() {
+  local f line
+  f=$(_update_undo_file)
+  FF_UNDO_VERSION="" FF_UNDO_BACKUP="" FF_UNDO_TIME=""
+  [[ -f $f ]] || return 1
+  while IFS= read -r line || [[ -n $line ]]; do
+    case $line in
+      version=*) FF_UNDO_VERSION=${line#version=} ;;
+      backup=*) FF_UNDO_BACKUP=${line#backup=} ;;
+      time=*) FF_UNDO_TIME=${line#time=} ;;
+    esac
+  done <"$f"
+  return 0
+}
+
+_update_undo_set() {
+  local f
+  f=$(_update_undo_file)
+  (umask 077 && printf 'version=%s\nbackup=%s\ntime=%s\n' "$1" "$2" "$(date '+%Y-%m-%d %H:%M:%S %z')" >"$f.tmp") &&
+    chmod 600 "$f.tmp" && mv -f "$f.tmp" "$f"
+}
+
+_update_undo_clear() { rm -f "$(_update_undo_file)"; }
+
+# _update_save_setup: keep the setup files in use now (the compose files and
+# the backup units) in $FF_ROOT/rollback, replacing an older copy only once
+# the new one is complete.
+_update_save_setup() {
+  local root new f dest
+  root=$(ff_root)
+  new="$root/rollback.new"
+  rm -rf "$new" "$root/rollback.old" || return 1
+  (umask 077 && mkdir "$new") || return 1
+  chmod 700 "$new" || return 1
+  for f in "${FF_SETUP_FILES[@]}"; do
+    dest=$(_ff_setup_dest "$f")
+    if [[ -e $dest ]] && ! cp -p "$dest" "$new/${f##*/}"; then
+      rm -rf "$new"
+      return 1
+    fi
+  done
+  if [[ -d $root/rollback ]] && ! mv "$root/rollback" "$root/rollback.old"; then
+    rm -rf "$new"
+    return 1
+  fi
+  mv "$new" "$root/rollback" || return 1
+  rm -rf "$root/rollback.old"
+}
+
+# _update_put_back: the setup files saved in $FF_ROOT/rollback back in
+# place; a file that did not exist then is removed.
+_update_put_back() {
+  local root f dest name ok=0
+  root=$(ff_root)
+  [[ -d $root/rollback ]] || return 1
+  for f in "${FF_SETUP_FILES[@]}"; do
+    dest=$(_ff_setup_dest "$f")
+    name=${f##*/}
+    if [[ -e $root/rollback/$name ]]; then
+      { cp -p "$root/rollback/$name" "$dest.tmp" && mv -f "$dest.tmp" "$dest"; } || ok=1
+    else
+      rm -f "$dest" || ok=1
+    fi
+  done
+  return "$ok"
+}
+
+# _update_undo_change: an update that stopped before starting the new
+# version puts the setup files from before back and drops its record, so
+# FreeFrame is as it was and a plain re-run works.
+_update_undo_change() {
+  if _update_put_back; then
+    _update_undo_clear
+    FF_STATE="FreeFrame is running the version it had ($1), with its setup files from before. Running sudo freeframe update again is safe."
   else
-    printf '%s\n  %s' "The version from before is not known. To put the database back as it was just before the update, run:" \
-      "sudo freeframe restore --yes $(_ff_q "$backup")"
+    FF_STATE="FreeFrame is still running the version it had ($1), but its setup files from before could not all be put back. To put everything back, run: sudo freeframe rollback"
   fi
 }
 
@@ -3447,7 +3566,7 @@ _update_way_back() {
 # restart and the health checks. If the new version does not come up, it
 # prints the line that goes back, rather than guessing.
 cmd_update() {
-  local root file ch old new answers pinned url mode host
+  local root file ch ref old new answers pinned url mode host
   root=$(ff_root)
   file="$root/.env.prod"
   if ((${#FF_ARGS[@]})); then
@@ -3462,8 +3581,23 @@ cmd_update() {
   fi
   _ff_need_finished_install update
   _ff_refuse_unfinished_restore update
+  if _update_undo_read; then
+    _ff_stop 1 "An earlier update did not finish (it started ${FF_UNDO_TIME:-earlier}, from version ${FF_UNDO_VERSION:-unknown}), so this update did not start. Nothing was changed." \
+      "to go back to ${FF_UNDO_VERSION:-the version from before}, run: sudo freeframe rollback. If FreeFrame works well as it is now, remove the record instead: sudo rm $(_ff_q "$(_update_undo_file)"), then run sudo freeframe update again."
+  fi
   ch=$(ff_channel "$file")
   _ff_check_channel "$ch"
+  # A pinned server stays on its version: its setup files come from that
+  # release's tag, not from the channel.
+  pinned=$(env_get "$file" FREEFRAME_VERSION)
+  ref=$ch
+  if [[ -n $pinned ]]; then
+    ref="v${pinned#v}"
+    if ! _ff_valid_ref "$ref"; then
+      _ff_stop 1 "FREEFRAME_VERSION in $file ('$pinned') is not a release number, so nothing was changed." \
+        "set it to a release such as 1.21.0, or delete that line to follow the $ch channel."
+    fi
+  fi
 
   # Spec goal 12b: the newest freeframe command does the rest.
   update_self "$ch"
@@ -3498,35 +3632,43 @@ cmd_update() {
       "check that the disk is not full, then run sudo freeframe update --channel $ch again."
   fi
 
+  # Before anything is replaced: the setup files in use now, and the record
+  # `freeframe rollback` goes back with.
+  FF_STEP="saving the setup files in use"
+  if ! _update_save_setup || ! _update_undo_set "$old" "$FF_UPDATE_BACKUP"; then
+    _update_undo_clear
+    install_fail "The setup files in use could not be saved for a rollback, so the update stopped before changing anything." \
+      "check that the disk is not full, then run sudo freeframe update again."
+  fi
+
   FF_STEP="downloading the setup files"
-  say "Downloading the setup files for the $ch channel..."
-  if ! fetch_setup_files "$ch"; then
-    install_fail "$(_ff_fetch_failure "the $ch channel")" \
+  if [[ -n $pinned ]]; then
+    say "This server is pinned to version $pinned (FREEFRAME_VERSION in $file), so it stays on that version"
+    say "and takes the setup files of release $ref. To follow the $ch channel again, delete that line, then run sudo freeframe update."
+    say "Downloading the setup files of release $ref..."
+  else
+    say "Downloading the setup files for the $ch channel..."
+  fi
+  if ! fetch_setup_files "$ref"; then
+    if [[ -z $FF_FETCH_MIXED ]]; then _update_undo_clear; fi
+    install_fail "$(_ff_fetch_failure "$([[ -n $pinned ]] && printf 'release %s' "$ref" || printf 'the %s channel' "$ch")")" \
       "check that this server can reach raw.githubusercontent.com and that the disk is not full, then run sudo freeframe update again."
   fi
   new=$(ff_version)
-  FF_STATE="The setup files for $new are in place, but FreeFrame is still running the version it had ($old). Running sudo freeframe update again finishes the move."
-
-  FF_STEP="refreshing the nightly backups"
-  if ! _ff_logged install_backup_timer; then
-    warn "The nightly backup timer could not be refreshed; the one set up before keeps running. The reason is at the end of $FF_LOG."
-  fi
+  FF_STATE="The setup files for $new are in place, but FreeFrame is still running the version it had ($old). To put them back, run: sudo freeframe rollback"
 
   FF_STEP="adding the settings the new release needs"
   if ! fill_settings "$file"; then
+    _update_undo_change "$old"
     install_fail "The settings could not be completed for the new release." \
       "fix what the message above says, then run sudo freeframe update again."
-  fi
-  pinned=$(env_get "$file" FREEFRAME_VERSION)
-  if [[ -n $pinned ]]; then
-    say "This server is pinned to version $pinned (FREEFRAME_VERSION in $file), so it stays on that version."
-    say "To follow the $ch channel again, delete that line, then run sudo freeframe update."
   fi
 
   if [[ ${FF_SKIP_PULL:-} != 1 ]]; then
     FF_STEP="downloading FreeFrame $new"
     say "Downloading FreeFrame $new (this can take a few minutes)..."
     if ! _ff_logged dc pull; then
+      _update_undo_change "$old"
       install_fail "FreeFrame $new could not be downloaded." \
         "check that this server can reach ghcr.io, then run sudo freeframe update again."
     fi
@@ -3536,7 +3678,7 @@ cmd_update() {
   host=$(_ff_url_host "$url")
   mode=$(env_get "$file" FREEFRAME_HTTPS)
   FF_STEP="starting FreeFrame $new"
-  FF_STATE="FreeFrame has been moved to $new. $(_update_way_back "$old" "$file" "$FF_UPDATE_BACKUP")"
+  FF_STATE="FreeFrame has been moved to $new. To go back to $old with the database as it was just before the update, run: sudo freeframe rollback"
   say "Starting FreeFrame $new..."
   if ! _ff_logged dc up -d --no-build; then
     install_fail "FreeFrame $new could not be started." "see why with: sudo freeframe logs"
@@ -3547,15 +3689,156 @@ cmd_update() {
     install_fail "FreeFrame did not come back after the update to $new." \
       "see why with: sudo freeframe logs (the API's messages: sudo freeframe logs api)."
   fi
+  # It answers: the way back is no longer needed.
+  _update_undo_clear
+  FF_STEP="refreshing the nightly backups"
+  if ! _ff_logged install_backup_timer; then
+    warn "The nightly backup timer could not be refreshed; the one set up before keeps running. The reason is at the end of $FF_LOG."
+  fi
   trap - ERR INT TERM HUP
   say ""
-  if [[ $old == "$new" ]]; then
+  if [[ -n $pinned ]]; then
+    say "FreeFrame stays on the pinned version $pinned; its setup files and images were refreshed."
+  elif [[ $old == "$new" ]]; then
     say "FreeFrame is already on the newest release of the $ch channel ($new); its setup files and images were refreshed."
   else
     say "FreeFrame was updated from $old to $new."
   fi
   say "It answers at $url."
   say "The database as it was just before the update is saved in $FF_UPDATE_BACKUP"
+  _install_log_stop
+}
+
+# cmd_rollback: `freeframe rollback`: take the server back to the version
+# it had before an update that did not end well, with the database as it was
+# just before that update. In order: stop the app containers, put the setup
+# files from before back, pin FREEFRAME_VERSION to the old version, restore
+# the update's backup (restore_database, which never starts FreeFrame on an
+# early failure here: the old version must not run on the database the
+# update left), then start and wait for health, and drop the record. Every
+# step can be repeated, so running it again after a failure is safe.
+cmd_rollback() {
+  local root file old backup when out s url mode host
+  local -a all=() svcs=()
+  root=$(ff_root)
+  file="$root/.env.prod"
+  if ((${#FF_ARGS[@]})); then _ff_bad_usage "freeframe rollback takes no other words."; fi
+  _ff_need_root rollback
+  _ff_need_install
+  if ! _update_undo_read; then
+    say "There is no update to roll back: the last update finished (or none was made), so nothing was changed."
+    say "To put back an older copy of the database instead, see: sudo freeframe restore"
+    return 0
+  fi
+  old=$FF_UNDO_VERSION backup=$FF_UNDO_BACKUP
+  if [[ ! $old =~ ^[A-Za-z0-9._-]+$ || $old == unknown ]]; then
+    _ff_stop 1 "The record of the last update ($(_update_undo_file)) does not say which version it came from, so nothing was changed." \
+      "to put the database back as it was before that update, run: sudo freeframe restore --yes $(_ff_q "$backup")"
+  fi
+  if ! _ff_is_pg_dump "$backup"; then
+    _ff_stop 1 "The backup taken before the update ($backup) is not there any more, so the database cannot be put back and nothing was changed." \
+      "if you have a copy of it, put it back at that path, then run sudo freeframe rollback again."
+  fi
+  if [[ ! -d $root/rollback ]]; then
+    _ff_stop 1 "The setup files saved before the update ($root/rollback) are missing, so nothing was changed." \
+      "to put the database back as it was before the update, run: sudo freeframe restore --yes $(_ff_q "$backup")"
+  fi
+  when=$(_ff_stamp_date "${backup##*/}")
+  if [[ -z ${FF_YES:-} ]]; then
+    if ! _ff_has_tty; then
+      _ff_stop 2 "Rolling back replaces FreeFrame's database, so it needs a yes, and there is no terminal here to ask." \
+        "run it in a terminal, or add --yes: sudo freeframe rollback --yes"
+    fi
+    say "This takes FreeFrame back to version $old, as it was before the update${FF_UNDO_TIME:+ of $FF_UNDO_TIME}:"
+    say "  the setup files and the version go back to $old, and the database goes back to the backup"
+    say "  taken just before the update${when:+ ($when)}: $backup"
+    say "Projects, comments, people and share links added or changed since then will be gone."
+    say "A copy of the current database is saved first. FreeFrame is stopped while this runs."
+    if ! confirm "Roll back now?" N; then
+      say "Rollback cancelled. Nothing was changed."
+      exit 1
+    fi
+  fi
+
+  if ! _ff_lock; then
+    _ff_stop 1 "Another backup or restore is running right now, so the rollback did not start. Nothing was changed." \
+      "wait a few minutes for it to finish, then run sudo freeframe rollback again."
+  fi
+  FF_ACTOR="the rollback"
+  FF_STOPPED=()
+  FF_ADMIN_CREATED="" FF_PW_GENERATED=""
+  FF_RERUN="sudo freeframe rollback --yes"
+  FF_STATE="Nothing has been changed."
+  FF_STATE_PREFIX=""
+  FF_RECORD_NEW="" FF_DROP_STARTED="" FF_RESTORE_FILE=$backup
+  _install_log_start rollback
+  _ff_cmd_traps
+  say "Rolling back to $old..."
+
+  FF_STEP="stopping FreeFrame"
+  say "Stopping FreeFrame (its web address shows an error until the rollback is done)..."
+  FF_STATE="FreeFrame may be partly stopped; nothing else has been changed. Running sudo freeframe rollback again is safe."
+  if out=$(dc config --services 2>>"$FF_LOG"); then
+    mapfile -t all <<<"$out"
+    for s in "${all[@]}"; do
+      if [[ -n $s && $s != postgres && $s != traefik ]]; then svcs+=("$s"); fi
+    done
+    if ((${#svcs[@]})) && ! _ff_logged dc stop "${svcs[@]}"; then
+      install_fail "FreeFrame could not be stopped." "the reason is at the end of $FF_LOG. Then run: sudo freeframe rollback"
+    fi
+  elif ! _ff_logged dc stop; then
+    install_fail "FreeFrame could not be stopped." "the reason is at the end of $FF_LOG. Then run: sudo freeframe rollback"
+  fi
+  FF_STATE="FreeFrame is stopped; nothing else has been changed. Running sudo freeframe rollback again is safe."
+
+  FF_STEP="putting the setup files from before back"
+  if ! _update_put_back; then
+    install_fail "The setup files from before the update could not all be put back." \
+      "check that the disk is not full, then run: sudo freeframe rollback"
+  fi
+  FF_STATE="FreeFrame is stopped. Its setup files are back as they were before the update; its version and database are not yet. Running sudo freeframe rollback again is safe."
+
+  FF_STEP="pinning version $old"
+  if [[ $(env_get "$file" FREEFRAME_VERSION) != "$old" ]]; then
+    if ! env_backup "$file" >/dev/null || ! env_set "$file" FREEFRAME_VERSION "$old"; then
+      install_fail "FREEFRAME_VERSION could not be set to $old in $file." \
+        "check that the disk is not full, then run: sudo freeframe rollback"
+    fi
+  fi
+  say "Pinned version $old (FREEFRAME_VERSION in $file)."
+
+  # From here the database still holds what the update left, which $old
+  # must not start on: restore_database starts nothing when it fails.
+  FF_STATE_PREFIX="FreeFrame is stopped. Its setup files and version are back to $old, but the database is not yet back as it was before the update, so FreeFrame stays stopped. Running sudo freeframe rollback again is safe."
+  FF_STATE=""
+  FF_RESTORE_NO_START=1
+  restore_database "$backup"
+  FF_RESTORE_NO_START=""
+
+  FF_STATE_PREFIX=""
+  FF_STATE="The setup files, the version ($old) and the database are back as they were before the update. Running sudo freeframe rollback again is safe."
+  FF_STEP="starting FreeFrame $old"
+  url=$(env_get "$file" FRONTEND_URL)
+  host=$(_ff_url_host "$url")
+  mode=$(env_get "$file" FREEFRAME_HTTPS)
+  say "Starting FreeFrame $old..."
+  if ! _ff_logged dc up -d --no-build --remove-orphans; then
+    install_fail "FreeFrame $old could not be started." "see why with: sudo freeframe logs"
+  fi
+  FF_STEP="waiting for FreeFrame to answer"
+  if ! _ff_wait_healthy "${mode:-off}" "$host"; then
+    install_fail "FreeFrame $old did not answer after the rollback." "see why with: sudo freeframe logs"
+  fi
+  if ! _ff_logged install_backup_timer; then
+    warn "The nightly backup timer could not be refreshed; the one set up before keeps running. The reason is at the end of $FF_LOG."
+  fi
+  _update_undo_clear
+  trap - ERR INT TERM HUP
+  say ""
+  say "FreeFrame is back on $old, with the database as it was just before the update${when:+ ($when)}."
+  say "It answers at $url."
+  say "This server now stays on $old. To try the update again later, delete the FREEFRAME_VERSION line from"
+  say "$file, then run sudo freeframe update."
   _install_log_stop
 }
 
@@ -4171,6 +4454,9 @@ cmd_status() {
   else
     say "  Updates:      Could not check for a newer release (GitHub did not answer)."
   fi
+  if _update_undo_read; then
+    say "                An update did not finish. To go back to ${FF_UNDO_VERSION:-the version from before}, run: sudo freeframe rollback"
+  fi
   say "  Web address:  $url"
   if probe_health "$mode" "$host"; then
     healthy=1
@@ -4336,6 +4622,8 @@ Commands:
   install     Set up FreeFrame on this server (asks a few questions)
   update      Back up, then move to the newest release on your channel
               (updates this command first; --channel picks another channel)
+  rollback    After an update that did not come up: go back to the version
+              from before, with the database as it was just before it
   configure   Change the answers you gave (web address, email, storage);
               with --yes, give only the new answers as options
   backup      Save a copy of the database to /opt/freeframe/backups now
@@ -4375,6 +4663,7 @@ main() {
     backup) cmd_backup ;;
     restore) cmd_restore ;;
     update) cmd_update ;;
+    rollback) cmd_rollback ;;
     configure) cmd_configure ;;
     status) cmd_status ;;
     logs) cmd_logs ;;

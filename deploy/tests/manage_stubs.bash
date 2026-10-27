@@ -99,11 +99,29 @@ dc() {
         api running "Up 2 hours (healthy)" worker exited "Exited (1) 5 minutes ago"
       ;;
     "exec -T postgres pg_isready "*) [[ -z ${STUB_PG_DOWN:-} ]] ;;
+    # What restore asks the database (rollback runs restore's steps).
+    "exec -T postgres psql -U "*" -d postgres "*)
+      cat >/dev/null
+      [[ -z ${STUB_MAINT_FAIL:-} ]] || return 1
+      echo 1
+      ;;
+    "exec -T postgres psql "*) echo 42 ;;
+    "exec -T postgres dropdb "*) [[ -z ${STUB_DROP_FAIL:-} ]] ;;
+    "exec -T postgres createdb "*) return 0 ;;
+    "exec -T postgres pg_restore "*)
+      cat >"$STUB_DIR/restored"
+      [[ -z ${STUB_RESTORE_FAIL:-} ]]
+      ;;
+    "stop"*)
+      # The images file in place when FreeFrame was first stopped.
+      [[ -e $STUB_DIR/images-at-stop ]] || cp "$FF_ROOT/docker-compose.images.yml" "$STUB_DIR/images-at-stop" 2>/dev/null || true
+      [[ -z ${STUB_STOP_FAIL:-} ]]
+      ;;
     "exec -T postgres pg_dump "*)
       [[ -z ${STUB_PG_DOWN:-} ]] || return 1
-      printf 'PGDMP current database\n'
+      printf 'PGDMP current database %s\n' "$(_ff_version_in "$(cat "$FF_ROOT/docker-compose.images.yml")" 2>/dev/null)"
       ;;
-    *"localhost:8000/health"*) [[ -z ${STUB_API_DOWN:-} ]] ;;
+    *"localhost:8000/health"*) [[ -z ${STUB_API_DOWN:-} && ! -e $STUB_DIR/api-down ]] ;;
     pull*) [[ -z ${STUB_PULL_FAIL:-} ]] ;;
     "up -d"*) [[ -z ${STUB_UP_FAIL:-} ]] ;;
     "logs "*) printf 'api-1  | started\n' ;;

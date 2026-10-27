@@ -113,18 +113,20 @@ newest_dump() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null | tail -1)
 
 # ---------------------------------------------------------------- the update
 
-@test "update: backs up, downloads, refreshes the timer, merges, pulls, starts and checks, in order" {
+@test "update: backs up, saves the setup files, downloads, merges, pulls, starts, checks, then refreshes the timer" {
   ff update
   [ "$status" -eq 0 ] || { echo "$output"; false; }
   assert_order "fetch latest deploy/freeframe" "dc exec -T postgres pg_dump -Fc" \
     "fetch latest docker-compose.prod.yml" "fetch latest docker-compose.images.yml" \
     "fetch latest docker-compose.https.yml" "fetch latest docker-compose.storage.yml" \
     "fetch latest deploy/systemd/freeframe-backup.service" "fetch latest deploy/systemd/freeframe-backup.timer" \
-    install_backup_timer derive_env "dc pull" "dc up -d --no-build" "localhost:8000/health" \
-    "probe_health sslip 203-0-113-7.sslip.io"
+    derive_env "dc pull" "dc up -d --no-build" "localhost:8000/health" \
+    "probe_health sslip 203-0-113-7.sslip.io" install_backup_timer
   # The units the timer is refreshed from are the channel's new ones.
   cmp "$STUB_REMOTE/deploy/systemd/freeframe-backup.service" "$FF_ROOT/systemd/freeframe-backup.service"
   cmp "$STUB_REMOTE/docker-compose.images.yml" "$FF_ROOT/docker-compose.images.yml"
+  # It ended well: no way back is kept open.
+  [ ! -e "$FF_ROOT/.update-undo" ]
 }
 
 @test "update: prints the version before and after, and the backup it took" {
@@ -184,56 +186,67 @@ newest_dump() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null | tail -1)
 
 # ---------------------------------------------------------------- failures
 
-@test "update: FreeFrame not healthy afterwards prints the way back and exits 1" {
+@test "update: FreeFrame not healthy afterwards names sudo freeframe rollback and exits 1" {
   export STUB_API_DOWN=1 FF_API_WAIT=10
   ff update
   [ "$status" -eq 1 ]
-  local d
-  d=$(newest_dump)
-  [ -n "$d" ]
   assert_out "FreeFrame did not come back after the update to 1.22.0."
-  assert_out "printf '\\nFREEFRAME_VERSION=1.21.0\\n' | sudo tee -a '$ENV' >/dev/null && sudo freeframe restore --yes '$BK/$d'"
+  assert_out "To go back to 1.21.0 with the database as it was just before the update, run: sudo freeframe rollback"
+  assert_no_out "tee -a"
   assert_out "sudo freeframe logs"
   assert_out "install.log"
 }
 
-@test "update: the printed way back pins the old version in a way compose and env_get read" {
+@test "update: a failed update leaves the record and the setup files from before for the rollback" {
+  local f
+  mkdir -p "$BATS_TEST_TMPDIR/before"
+  for f in docker-compose.prod.yml docker-compose.images.yml docker-compose.https.yml docker-compose.storage.yml; do
+    cp "$FF_ROOT/$f" "$BATS_TEST_TMPDIR/before/$f"
+  done
   export STUB_API_DOWN=1 FF_API_WAIT=10
   ff update
   [ "$status" -eq 1 ]
-  # Run the pin half of the printed line against the real file (no sudo here).
-  local pin
-  pin=$(grep -o "printf '.*' | sudo tee -a '[^']*'" <<<"$output" | head -1)
-  [ -n "$pin" ]
-  pin=${pin//sudo /}
-  printf 'NO_NEWLINE_AT_END=x' >>"$ENV"
-  eval "$pin" >/dev/null
-  assert_eq "$(env_get "$ENV" FREEFRAME_VERSION)" 1.21.0
-  assert_eq "$(env_get "$ENV" NO_NEWLINE_AT_END)" x
+  [ "$(stat -c %a "$FF_ROOT/.update-undo")" = 600 ]
+  grep -qx "version=1.21.0" "$FF_ROOT/.update-undo"
+  grep -qx "backup=$BK/$(newest_dump)" "$FF_ROOT/.update-undo"
+  grep -q "^time=20" "$FF_ROOT/.update-undo"
+  [ "$(stat -c %a "$FF_ROOT/rollback")" = 700 ]
+  for f in docker-compose.prod.yml docker-compose.images.yml docker-compose.https.yml docker-compose.storage.yml; do
+    cmp "$BATS_TEST_TMPDIR/before/$f" "$FF_ROOT/rollback/$f"
+  done
+  cmp "$FF_ROOT/rollback/freeframe-backup.service" <(sed 's/1.22.0/1.21.0/' "$STUB_REMOTE/deploy/systemd/freeframe-backup.service")
 }
 
-@test "update: the stack not starting prints the way back too" {
+@test "update: the stack not starting names the rollback too" {
   export STUB_UP_FAIL=1
   ff update
   [ "$status" -eq 1 ]
-  assert_out "sudo freeframe restore --yes '$BK/$(newest_dump)'"
-  assert_out "FREEFRAME_VERSION=1.21.0"
+  assert_out "run: sudo freeframe rollback"
+  [ -e "$FF_ROOT/.update-undo" ]
 }
 
-@test "update: no answer through the web address prints the way back" {
+@test "update: no answer through the web address names the rollback" {
   export STUB_HEALTH_FAIL=1 FF_HEALTH_WAIT=10
   ff update
   [ "$status" -eq 1 ]
-  assert_out "sudo freeframe restore --yes '$BK/$(newest_dump)'"
+  assert_out "run: sudo freeframe rollback"
 }
 
-@test "update: a failed image download leaves FreeFrame on the version it had" {
+@test "update: a failed image download puts the setup files from before back and drops the record" {
+  cp "$FF_ROOT/docker-compose.images.yml" "$BATS_TEST_TMPDIR/images.before"
   export STUB_PULL_FAIL=1
   ff update
   [ "$status" -eq 1 ]
   assert_out "could not be downloaded"
-  assert_out "still running the version it had (1.21.0)"
+  assert_out "FreeFrame is running the version it had (1.21.0), with its setup files from before"
+  assert_out "Running sudo freeframe update again is safe."
   assert_not_called "dc up -d"
+  cmp "$BATS_TEST_TMPDIR/images.before" "$FF_ROOT/docker-compose.images.yml"
+  [ ! -e "$FF_ROOT/.update-undo" ]
+  # So a plain re-run is not refused.
+  unset STUB_PULL_FAIL
+  ff update
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
 }
 
 @test "update: a backup that fails stops it before anything is downloaded" {
@@ -276,12 +289,19 @@ newest_dump() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null | tail -1)
   [ -z "$(ls -A "$FF_ROOT" | grep '^\.download')" ]
 }
 
-@test "update: a pinned version is kept and said" {
+@test "update: a pinned server takes its setup files from the pinned release's tag and says it stays" {
   printf 'FREEFRAME_VERSION=1.20.0\n' >>"$ENV"
   ff update
   [ "$status" -eq 0 ] || { echo "$output"; false; }
   assert_out "pinned to version 1.20.0"
+  grep -qx "fetch v1.20.0 docker-compose.images.yml" "$CALLS"
+  grep -qx "fetch v1.20.0 deploy/systemd/freeframe-backup.timer" "$CALLS"
+  assert_not_called "fetch latest docker-compose"
+  # The command itself still comes from the channel.
+  grep -qx "fetch latest deploy/freeframe" "$CALLS"
   assert_has "$ENV" "FREEFRAME_VERSION=1.20.0"
+  assert_out "FreeFrame stays on the pinned version 1.20.0"
+  assert_no_out "newest release"
 }
 
 # ---------------------------------------------------------------- channel
