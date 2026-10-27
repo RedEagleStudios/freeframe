@@ -1912,6 +1912,15 @@ _install_count_steps() {
   FF_QTOTAL=$n
 }
 
+# _ff_typed_name NAME: 0 when NAME, typed at a menu or at "Domain:" or
+# "Mail server:", is an address: a name with a dot and a letter in it
+# (review.yourstudio.com), or an IPv4 address. A number such as 12, or 1.5,
+# is a mistyped choice, not a name.
+_ff_typed_name() {
+  _ff_is_ipv4 "$1" && return 0
+  [[ $1 == *.* && $1 == *[a-z]* ]] && valid_hostname "$1"
+}
+
 # _install_banner: the FreeFrame name in large letters, and what it is.
 _install_banner() {
   local line
@@ -2011,16 +2020,16 @@ _install_prompt_address() {
           ask answer " Domain" "" || _ff_input_ended
           answer=$(_ff_clean_host "$answer")
           [[ -n $answer ]] || break
-          if valid_hostname "$answer"; then
+          if _ff_typed_name "$answer"; then
             FF_DOMAIN=$answer
             return 0
           fi
-          _ff_hint 3 "'$answer' is not a plain name like review.yourstudio.com. Type only the name, without a port, a path or spaces."
+          _ff_hint 3 "'$answer' is not a domain name like review.yourstudio.com. Type only the name, without a port, a path or spaces, or press Enter to go back."
         done
         continue
         ;;
     esac
-    if [[ $answer != [0-9] ]] && valid_hostname "$answer"; then
+    if _ff_typed_name "$answer"; then
       FF_DOMAIN=$answer
       return 0
     fi
@@ -2230,20 +2239,23 @@ _install_ask_smtp() {
           return 0
           ;;
         2)
-          while [[ -z ${FF_SMTP_HOST:-} ]]; do
+          # Enter goes back to the choices, as at "Domain:".
+          while :; do
             ask answer " Mail server" "" || _ff_input_ended
             answer=$(_ff_clean_host "$answer")
-            if valid_hostname "$answer"; then
+            [[ -n $answer ]] || break
+            if _ff_typed_name "$answer"; then
               FF_SMTP_HOST=$answer
-            elif [[ -n $answer ]]; then
-              _ff_hint 3 "'$answer' is not a plain name like smtp.postmarkapp.com. Type only the server's name."
+              break
             fi
+            _ff_hint 3 "'$answer' is not a mail server name like smtp.postmarkapp.com. Type only the server's name, or press Enter to go back."
           done
-          break
+          if [[ -n ${FF_SMTP_HOST:-} ]]; then break; fi
+          continue
           ;;
       esac
       # A mail server typed at the menu: the same as 2, then that name.
-      if [[ $answer != [0-9] ]] && valid_hostname "$answer"; then
+      if _ff_typed_name "$answer"; then
         FF_SMTP_HOST=$answer
         break
       fi

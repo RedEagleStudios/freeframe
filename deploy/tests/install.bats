@@ -1940,6 +1940,39 @@ SUDO_C_LATEST='sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Tech
   assert_out "ran: install --channel latest"
 }
 
+@test "screens: a number or a stray dot at a menu is not taken as a domain or mail server" {
+  local typo
+  for typo in 12 22 1.5; do
+    rm -rf "$FF_ROOT" && mkdir -p "$FF_ROOT"
+    tty_answers "$typo" 2 "$typo" "" 1 "certs@example.com" 1 "$typo" 2 "$typo" "" 1 "Grace" "grace@example.com" \
+      "long-password-1" "long-password-1" "y"
+    ff_install
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    assert_out "Type 1, 2 or 3, or a domain such as review.yourstudio.com."
+    assert_out "'$typo' is not a domain name like review.yourstudio.com."
+    assert_out "Type 1 or 2, or the mail server's name."
+    assert_out "'$typo' is not a mail server name like smtp.postmarkapp.com."
+    assert_has "$ENV" "FRONTEND_URL=https://203-0-113-7.sslip.io"
+    if grep -q "^SMTP_HOST=." "$ENV"; then grep "^SMTP_HOST" "$ENV"; false; fi
+  done
+  # A typed IP address still means plain HTTP on it.
+  rm -rf "$FF_ROOT" && mkdir -p "$FF_ROOT"
+  tty_answers 10.0.0.5 "${REST[@]}"
+  export STUB_LOCAL_IP=10.0.0.5
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_has "$ENV" "FRONTEND_URL=http://10.0.0.5"
+}
+
+@test "screens: Enter at Mail server goes back to the email menu" {
+  tty_answers "" "certs@example.com" 1 2 "" 1 "Grace" "grace@example.com" "long-password-1" "long-password-1" "y"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  [ "$(grep -o "Choose 1 or 2" <<<"$output" | wc -l | tr -d ' ')" -eq 3 ] || { echo "$output"; false; }
+  if grep -q "^SMTP_HOST=." "$ENV"; then grep "^SMTP_HOST" "$ENV"; false; fi
+  assert_out "To add email later, run: sudo freeframe configure"
+}
+
 # ---------------------------------------------------------------- hints and state lines
 
 @test "install: a program is listed as stopped only when stopping it worked" {
