@@ -2818,6 +2818,13 @@ backup_create() {
       "What to try: start FreeFrame (sudo freeframe restart), then run: $retry"
     return 1
   fi
+  # FF_BACKUP_IF_DATA (freeframe backup): a database with no tables, as a
+  # failed restore leaves it, is not backed up, so its copy never replaces a
+  # real backup. FF_BACKUP_EMPTY tells the caller; it says so itself.
+  if [[ -n ${FF_BACKUP_IF_DATA:-} && $(_restore_db_state || true) == empty ]]; then
+    FF_BACKUP_EMPTY=1
+    return 1
+  fi
   stamp=$(_ff_stamp) || stamp=""
   while [[ $stamp =~ ^[0-9]{8}-[0-9]{6}$ ]] &&
     [[ -e $dir/freeframe-$stamp.dump || -e $dir/freeframe-$stamp.env.prod ]]; do
@@ -2876,6 +2883,22 @@ _backup_on_signal() {
   exit 1
 }
 
+# _backup_not_now NIGHTLY_REASON REASON TRY: the database may be empty, so
+# no backup is made and none is pruned. The nightly run (--quiet) is skipped
+# with one line and exit 0; a run by hand is refused (exit 1).
+_backup_not_now() {
+  local msg
+  if [[ -n ${FF_QUIET:-} ]]; then
+    msg="The nightly backup was skipped: $1. The backups already here were kept."
+    say "$msg"
+    _ff_log_lines "$msg"
+    return 0
+  fi
+  msg="$2, and a backup of it could replace a real one. No backup was made."
+  _ff_log_lines "$msg" "What to try: $3"
+  _ff_stop 1 "$msg" "$3"
+}
+
 # cmd_backup: `freeframe backup [--quiet]`. --quiet (the nightly timer)
 # prints nothing when the backup is saved, and a plain error when not.
 cmd_backup() {
@@ -2910,13 +2933,32 @@ cmd_backup() {
     _ff_stop 1 "$FF_BUSY, so this backup did not start." \
       "wait a few minutes for it to finish, then run sudo freeframe backup again."
   fi
+  # While a restore is unfinished the database may be empty: a copy of it
+  # would push a real backup out of the newest 7 every night. Read under the
+  # lock, which a running restore holds.
+  if [[ -f $(_restore_undo_file) ]]; then
+    _backup_not_now "a restore of the database did not finish, so the database may be empty" \
+      "A restore of the database did not finish, so the database may be empty" \
+      "$(_ff_unfinished_restore_try "$(_restore_undo_path)")"
+    return 0
+  fi
   exec {FF_BACKUP_ERR}>&2
   # No ERR trap: backup_create runs inside `if !`, where bash never fires
   # one, so every step in it is checked explicitly instead.
   trap '_backup_on_signal INT' INT
   trap '_backup_on_signal TERM' TERM
   trap '_backup_on_signal HUP' HUP
-  if ! backup_create prune; then exit 1; fi
+  FF_BACKUP_IF_DATA=1 FF_BACKUP_EMPTY=""
+  if ! backup_create prune; then
+    trap - INT TERM HUP
+    if [[ -n $FF_BACKUP_EMPTY ]]; then
+      _backup_not_now "FreeFrame's database is empty (it has no tables)" \
+        "FreeFrame's database is empty (it has no tables)" \
+        "if a restore failed, run it again: sudo freeframe restore"
+      return 0
+    fi
+    exit 1
+  fi
   trap - INT TERM HUP
   [[ -z ${FF_QUIET:-} ]] || return 0
   base=${FF_BACKUP_MADE%.dump}
@@ -3448,14 +3490,23 @@ _ff_refuse_unfinished_restore() {
   undo=$(_restore_undo_path)
   [[ -n $undo ]] || return 0
   msg="A restore of the database did not finish, so the database may be empty. Starting FreeFrame on it would open its setup page to anyone, so freeframe $1 did not run."
-  try="finish the restore by running it again, or go back to the database as it was before it: sudo freeframe restore --yes $(_ff_q "$undo")"
-  if [[ -f $(_update_undo_file) ]]; then
-    try="finish the rollback, which is safe to run again: sudo freeframe rollback"
-  fi
+  try=$(_ff_unfinished_restore_try "$undo")
   # logged: the screen is copied into install.log, so the end goes through it.
   if [[ ${2:-} == logged ]]; then install_fail "$msg" "$try"; fi
   _ff_log_lines "$msg" "What to try: $try"
   _ff_stop 1 "$msg" "$try"
+}
+
+# _ff_unfinished_restore_try [UNDO]: the way out of an unfinished restore
+# whose copy from before is UNDO (empty when it is gone).
+_ff_unfinished_restore_try() {
+  if [[ -f $(_update_undo_file) ]]; then
+    printf 'finish the rollback, which is safe to run again: sudo freeframe rollback'
+  elif [[ -n ${1:-} ]]; then
+    printf 'finish the restore by running it again, or go back to the database as it was before it: sudo freeframe restore --yes %s' "$(_ff_q "$1")"
+  else
+    printf 'finish the restore by running it again: sudo freeframe restore'
+  fi
 }
 
 # _ff_wait_healthy MODE HOST: wait for the API inside the compose network,

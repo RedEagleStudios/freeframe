@@ -252,6 +252,50 @@ dumps() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null) || true; }
   assert_not_called pg_dump
 }
 
+@test "backup: 8 nightly runs during an unfinished restore leave every real backup in place" {
+  local s before
+  for s in 01 02 03 04 05 06 07; do old_backup "202610$s-030000"; done
+  # A restore failed after dropping the database: the record stands, and
+  # the database is there but empty.
+  printf '%s\n' "$BK/freeframe-20261007-030000.dump" >"$FF_ROOT/.restore-undo"
+  export STUB_DB_STATE=empty
+  before=$(ls -A "$BK")
+  for s in 1 2 3 4 5 6 7 8; do
+    ff backup --quiet
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    assert_eq "$(printf '%s\n' "$output" | grep -c .)" 1
+    assert_out "The nightly backup was skipped: a restore of the database did not finish"
+  done
+  assert_eq "$(ls -A "$BK")" "$before"
+  assert_not_called pg_dump
+}
+
+@test "backup: by hand during an unfinished restore is refused in plain words" {
+  old_backup 20261020-030000
+  printf '%s\n' "$BK/freeframe-20261020-030000.dump" >"$FF_ROOT/.restore-undo"
+  ff backup
+  [ "$status" -eq 1 ]
+  assert_out "A restore of the database did not finish, so the database may be empty, and a backup of it could replace a real one. No backup was made."
+  assert_out "sudo freeframe restore --yes '$BK/freeframe-20261020-030000.dump'"
+  assert_not_called pg_dump
+  assert_eq "$(dumps)" "freeframe-20261020-030000.dump"
+}
+
+@test "backup: an empty database is never backed up, and nothing is pruned" {
+  local s before
+  for s in 01 02 03 04 05 06 07; do old_backup "202610$s-030000"; done
+  export STUB_DB_STATE=empty
+  before=$(ls -A "$BK")
+  ff backup --quiet
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "The nightly backup was skipped: FreeFrame's database is empty (it has no tables)"
+  ff backup
+  [ "$status" -eq 1 ]
+  assert_out "FreeFrame's database is empty (it has no tables), and a backup of it could replace a real one. No backup was made."
+  assert_eq "$(ls -A "$BK")" "$before"
+  assert_not_called pg_dump
+}
+
 @test "backup: the lock file names the command that holds it" {
   command -v flock >/dev/null || skip "no flock"
   ff backup
@@ -673,7 +717,10 @@ dumps() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null) || true; }
   # The recorded copy is huge, the others are small: it must not count.
   export STUB_BIG_LAST=$((900 * 1048576)) STUB_BIG_LAST_FILE="$BK/freeframe-20261001-030000.dump"
   export STUB_FREE_MB=1100
-  ff backup
+  # freeframe backup itself refuses while the record stands; backup_create
+  # (restore's safety copy, update) still protects the copy.
+  run bash -c 'set -Eeuo pipefail; source "$1"; source "$2"; backup_create prune' \
+    ff-run "$FF_SCRIPT" "$STUBS"
   [ "$status" -eq 0 ] || { echo "$output"; false; }
   [ -e "$BK/freeframe-20261001-030000.dump" ]
   [ -e "$BK/freeframe-20261001-030000.env.prod" ]
