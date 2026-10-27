@@ -328,6 +328,39 @@ BEFORE() { printf '%s' "$BATS_TEST_TMPDIR/env.before"; }
   assert_not_called "dc "
 }
 
+@test "configure: while a restore runs, it says another command is running, not that the database may be empty" {
+  command -v flock >/dev/null || skip "no flock"
+  installed_server sslip bundled
+  keep_copy
+  mkdir -p "$BK"
+  printf 'PGDMP old\n' >"$BK/freeframe-20261020-030000.dump"
+  printf '%s\n' "$BK/freeframe-20261020-030000.dump" >"$FF_ROOT/.restore-undo"
+  exec 9>>"$FF_ROOT/.freeframe.lock"
+  flock -n 9
+  ff configure --yes --domain review.yourstudio.com
+  exec 9>&-
+  [ "$status" -eq 1 ]
+  assert_out "Another freeframe command (an update, rollback, backup, restore, restart or configure) is running right now, so the settings were not changed."
+  assert_no_out "did not finish"
+  assert_no_out "may be empty"
+  cmp "$ENV" "$(BEFORE)"
+  assert_not_called "dc "
+}
+
+@test "configure: a restore left unfinished while it asked is refused once it has the lock" {
+  installed_server sslip bundled
+  keep_copy
+  mkdir -p "$BK"
+  printf 'PGDMP old\n' >"$BK/freeframe-20261020-030000.dump"
+  export STUB_AT_LOCK='printf "%s\n" "$FF_ROOT/backups/freeframe-20261020-030000.dump" >"$FF_ROOT/.restore-undo"'
+  ff configure --yes --domain review.yourstudio.com
+  [ "$status" -eq 1 ]
+  assert_out "A restore of the database did not finish"
+  cmp "$ENV" "$(BEFORE)"
+  [ -z "$(env_backups)" ]
+  assert_not_called "dc "
+}
+
 @test "configure: answers that end part-way change nothing and say so" {
   installed_server sslip bundled
   keep_copy

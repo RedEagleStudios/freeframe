@@ -3395,19 +3395,23 @@ _ff_need_finished_install() {
   fi
 }
 
-# _ff_refuse_unfinished_restore COMMAND: while a restore's undo record
+# _ff_refuse_unfinished_restore COMMAND [logged]: while a restore's undo record
 # stands, the database may be empty; FreeFrame started on it would offer its
-# setup page to anyone. The record is left as it is.
+# setup page to anyone. The record is left as it is. Checked under the lock:
+# a restore that is running has the same record, and holds the lock.
 _ff_refuse_unfinished_restore() {
-  local undo
+  local undo msg try
   undo=$(_restore_undo_path)
   [[ -n $undo ]] || return 0
+  msg="A restore of the database did not finish, so the database may be empty. Starting FreeFrame on it would open its setup page to anyone, so freeframe $1 did not run."
+  try="finish the restore by running it again, or go back to the database as it was before it: sudo freeframe restore --yes $(_ff_q "$undo")"
   if [[ -f $(_update_undo_file) ]]; then
-    _ff_stop 1 "A restore of the database did not finish, so the database may be empty. Starting FreeFrame on it would open its setup page to anyone, so freeframe $1 did not run." \
-      "finish the rollback, which is safe to run again: sudo freeframe rollback"
+    try="finish the rollback, which is safe to run again: sudo freeframe rollback"
   fi
-  _ff_stop 1 "A restore of the database did not finish, so the database may be empty. Starting FreeFrame on it would open its setup page to anyone, so freeframe $1 did not run." \
-    "finish the restore by running it again, or go back to the database as it was before it: sudo freeframe restore --yes $(_ff_q "$undo")"
+  # logged: the screen is copied into install.log, so the end goes through it.
+  if [[ ${2:-} == logged ]]; then install_fail "$msg" "$try"; fi
+  _ff_log_lines "$msg" "What to try: $try"
+  _ff_stop 1 "$msg" "$try"
 }
 
 # _ff_wait_healthy MODE HOST: wait for the API inside the compose network,
@@ -4566,6 +4570,13 @@ cmd_configure() {
   _ff_need_root configure
   _ff_need_install
   _ff_need_finished_install configure
+  # The lock is taken only once the answers are in, so no other command
+  # waits on a question. Asked first anyway: while another command holds it,
+  # its own files (a running restore's record, say) say nothing yet.
+  if _ff_lock_busy; then
+    _ff_stop 1 "$FF_BUSY, so the settings were not changed." \
+      "wait a few minutes for it to finish, then run sudo freeframe configure again."
+  fi
   _ff_refuse_unfinished_restore configure
   if [[ -z ${FF_YES:-} ]] && ! _ff_has_tty; then
     _ff_stop 2 "There is no terminal here to ask configure's questions." \
@@ -4654,6 +4665,8 @@ cmd_configure() {
     install_fail "$FF_BUSY, so the settings were not changed." \
       "wait a few minutes for it to finish, then run sudo freeframe configure again."
   fi
+  # Again under the lock: a restore may have stopped part-way meanwhile.
+  _ff_refuse_unfinished_restore configure logged
 
   FF_STEP="saving the settings"
   # Plain HTTP goes through switch_to_http_mode, which writes the address
@@ -4921,13 +4934,15 @@ cmd_restart() {
   _ff_need_root restart
   _ff_need_install
   _ff_need_finished_install restart
-  _ff_refuse_unfinished_restore restart
   FF_ACTOR="the restart"
   _ff_log_open restart
+  # The lock first: a restore that is running has the same undo record as
+  # one that stopped part-way, and only the lock tells them apart.
   if ! _ff_lock; then
     _ff_manage_stop 1 "$FF_BUSY, so FreeFrame was not restarted." \
       "wait a few minutes for it to finish, then run sudo freeframe restart again."
   fi
+  _ff_refuse_unfinished_restore restart
   say "Restarting FreeFrame..."
   if ! _ff_logged dc up -d --no-build --force-recreate; then
     _ff_manage_stop 1 "FreeFrame could not be restarted." \

@@ -163,6 +163,24 @@ setup() {
   assert_not_called "dc up"
 }
 
+@test "restart: while a restore runs, it says another command is running, not that the database may be empty" {
+  command -v flock >/dev/null || skip "no flock"
+  # A restore in progress: it holds the lock, and its undo record stands.
+  mkdir -p "$BK"
+  printf 'PGDMP old\n' >"$BK/freeframe-20261020-030000.dump"
+  printf '%s\n' "$BK/freeframe-20261020-030000.dump" >"$FF_ROOT/.restore-undo"
+  exec 9>>"$FF_ROOT/.freeframe.lock"
+  flock -n 9
+  ff restart
+  exec 9>&-
+  [ "$status" -eq 1 ]
+  assert_out "Another freeframe command (an update, rollback, backup, restore, restart or configure) is running right now, so FreeFrame was not restarted."
+  assert_no_out "did not finish"
+  assert_no_out "may be empty"
+  assert_not_called "dc up"
+  assert_eq "$(cat "$FF_ROOT/.restore-undo")" "$BK/freeframe-20261020-030000.dump"
+}
+
 @test "status, logs and restart need root and an installed FreeFrame" {
   local c
   for c in status logs restart; do
