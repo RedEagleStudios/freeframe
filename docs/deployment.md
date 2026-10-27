@@ -155,7 +155,9 @@ After the install, the `freeframe` command is on the server. All commands need `
    The `-m 600` makes the file readable by the administrator only, because it holds your passwords. (The installer tightens it to that itself, but it is better never to leave it open.)
 4. Run the install command. It keeps every setting from the file (including the secrets, which the restored database needs) and skips the questions the file already answers. It still asks for an admin account; the restore in the next step replaces it with your old accounts.
 5. Run `sudo freeframe restore /path/to/the-copied-file.dump` and answer yes.
-6. Give the new server its own web address. The settings file carries the old server's address, and the installer does not check or change an address that comes from a copied file. If the old server used the free `sslip.io` address or "this network only", the new server would keep the old address, which does not lead to it. Run `sudo freeframe configure` and enter the new server's domain (or choose the new automatic address). If you moved with the same domain, point its DNS at the new server (step 2); no change is needed then.
+6. Give the new server its own web address. The settings file carries the old server's address, and the installer does not check or change an address that comes from a copied file, so the new server would keep the old address, which does not lead to it. If you moved with the same domain, point its DNS at the new server (step 2) and nothing more is needed. Otherwise:
+   - If the old server used the free automatic (`sslip.io`) address, run `sudo freeframe configure --https sslip --yes`. It works out the new server's own automatic address from its public IP address.
+   - Otherwise, run `sudo freeframe configure` and type the new web address: your domain, or the new server's IP address for "this network only".
 7. If footage was kept on the old server, copy the media to the new one as well; the restore brings back the database only. Using your own S3 bucket avoids this: the new server simply uses the same bucket.
 
 ### Unattended installs (cloud-init, Ansible)
