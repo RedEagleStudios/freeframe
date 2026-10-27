@@ -331,3 +331,22 @@ assert_database_untouched() {
   cmp "$UPDATE_BACKUP" "$STUB_DIR/restored"
   assert_out "with the database as it was just before the update"
 }
+
+@test "rollback: a never-started record without its version is not sent to a restore either" {
+  unstarted_update
+  sed -i 's/^version=.*/version=unknown/' "$FF_ROOT/.update-undo"
+  ff rollback
+  [ "$status" -eq 1 ]
+  assert_out "does not say which version"
+  assert_no_out "sudo freeframe restore"
+  assert_out "sudo rm '$FF_ROOT/.update-undo' && sudo freeframe update"
+  assert_database_untouched
+}
+
+@test "rollback: a started record without its version still points at the restore" {
+  failed_update
+  sed -i 's/^version=.*/version=unknown/' "$FF_ROOT/.update-undo"
+  ff rollback --yes
+  [ "$status" -eq 1 ]
+  assert_out "sudo freeframe restore --yes '$UPDATE_BACKUP'"
+}

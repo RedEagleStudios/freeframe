@@ -3990,15 +3990,15 @@ cmd_rollback() {
   old=$FF_UNDO_VERSION backup=$FF_UNDO_BACKUP
   [[ $FF_UNDO_PHASE != saved ]] || started=""
   rec_q=$(_ff_q "$(_update_undo_file)")
-  if [[ ! $old =~ ^[A-Za-z0-9._-]+$ || $old == unknown ]]; then
-    _ff_stop 1 "The record of the last update ($(_update_undo_file)) does not say which version it came from, so nothing was changed." \
-      "to put the database back as it was before that update, run: sudo freeframe restore --yes $(_ff_q "$backup")"
-  fi
   # A new version that never started changed nothing in the database, so its
   # rollback needs no backup, and a restore is never the advice for it.
   unsaved_try="to put the database back as it was before the update, run: sudo freeframe restore --yes $(_ff_q "$backup")"
   if [[ -z $started ]]; then
-    unsaved_try="the new version of that update never ran, so the database was not changed and $old still runs. To try the update again, remove the record and run it: sudo rm $rec_q && sudo freeframe update"
+    unsaved_try="the new version of that update never ran, so the database was not changed and the version from before still runs. To try the update again, remove the record and run it: sudo rm $rec_q && sudo freeframe update"
+  fi
+  if [[ ! $old =~ ^[A-Za-z0-9._-]+$ || $old == unknown ]]; then
+    _ff_stop 1 "The record of the last update ($(_update_undo_file)) does not say which version it came from, so nothing was changed." \
+      "$unsaved_try"
   fi
   if [[ -n $started ]] && ! _ff_is_pg_dump "$backup"; then
     _ff_stop 1 "The backup taken before the update ($backup) is not there any more, so the database cannot be put back and nothing was changed." \
