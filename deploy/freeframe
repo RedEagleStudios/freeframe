@@ -1062,7 +1062,10 @@ EOF
 
 # install_backup_timer: put the nightly backup units (fetched into
 # $FF_ROOT/systemd with the compose files) into systemd and start the timer.
-# Safe to run again: it replaces the units with the fetched ones.
+# Safe to run again: it replaces the units with the fetched ones. Starting a
+# Persistent=true timer that missed a run fires that run at once; update and
+# rollback call this holding the lock, and the backup then skips itself
+# (cmd_backup) instead of failing in the journal.
 install_backup_timer() {
   local root dir u
   root=$(ff_root)
@@ -2654,9 +2657,10 @@ _ff_need_install() {
   fi
 }
 
-# _ff_lock: take the lock ($FF_ROOT/.freeframe.lock) that every command
-# which changes the server holds (update, rollback, backup, restore,
+# _ff_lock NAME: take the lock ($FF_ROOT/.freeframe.lock) that every
+# command which changes the server holds (update, rollback, backup, restore,
 # restart, configure), without waiting. 1 when another of them holds it.
+# The holder writes "NAME PID" into the file (_ff_lock_holder reads it).
 # Without flock (not on a supported server) there is no lock.
 # FF_BUSY: the start of the message when the lock is held, naming them all.
 FF_BUSY="Another freeframe command (an update, rollback, backup, restore, restart or configure) is running right now"
@@ -2675,7 +2679,20 @@ _ff_lock() {
   fi
   (umask 077 && : >>"$root/.freeframe.lock") || return 0
   exec {FF_LOCK_FD}>>"$root/.freeframe.lock"
-  flock -n "$FF_LOCK_FD"
+  flock -n "$FF_LOCK_FD" || return 1
+  # Written through a descriptor of its own: closing it keeps the lock,
+  # which belongs to FF_LOCK_FD's.
+  printf '%s %s\n' "${1:-freeframe}" "$$" >"$root/.freeframe.lock" 2>/dev/null || true
+}
+
+# _ff_lock_holder: the name of the command that holds the lock, when the
+# lock file names one whose process still runs; nothing otherwise (call it
+# only once _ff_lock was refused).
+_ff_lock_holder() {
+  local name="" pid=""
+  read -r name pid <"$(ff_root)/.freeframe.lock" 2>/dev/null || true
+  [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null || return 0
+  printf '%s' "$name"
 }
 
 # _ff_lock_busy: 0 when another freeframe command holds the lock right now
@@ -2862,7 +2879,7 @@ _backup_on_signal() {
 # cmd_backup: `freeframe backup [--quiet]`. --quiet (the nightly timer)
 # prints nothing when the backup is saved, and a plain error when not.
 cmd_backup() {
-  local root base size
+  local root base size holder
   root=$(ff_root)
   if ((${#FF_ARGS[@]})); then
     _ff_bad_usage "freeframe backup takes no file name: backups always go to $root/backups."
@@ -2871,7 +2888,24 @@ cmd_backup() {
   _ff_need_install
   FF_ACTOR="the backup"
   _ff_log_open backup
-  if ! _ff_lock; then
+  if ! _ff_lock backup; then
+    # The nightly run behind an update or a rollback is skipped, not failed:
+    # both enable the timer again while they hold the lock, which fires a
+    # missed run at once (Persistent=true), and an update takes a backup of
+    # its own first. Anything else holding the lock (or a run by hand) is
+    # refused, so a backup that was wanted and not made is never silent.
+    holder=$(_ff_lock_holder)
+    if [[ -n ${FF_QUIET:-} && ( $holder == update || $holder == rollback ) ]]; then
+      local skip="The nightly backup was skipped: a freeframe $holder is running right now."
+      if [[ $holder == update ]]; then
+        skip+=" The update saves a backup of the database of its own before it changes anything."
+      else
+        skip+=" The next one runs as usual; for one sooner, run sudo freeframe backup once the rollback has finished."
+      fi
+      say "$skip"
+      _ff_log_lines "$skip"
+      return 0
+    fi
     _ff_log_lines "$FF_BUSY, so this backup did not start."
     _ff_stop 1 "$FF_BUSY, so this backup did not start." \
       "wait a few minutes for it to finish, then run sudo freeframe backup again."
@@ -3130,7 +3164,7 @@ cmd_restore() {
     fi
   fi
 
-  if ! _ff_lock; then
+  if ! _ff_lock restore; then
     _ff_stop 1 "$FF_BUSY, so this restore did not start. Nothing was changed." \
       "wait a few minutes for it to finish, then run the command again."
   fi
@@ -3723,7 +3757,7 @@ cmd_update() {
   FF_UPDATE_PUT_BACK=${FF_SELF_UPDATED:+${FF_UPDATE_PUT_BACK:-}}
   # The lock comes before anything is read or changed: a second update (from
   # another SSH session, say) must not touch a running one's files or record.
-  if ! _ff_lock; then
+  if ! _ff_lock update; then
     _ff_stop 1 "$FF_BUSY, so the update did not start. Nothing was changed." \
       "wait for it to finish, then run sudo freeframe update again."
   fi
@@ -4097,7 +4131,7 @@ cmd_rollback() {
   # An update may have moved on meanwhile: what is done is worked out again
   # from the record as it is under the lock, and anything other than what
   # was asked about is refused.
-  if ! _ff_lock; then
+  if ! _ff_lock rollback; then
     _ff_stop 1 "$FF_BUSY, so the rollback did not start. Nothing was changed." \
       "wait a few minutes for it to finish, then run sudo freeframe rollback again."
   fi
@@ -4685,7 +4719,7 @@ cmd_configure() {
       fi
     fi
   fi
-  if ! _ff_lock; then
+  if ! _ff_lock configure; then
     install_fail "$FF_BUSY, so the settings were not changed." \
       "wait a few minutes for it to finish, then run sudo freeframe configure again."
   fi
@@ -4963,7 +4997,7 @@ cmd_restart() {
   _ff_log_open restart
   # The lock first: a restore that is running has the same undo record as
   # one that stopped part-way, and only the lock tells them apart.
-  if ! _ff_lock; then
+  if ! _ff_lock restart; then
     _ff_manage_stop 1 "$FF_BUSY, so FreeFrame was not restarted." \
       "wait a few minutes for it to finish, then run sudo freeframe restart again."
   fi

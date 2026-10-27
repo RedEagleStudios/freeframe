@@ -683,6 +683,20 @@ killed_update_state() {
   assert_out "the setup files from before an earlier update that stopped part-way were put back first."
 }
 
+@test "update: a missed nightly backup that fires when the timer is enabled is skipped, not failed" {
+  command -v flock >/dev/null || skip "no flock"
+  export STUB_TIMER_RUNS_BACKUP=1 STUBS FF_SCRIPT
+  ff update
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  # The backup the timer started ran while the update still held the lock.
+  [ "$(cat "$STUB_DIR/timer-backup.rc")" = 0 ] || { cat "$STUB_DIR/timer-backup.out"; false; }
+  grep -q "The nightly backup was skipped: a freeframe update is running right now" "$STUB_DIR/timer-backup.out"
+  if grep -q "Another freeframe command" "$STUB_DIR/timer-backup.out"; then false; fi
+  # Nothing was dumped after the timer was enabled.
+  sed -n '/^install_backup_timer$/,$p' "$CALLS" | { ! grep -q pg_dump; }
+  grep -q "The nightly backup was skipped" "$FF_ROOT/install.log"
+}
+
 @test "update: a signal after the new version answered does not advise a rollback that has nothing to do" {
   export STUB_TIMER_HANG=1
   ff_signal TERM timer update

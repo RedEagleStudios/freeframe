@@ -96,10 +96,24 @@ if [[ -z ${STUB_REAL_REEXEC:-} ]]; then
 fi
 
 # STUB_TIMER_HANG: refreshing the timer hangs (a signal after the update
-# succeeded).
+# succeeded). STUB_TIMER_RUNS_BACKUP: enabling the timer fires a missed run
+# at once, as Persistent=true does: `freeframe backup --quiet` in a process
+# of its own, as systemd starts it (without this one's lock descriptor). Its
+# output and exit status go to $STUB_DIR/timer-backup.out and .rc.
 install_backup_timer() {
   _stub_log install_backup_timer
   [[ -z ${STUB_TIMER_HANG:-} ]] || _stub_hang timer
+  if [[ -n ${STUB_TIMER_RUNS_BACKUP:-} ]]; then
+    local rc=0
+    (
+      if [[ -n ${FF_LOCK_FD:-} ]]; then eval "exec ${FF_LOCK_FD}>&-"; fi
+      # shellcheck disable=SC2016 # the inner script expands its own $1 $2 $@
+      exec env -u FF_LOCK_FD -u STUB_TIMER_RUNS_BACKUP bash -c \
+        'set -Eeuo pipefail; source "$1"; source "$2"; shift 2; main "$@"' \
+        ff-run "$FF_SCRIPT" "$STUBS" backup --quiet
+    ) >"$STUB_DIR/timer-backup.out" 2>&1 || rc=$?
+    printf '%s\n' "$rc" >"$STUB_DIR/timer-backup.rc"
+  fi
   [[ -z ${STUB_TIMER_FAIL:-} ]]
 }
 

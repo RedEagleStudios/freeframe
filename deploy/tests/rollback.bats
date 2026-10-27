@@ -243,6 +243,17 @@ assert_not_started() {
   assert_no_out "run: sudo freeframe rollback"
 }
 
+@test "rollback: a missed nightly backup that fires when the timer is enabled is skipped, not failed" {
+  command -v flock >/dev/null || skip "no flock"
+  failed_update
+  export STUB_TIMER_RUNS_BACKUP=1 STUBS FF_SCRIPT
+  ff rollback --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  [ "$(cat "$STUB_DIR/timer-backup.rc")" = 0 ] || { cat "$STUB_DIR/timer-backup.out"; false; }
+  grep -q "The nightly backup was skipped: a freeframe rollback is running right now" "$STUB_DIR/timer-backup.out"
+  if grep -q "Another freeframe command" "$STUB_DIR/timer-backup.out"; then false; fi
+}
+
 @test "rollback: compose files that do not parse are no dead end: it stops by project label" {
   failed_update
   export STUB_CONFIG_FAIL_NEW=1

@@ -224,6 +224,41 @@ dumps() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null) || true; }
   assert_not_called pg_dump
 }
 
+@test "backup: only the nightly run, and only behind an update or rollback, is skipped instead of refused" {
+  command -v flock >/dev/null || skip "no flock"
+  exec 8>>"$FF_ROOT/.freeframe.lock"
+  flock -n 8
+  # Behind a running update (the lock file names it and its live process).
+  printf 'update %s\n' "$$" >"$FF_ROOT/.freeframe.lock"
+  ff backup --quiet
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "The nightly backup was skipped: a freeframe update is running right now"
+  assert_not_called pg_dump
+  # By hand, the same is refused: a backup was asked for and none was made.
+  ff backup
+  [ "$status" -eq 1 ]
+  assert_out "Another freeframe command"
+  # Behind a restore, the nightly run is refused as before.
+  printf 'restore %s\n' "$$" >"$FF_ROOT/.freeframe.lock"
+  ff backup --quiet
+  [ "$status" -eq 1 ]
+  assert_out "Another freeframe command"
+  # A name left by a process that has ended says nothing about the holder.
+  printf 'update 999999999\n' >"$FF_ROOT/.freeframe.lock"
+  ff backup --quiet
+  [ "$status" -eq 1 ]
+  assert_out "Another freeframe command"
+  exec 8>&-
+  assert_not_called pg_dump
+}
+
+@test "backup: the lock file names the command that holds it" {
+  command -v flock >/dev/null || skip "no flock"
+  ff backup
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -qE '^backup [0-9]+$' "$FF_ROOT/.freeframe.lock"
+}
+
 @test "backup: with no log file possible, a failure does not point at one" {
   mkdir "$FF_ROOT/install.log"
   export STUB_DUMP_FAIL=1
