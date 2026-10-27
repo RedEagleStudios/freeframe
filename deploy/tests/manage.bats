@@ -159,7 +159,7 @@ setup() {
   ff restart
   exec 9>&-
   [ "$status" -eq 1 ]
-  assert_out "Another backup or restore is running"
+  assert_out "Another freeframe command (an update, rollback, backup, restore, restart or configure) is running right now"
   assert_not_called "dc up"
 }
 

@@ -2657,11 +2657,17 @@ _ff_need_install() {
 # _ff_lock: take the backup/restore lock, without waiting. 1 when another
 # backup or restore holds it. Without flock (not on a supported server) there
 # is no lock.
+# FF_BUSY: the start of the message when the lock is held. Any command
+# that changes the server takes it, so it names them all.
+FF_BUSY="Another freeframe command (an update, rollback, backup, restore, restart or configure) is running right now"
+
 _ff_lock() {
   local root
   root=$(ff_root)
   command -v flock >/dev/null 2>&1 || return 0
-  [[ -z ${FF_LOCK_FD:-} ]] || return 0
+  # Held already: by this process, or handed on by the update's re-exec
+  # (the descriptor stays open across exec, and so does its lock).
+  if [[ -n ${FF_LOCK_FD:-} ]] && flock -n "$FF_LOCK_FD" 2>/dev/null; then return 0; fi
   (umask 077 && : >>"$root/.freeframe.lock") || return 0
   exec {FF_LOCK_FD}>>"$root/.freeframe.lock"
   flock -n "$FF_LOCK_FD"
@@ -2844,8 +2850,8 @@ cmd_backup() {
   FF_ACTOR="the backup"
   _ff_log_open backup
   if ! _ff_lock; then
-    _ff_log_lines "Another backup or restore is running right now, so this backup did not start."
-    _ff_stop 1 "Another backup or restore is running right now, so this backup did not start." \
+    _ff_log_lines "$FF_BUSY, so this backup did not start."
+    _ff_stop 1 "$FF_BUSY, so this backup did not start." \
       "wait a few minutes for it to finish, then run sudo freeframe backup again."
   fi
   exec {FF_BACKUP_ERR}>&2
@@ -3103,7 +3109,7 @@ cmd_restore() {
   fi
 
   if ! _ff_lock; then
-    _ff_stop 1 "Another backup or restore is running right now, so this restore did not start. Nothing was changed." \
+    _ff_stop 1 "$FF_BUSY, so this restore did not start. Nothing was changed." \
       "wait a few minutes for it to finish, then run the command again."
   fi
   FF_ACTOR="the restore"
@@ -3454,6 +3460,8 @@ _ff_reexec() {
   local path=$1
   shift
   export FF_SELF_UPDATED=1
+  # The update holds the lock; the new command carries on with it.
+  if [[ -n ${FF_LOCK_FD:-} ]]; then export FF_LOCK_FD; fi
   exec bash "$path" "$@"
 }
 
@@ -3655,6 +3663,12 @@ cmd_update() {
       "to change the web address, email or storage, run: sudo freeframe configure"
   fi
   _ff_need_finished_install update
+  # The lock comes before anything is read or changed: a second update (from
+  # another SSH session, say) must not touch a running one's files or record.
+  if ! _ff_lock; then
+    _ff_stop 1 "$FF_BUSY, so the update did not start. Nothing was changed." \
+      "wait for it to finish, then run sudo freeframe update again."
+  fi
   _ff_refuse_unfinished_restore update
   if _update_undo_read; then
     if [[ $FF_UNDO_PHASE == saved ]]; then
@@ -3700,10 +3714,6 @@ cmd_update() {
   # Spec goal 12b: the newest freeframe command does the rest.
   update_self "$ch"
 
-  if ! _ff_lock; then
-    _ff_stop 1 "Another backup or restore is running right now, so the update did not start. Nothing was changed." \
-      "wait a few minutes for it to finish, then run sudo freeframe update again."
-  fi
   FF_ACTOR="the update"
   FF_STOPPED=()
   FF_ADMIN_CREATED="" FF_PW_GENERATED=""
@@ -3993,7 +4003,7 @@ cmd_rollback() {
   fi
 
   if ! _ff_lock; then
-    _ff_stop 1 "Another backup or restore is running right now, so the rollback did not start. Nothing was changed." \
+    _ff_stop 1 "$FF_BUSY, so the rollback did not start. Nothing was changed." \
       "wait a few minutes for it to finish, then run sudo freeframe rollback again."
   fi
   FF_ACTOR="the rollback"
@@ -4560,7 +4570,7 @@ cmd_configure() {
     fi
   fi
   if ! _ff_lock; then
-    install_fail "Another backup or restore is running right now, so the settings were not changed." \
+    install_fail "$FF_BUSY, so the settings were not changed." \
       "wait a few minutes for it to finish, then run sudo freeframe configure again."
   fi
 
@@ -4829,7 +4839,7 @@ cmd_restart() {
   FF_ACTOR="the restart"
   _ff_log_open restart
   if ! _ff_lock; then
-    _ff_manage_stop 1 "Another backup or restore is running right now, so FreeFrame was not restarted." \
+    _ff_manage_stop 1 "$FF_BUSY, so FreeFrame was not restarted." \
       "wait a few minutes for it to finish, then run sudo freeframe restart again."
   fi
   say "Restarting FreeFrame..."

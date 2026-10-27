@@ -75,6 +75,25 @@ newest_dump() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null | tail -1)
   assert_not_called "dc "
 }
 
+@test "update: the re-exec'd command carries on with the lock the update took" {
+  command -v flock >/dev/null || skip "no flock"
+  # A stand-in new command that reports on the lock.
+  cat >"$STUB_REMOTE/deploy/freeframe" <<'SCRIPT'
+#!/usr/bin/env bash
+FF_SCRIPT_KIND=freeframe-management-script
+cmd_update() { :; }
+exec {g}>>"$FF_ROOT/.freeframe.lock"
+if flock -n "$g"; then echo "lock: free"; else echo "lock: held"; fi
+if [[ -n ${FF_LOCK_FD:-} ]] && flock -n "$FF_LOCK_FD"; then echo "lock: carried on"; fi
+SCRIPT
+  export STUB_REAL_REEXEC=1
+  ff update
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  # Nobody else can take it, and the new command has it.
+  assert_out "lock: held"
+  assert_out "lock: carried on"
+}
+
 @test "update: a cut-off command download is refused and nothing changes" {
   printf '#!/usr/bin/env bash\nif true; then\n' >"$STUB_REMOTE/deploy/freeframe"
   cp "$ENV" "$BATS_TEST_TMPDIR/env.before"
@@ -360,7 +379,7 @@ newest_dump() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null | tail -1)
   ff update
   exec 9>&-
   [ "$status" -eq 1 ]
-  assert_out "Another backup or restore is running"
+  assert_out "Another freeframe command (an update, rollback, backup, restore, restart or configure) is running right now"
   assert_not_called "dc "
 }
 
@@ -612,4 +631,41 @@ started_record() {
 
 @test "every rollback hint uses the same command, sudo freeframe rollback" {
   if grep -n 'freeframe rollback --yes' "$FF_SCRIPT"; then false; fi
+}
+
+# ---------------------------------------------------------------- round 3
+
+# killed_update_state: what an update killed before its new version started
+# leaves (or what a running one has while it downloads): the new files in
+# place, the saved set, and a phase=saved record.
+killed_update_state() {
+  local f
+  mkdir -p "$FF_ROOT/rollback"
+  for f in $SETUP_NAMES; do cp "$FF_ROOT/$f" "$FF_ROOT/rollback/$f"; cp "$STUB_REMOTE/$f" "$FF_ROOT/$f"; done
+  cp "$FF_ROOT/systemd/"freeframe-backup.* "$FF_ROOT/rollback/"
+  mkdir -p "$BK"
+  printf 'PGDMP before\n' >"$BK/freeframe-20261020-030000.dump"
+  printf 'version=1.21.0\nbackup=%s\ntime=2026-10-20 03:00:00 +0000\nphase=saved\n' "$BK/freeframe-20261020-030000.dump" \
+    >"$FF_ROOT/.update-undo"
+}
+
+@test "update: a second update while the first holds the lock changes nothing of the first's" {
+  command -v flock >/dev/null || skip "no flock"
+  killed_update_state
+  local f
+  mkdir -p "$BATS_TEST_TMPDIR/during"
+  for f in $SETUP_NAMES .update-undo; do cp "$FF_ROOT/$f" "$BATS_TEST_TMPDIR/during/$f"; done
+  # The first update, still running, holds the lock.
+  exec 9>>"$FF_ROOT/.freeframe.lock"
+  flock -n 9
+  ff update
+  exec 9>&-
+  [ "$status" -eq 1 ]
+  for f in $SETUP_NAMES .update-undo; do
+    cmp "$BATS_TEST_TMPDIR/during/$f" "$FF_ROOT/$f" || { echo "$f was changed"; return 1; }
+  done
+  assert_out "Another freeframe command (an update, rollback, backup, restore, restart or configure) is running right now, so the update did not start. Nothing was changed."
+  assert_no_out "putting its setup files from before back"
+  assert_not_called fetch
+  assert_not_called "dc "
 }
