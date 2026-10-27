@@ -72,7 +72,7 @@ newest_dump() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null | tail -1)
   cmp "$STUB_REMOTE/deploy/freeframe" "$FF_BIN_DIR/freeframe"
   [ "$(stat -c %a "$FF_BIN_DIR/freeframe")" = 755 ]
   # The old process stopped at the exec: nothing else ran.
-  assert_not_called "dc "
+  assert_no_dc_change
 }
 
 @test "update: the re-exec'd command carries on with the lock the update took" {
@@ -102,7 +102,7 @@ SCRIPT
   assert_out "nothing was changed"
   cmp "$FF_SCRIPT" "$FF_BIN_DIR/freeframe"
   cmp "$ENV" "$BATS_TEST_TMPDIR/env.before"
-  assert_not_called "dc "
+  assert_no_dc_change
   [ ! -d "$BK" ]
 }
 
@@ -113,7 +113,7 @@ SCRIPT
   assert_out "is not the freeframe command"
   assert_out "nothing was changed"
   cmp "$FF_SCRIPT" "$FF_BIN_DIR/freeframe"
-  assert_not_called "dc "
+  assert_no_dc_change
   # With the marker but without the update command, it is refused too.
   printf '#!/usr/bin/env bash\nFF_SCRIPT_KIND=freeframe-management-script\n' >"$STUB_REMOTE/deploy/freeframe"
   ff update
@@ -126,7 +126,7 @@ SCRIPT
   ff update
   [ "$status" -eq 1 ]
   assert_out "nothing was changed"
-  assert_not_called "dc "
+  assert_no_dc_change
   assert_not_called "fetch latest docker-compose"
 }
 
@@ -342,6 +342,57 @@ SCRIPT
   grep -qx "fetch stable deploy/freeframe" "$CALLS"
   grep -qx "fetch stable docker-compose.prod.yml" "$CALLS"
   assert_not_called "fetch latest"
+}
+
+# ---------------------------------------------------------------- downgrade
+
+# this_server_runs VERSION: the setup files on this server are for VERSION.
+this_server_runs() {
+  sed -i "s/FREEFRAME_VERSION:-[^}]*}/FREEFRAME_VERSION:-$1}/" "$FF_ROOT/docker-compose.images.yml"
+}
+
+@test "update: a channel older than this server is refused, nothing changes and the channel is not saved" {
+  this_server_runs 1.22.0
+  remote_release 1.21.0
+  newer_command
+  cp "$ENV" "$BATS_TEST_TMPDIR/env.before"
+  cp "$FF_ROOT/docker-compose.images.yml" "$BATS_TEST_TMPDIR/images.before"
+  ff update --channel stable
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  assert_out "The stable channel is on FreeFrame 1.21.0, older than the 1.22.0 this server runs, so nothing was changed."
+  assert_out "sudo freeframe update --channel latest"
+  assert_out "Or wait until the stable channel reaches 1.22.0"
+  cmp "$ENV" "$BATS_TEST_TMPDIR/env.before"
+  cmp "$FF_ROOT/docker-compose.images.yml" "$BATS_TEST_TMPDIR/images.before"
+  assert_eq "$(env_get "$ENV" FREEFRAME_CHANNEL)" latest
+  # The command on this server is not swapped for the channel's older one.
+  cmp "$FF_SCRIPT" "$FF_BIN_DIR/freeframe"
+  assert_no_dc_change
+  assert_not_called "fetch stable docker-compose"
+  assert_not_called "fetch stable deploy/freeframe"
+  [ ! -d "$BK" ]
+  [ -z "$(env_backups)" ]
+}
+
+@test "update: the running version counts when it is newer than the files, and latest is not offered on latest" {
+  remote_release 1.21.0
+  export STUB_RUNNING_IMAGE=ghcr.io/techiebutler/freeframe-api:1.22.0
+  ff update
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  assert_out "The latest channel is on FreeFrame 1.21.0, older than the 1.22.0 this server runs, so nothing was changed."
+  assert_out "Wait until the latest channel reaches 1.22.0"
+  assert_no_out "--channel latest"
+  assert_not_called "dc pull"
+  [ ! -d "$BK" ]
+}
+
+@test "update: a channel whose version cannot be read stops before anything changes" {
+  export STUB_NET_DOWN=1
+  ff update
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  assert_out "nothing was changed"
+  assert_no_dc_change
+  [ ! -d "$BK" ]
 }
 
 @test "update: a channel that is not a branch or tag name is refused" {

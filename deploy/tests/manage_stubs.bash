@@ -151,10 +151,20 @@ cert_expiry() {
   printf '%s\n' "${STUB_CERT_END:-Jan 24 10:00:00 2027 GMT}"
 }
 
+# The channel's version: STUB_REMOTE_VERSION when set, otherwise the default
+# in the images file the ref serves (as the real one reads it).
 remote_version() {
+  local d=$STUB_REMOTE
   _stub_log "remote_version $1"
   [[ -z ${STUB_NET_DOWN:-} ]] || return 1
-  printf '%s\n' "${STUB_REMOTE_VERSION:-1.21.0}"
+  [[ -z ${STUB_FETCH_FAIL_REF:-} || $1 != "$STUB_FETCH_FAIL_REF" ]] || return 1
+  if [[ -n ${STUB_REMOTE_VERSION:-} ]]; then
+    printf '%s\n' "$STUB_REMOTE_VERSION"
+    return 0
+  fi
+  if [[ -n ${STUB_REMOTE_REFS:-} && -d $STUB_REMOTE_REFS/$1 ]]; then d=$STUB_REMOTE_REFS/$1; fi
+  [[ -f $d/docker-compose.images.yml ]] || return 1
+  _ff_version_in "$(<"$d/docker-compose.images.yml")"
 }
 
 # docker compose for this install.

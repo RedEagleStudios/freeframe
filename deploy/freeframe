@@ -3400,10 +3400,15 @@ _ff_parts_cmp() {
 
 # remote_version CHANNEL: the version `freeframe update` would move to: the
 # default in the images compose file at the channel's ref. Fails without a
-# network answer.
+# network answer. With FF_FETCH_FROM_DIR (test-only, as in fetch) the file is
+# read from that folder.
 remote_version() {
   local out
-  out=$(curl -fsSL --max-time 10 "$FF_RAW_BASE/$1/docker-compose.images.yml" 2>/dev/null) || return 1
+  if [[ -n ${FF_FETCH_FROM_DIR:-} ]]; then
+    out=$(cat "$FF_FETCH_FROM_DIR/docker-compose.images.yml" 2>/dev/null) || return 1
+  else
+    out=$(curl -fsSL --max-time 10 "$FF_RAW_BASE/$1/docker-compose.images.yml" 2>/dev/null) || return 1
+  fi
   _ff_version_in "$out"
 }
 
@@ -3739,6 +3744,29 @@ _update_before_change() {
 # and backup units, the fill-missing settings merge, the new images, a
 # restart and the health checks. If the new version does not come up, it
 # prints the line that goes back, rather than guessing.
+# _update_refuse_older_channel CH: stop, changing nothing, when the release
+# the channel CH is on is older than the one this server runs (the running
+# containers' version, or the setup files' when that is unknown). An older
+# release cannot start on a database a newer one has migrated.
+_update_refuse_older_channel() {
+  local ch=$1 target cur try
+  if ! target=$(remote_version "$ch"); then
+    _ff_stop 1 "Could not read which release the $ch channel is on, so $(_update_unchanged)." \
+      "check that this server can reach raw.githubusercontent.com, then run sudo freeframe update again."
+  fi
+  cur=$(_ff_running_version)
+  [[ -n $cur ]] || cur=$(ff_version)
+  [[ $cur =~ ^v?[0-9] ]] || return 0
+  _ff_version_gt "$cur" "$target" || return 0
+  try="the $ch channel is behind this server."
+  if [[ $ch != latest ]]; then
+    try+=" To keep getting updates, switch to the newest releases: sudo freeframe update --channel latest. Or wait until the $ch channel reaches ${cur#v}, then run sudo freeframe update."
+  else
+    try+=" Wait until the latest channel reaches ${cur#v}, then run sudo freeframe update."
+  fi
+  _ff_stop 1 "The $ch channel is on FreeFrame $target, older than the ${cur#v} this server runs, so $(_update_unchanged)." "$try"
+}
+
 cmd_update() {
   local root file ch ref old new answers pinned url mode host running save_ref="" try
   root=$(ff_root)
@@ -3803,6 +3831,12 @@ cmd_update() {
         "delete the FREEFRAME_VERSION line from $file to follow the $ch channel, then run sudo freeframe update."
     fi
   fi
+
+  # A channel behind this server (stable after a newer install from latest,
+  # or stable moved back to an older release) would take it to an older
+  # release, onto a database the newer one has already migrated. Checked
+  # before the command itself is replaced, so nothing at all changes.
+  [[ -n $pinned ]] || _update_refuse_older_channel "$ch"
 
   # Spec goal 12b: the newest freeframe command does the rest.
   update_self "$ch"
@@ -4847,6 +4881,11 @@ cmd_status() {
       say "  Updates:      $latest is available on the $ch channel. To move to it, run: sudo freeframe update"
       if [[ -n $pinned ]]; then
         say "                (first delete the FREEFRAME_VERSION line from $file, which keeps this server on $pinned)"
+      fi
+    elif _ff_version_gt "$ver" "$latest"; then
+      say "  Updates:      none; this server runs $ver, ahead of the $ch channel ($latest)"
+      if [[ $ch != latest ]]; then
+        say "                To follow the newest releases, run: sudo freeframe update --channel latest"
       fi
     else
       say "  Updates:      none; this is the newest release on the $ch channel"

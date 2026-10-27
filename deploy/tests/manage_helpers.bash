@@ -117,6 +117,18 @@ assert_not_called() {
   fi
 }
 
+# assert_no_dc_change: no docker compose call other than reading which image
+# the api runs (dc ps --format {{.Image}} api), which changes nothing.
+assert_no_dc_change() {
+  local l
+  l=$(grep '^dc ' "$CALLS" | grep -vxF 'dc ps --format {{.Image}} api' || true)
+  if [[ -n $l ]]; then
+    echo "unexpected docker compose calls:"
+    echo "$l"
+    return 1
+  fi
+}
+
 assert_out() {
   if [[ $output != *"$1"* ]]; then
     echo "expected output to contain: $1"

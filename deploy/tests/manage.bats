@@ -55,6 +55,17 @@ setup() {
   assert_out "this is the newest release on the latest channel"
 }
 
+@test "status: a server ahead of its channel says so, not that it is the newest" {
+  sed -i "s/FREEFRAME_VERSION:-[^}]*}/FREEFRAME_VERSION:-1.22.0}/" "$FF_ROOT/docker-compose.images.yml"
+  env_set "$ENV" FREEFRAME_CHANNEL stable
+  export STUB_REMOTE_VERSION=1.21.0
+  ff status
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "this server runs 1.22.0, ahead of the stable channel (1.21.0)"
+  assert_out "sudo freeframe update --channel latest"
+  assert_no_out "this is the newest release"
+}
+
 @test "status: no network is not an error" {
   export STUB_NET_DOWN=1
   ff status
@@ -223,6 +234,20 @@ setup() {
 }
 
 # ---------------------------------------------------------------- version order
+
+@test "remote_version: with FF_FETCH_FROM_DIR the version is read from that folder, as fetch does" {
+  local d="$BATS_TEST_TMPDIR/workspace"
+  mkdir -p "$d"
+  printf 'services:\n  api:\n    image: x:${FREEFRAME_VERSION:-1.23.4}\n' >"$d/docker-compose.images.yml"
+  # No network at all: a curl would fail.
+  curl() { return 7; }
+  FF_FETCH_FROM_DIR=$d run remote_version latest
+  [ "$status" -eq 0 ]
+  assert_eq "$output" 1.23.4
+  rm "$d/docker-compose.images.yml"
+  FF_FETCH_FROM_DIR=$d run remote_version latest
+  [ "$status" -ne 0 ]
+}
 
 @test "_ff_version_gt: numbers compare as numbers, and a pre-release ranks below its release" {
   _ff_version_gt 1.22.0 1.21.9
