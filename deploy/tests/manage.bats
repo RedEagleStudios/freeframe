@@ -40,6 +40,16 @@ setup() {
   done
 }
 
+@test "status: Last is the newest ordinary backup, not a rollback's copy" {
+  mkdir -p "$BK"
+  printf 'PGDMP x\n' >"$BK/freeframe-20261025-030411.dump"
+  printf 'PGDMP y\n' >"$BK/freeframe-20261026-120000-before-rollback.dump"
+  ff status
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "Last:         2026-10-25 03:04:11 (freeframe-20261025-030411.dump"
+  assert_out "2 kept"
+}
+
 @test "status: a newer release on the channel is named with the command to get it" {
   export STUB_REMOTE_VERSION=1.22.0
   ff status

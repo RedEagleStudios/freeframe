@@ -730,6 +730,36 @@ dumps() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null) || true; }
   [ -e "$BK/freeframe-20261004-030000.dump" ]
 }
 
+@test "restore without FILE does not suggest the rollback's copy, and lists it with its date" {
+  old_backup 20261020-030000
+  old_backup 20261021-030000-before-rollback
+  ff restore
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "sudo freeframe restore '$BK/freeframe-20261020-030000.dump'"
+  if [[ $output == *"restore '$BK/freeframe-20261021-030000-before-rollback.dump'"* ]]; then echo "$output"; false; fi
+  assert_out "freeframe-20261021-030000-before-rollback.dump"
+  assert_out "2026-10-21 03:00:00"
+  assert_out "before a rollback"
+}
+
+@test "backup: a rollback's copy ages out like any backup, with its settings copy, and counts for the size rule" {
+  local s
+  old_backup 20261001-030000-before-rollback
+  for s in 02 03 04 05 06 07; do old_backup "202610$s-030000"; done
+  ff backup
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(dumps | wc -l | tr -d ' ')" 7
+  [ ! -e "$BK/freeframe-20261001-030000-before-rollback.dump" ]
+  [ ! -e "$BK/freeframe-20261001-030000-before-rollback.env.prod" ]
+  # The newest backup is a big rollback copy: twice its size is needed.
+  old_backup 20261030-030000-before-rollback
+  export STUB_BIG_LAST=$((700 * 1048576)) STUB_BIG_LAST_FILE="$BK/freeframe-20261030-030000-before-rollback.dump"
+  export STUB_FREE_MB=1300
+  ff backup
+  [ "$status" -eq 1 ]
+  assert_out "at least 1400 MB"
+}
+
 @test "backup_prune leaves a protected dump alone and does not count it" {
   local s
   for s in 01 02 03 04; do old_backup "202610$s-030000"; done

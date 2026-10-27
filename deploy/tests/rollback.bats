@@ -69,6 +69,18 @@ assert_not_started() {
   assert_out "delete the FREEFRAME_VERSION line"
 }
 
+@test "rollback: its copy of the database from before has its own name, so it is never taken for the newest backup" {
+  failed_update
+  ff rollback --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  local copy
+  copy=$(cd "$BK" && ls | grep -E '^freeframe-[0-9]{8}-[0-9]{6}-before-rollback\.dump$')
+  [ -n "$copy" ] || { ls -A "$BK"; false; }
+  [ -f "$BK/${copy%.dump}.env.prod" ]
+  # The only ordinary backup is still the one the update took.
+  assert_eq "$(cd "$BK" && ls | grep -E '^freeframe-[0-9]{8}-[0-9]{6}\.dump$')" "${UPDATE_BACKUP##*/}"
+}
+
 @test "rollback: a database check that fails never starts the old version, and says a re-run is safe" {
   failed_update
   export STUB_MAINT_FAIL=1

@@ -138,14 +138,14 @@ After the install, the `freeframe` command is on the server. All commands need `
 
 ### Backups with the installer
 
-- **Nightly at 03:00** (server time), the installer's timer saves a copy of the database and of the settings file to `/opt/freeframe/backups`. The newest 7 are kept. `sudo freeframe backup` makes one right now.
-- **They are on the same server.** If the server is lost, so are they. Copy the newest `.dump` file and `/opt/freeframe/.env.prod` to another computer or storage now and then. The files are readable by the administrator only, so copy them as that user, for example with `sudo cat` or by logging in as root.
+- **Nightly at 03:00** (server time), the installer's timer saves a copy of the database and of the settings file to `/opt/freeframe/backups`. The newest 7 are kept. `sudo freeframe backup` makes one right now. A rollback also saves the database it replaces, named `freeframe-<date>-<time>-before-rollback.dump`; it holds the newer release's database, so it is never offered as the newest backup.
+- **They are on the same server.** If the server is lost, so are they. Copy the newest backup (`sudo freeframe status` names it) and `/opt/freeframe/.env.prod` to another computer or storage now and then. The files are readable by the administrator only, so copy them as that user, for example with `sudo cat` or by logging in as root.
 - **Uploaded media is not in these backups** when footage is kept on the server (it can be very large). If you use your own S3 bucket, the media stays in the bucket; see [S3 Media Backup](#s3-media-backup) for keeping a second copy.
 - **To put a backup back:** `sudo freeframe restore` lists them; `sudo freeframe restore FILE` restores one. It asks first, saves a copy of the current database, and then replaces it.
 
 ### Moving to a new server
 
-1. On the old server run `sudo freeframe backup`, then copy the newest `.dump` file from `/opt/freeframe/backups` and the file `/opt/freeframe/.env.prod` to your computer.
+1. On the old server run `sudo freeframe backup`, then copy the backup it just saved (it prints the file name) from `/opt/freeframe/backups` and the file `/opt/freeframe/.env.prod` to your computer.
 2. Rent the new server as above. Point your domain's DNS at the new server's address.
 3. On the new server, create the folder and put the old settings file in it:
    ```bash

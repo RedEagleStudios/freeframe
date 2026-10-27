@@ -2610,7 +2610,7 @@ _ff_stamp() { date +%Y%m%d-%H%M%S; }
 # nothing for a name without a stamp. The name, not the file's time, says
 # when a backup was made: copying a file between servers changes its time.
 _ff_stamp_date() {
-  local re='freeframe-([0-9]{4})([0-9]{2})([0-9]{2})-([0-9]{2})([0-9]{2})([0-9]{2})\.dump$'
+  local re='freeframe-([0-9]{4})([0-9]{2})([0-9]{2})-([0-9]{2})([0-9]{2})([0-9]{2})(-before-rollback)?\.dump$'
   [[ ${1:-} =~ $re ]] || return 0
   printf '%s-%s-%s %s:%s:%s' "${BASH_REMATCH[@]:1:6}"
 }
@@ -2623,6 +2623,19 @@ _ff_backup_dumps() {
   for f in "$1"/freeframe-*.dump; do
     if [[ -f $f ]]; then printf '%s\n' "$f"; fi
   done
+}
+
+# _ff_backup_newest DIR: the newest ordinary backup in DIR (not a rollback's
+# copy of the database it replaced, freeframe-<stamp>-before-rollback.dump,
+# which holds a newer release's database), or the newest of any kind when
+# there is no ordinary one. Nothing when DIR has no backups.
+_ff_backup_newest() {
+  local f any="" ord=""
+  while IFS= read -r f; do
+    any=$f
+    [[ $f == *-before-rollback.dump ]] || ord=$f
+  done < <(_ff_backup_dumps "$1")
+  printf '%s' "${ord:-$any}"
 }
 
 # _ff_is_pg_dump FILE: 0 when FILE is a pg_dump custom-format archive (it
@@ -2827,7 +2840,7 @@ backup_create() {
   fi
   stamp=$(_ff_stamp) || stamp=""
   while [[ $stamp =~ ^[0-9]{8}-[0-9]{6}$ ]] &&
-    [[ -e $dir/freeframe-$stamp.dump || -e $dir/freeframe-$stamp.env.prod ]]; do
+    [[ -e $dir/freeframe-$stamp${FF_BACKUP_SUFFIX:-}.dump || -e $dir/freeframe-$stamp${FF_BACKUP_SUFFIX:-}.env.prod ]]; do
     sleep 1
     stamp=$(_ff_stamp) || stamp=""
   done
@@ -2836,7 +2849,8 @@ backup_create() {
       "What to try: check the date with: date, then run: $retry"
     return 1
   fi
-  base="$dir/freeframe-$stamp"
+  # FF_BACKUP_SUFFIX: -before-rollback for the copy a rollback saves.
+  base="$dir/freeframe-$stamp${FF_BACKUP_SUFFIX:-}"
   FF_PARTIAL=$base
   printf 'backup: writing %s.dump\n' "$base" >>"${FF_LOG:-/dev/null}"
   if ! (umask 077 && dc exec -T postgres pg_dump -Fc -U "$FF_PG_USER" "$FF_PG_DB" \
@@ -2986,11 +3000,12 @@ restore_list() {
     f=${dumps[i]}
     name=${f##*/}
     when=$(_ff_stamp_date "$name")
-    printf '  %-34s  %-19s  %s\n' "$name" "${when:-(no date)}" "$(_ff_human_size "$(_ff_size_bytes "$f")")"
+    printf '  %-34s  %-19s  %s%s\n' "$name" "${when:-(no date)}" "$(_ff_human_size "$(_ff_size_bytes "$f")")" \
+      "$([[ $name == *-before-rollback.dump ]] && printf '  (the database just before a rollback, from the newer release)')"
   done
   say ""
   say "To put one back, run for example (this replaces the current database, after saving a copy of it):"
-  say "  sudo freeframe restore $(_ff_q "${dumps[-1]}")"
+  say "  sudo freeframe restore $(_ff_q "$(_ff_backup_newest "$dir")")"
   say "A backup copied from another server can be given by its path."
   undo=$(_restore_undo_path)
   if [[ -n $undo ]]; then
@@ -4288,8 +4303,11 @@ cmd_rollback() {
   FF_STATE_PREFIX="FreeFrame is stopped. Its setup files and version are back to $old, but the database is not yet back as it was before the update, so FreeFrame stays stopped. Running sudo freeframe rollback again is safe."
   FF_STATE=""
   FF_RESTORE_NO_START=1
+  # Its copy of the database it replaces is a newer release's: named apart,
+  # so restore and status never offer it as the newest backup.
+  FF_BACKUP_SUFFIX=-before-rollback
   restore_database "$backup"
-  FF_RESTORE_NO_START=""
+  FF_RESTORE_NO_START="" FF_BACKUP_SUFFIX=""
 
   FF_STATE_PREFIX=""
   FF_STATE="The setup files, the version ($old) and the database are back as they were before the update. Running sudo freeframe rollback again is safe."
@@ -5020,7 +5038,7 @@ cmd_status() {
   if ((n == 0)); then
     say "  Last:         none yet (to make one now: sudo freeframe backup)"
   else
-    last=${dumps[n - 1]}
+    last=$(_ff_backup_newest "$dir")
     bytes=$(_ff_size_bytes "$last") || bytes=0
     say "  Last:         $(_ff_stamp_date "${last##*/}") (${last##*/}, $(_ff_human_size "$bytes")); $n kept"
   fi
