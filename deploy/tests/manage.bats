@@ -201,3 +201,15 @@ setup() {
   assert_out "older"
   assert_out "after"
 }
+
+@test "status: with FreeFrame not answering, the certificate line does not blame DNS" {
+  export STUB_HEALTH_FAIL=1 STUB_CERT_FAIL=1
+  ff status
+  [ "$status" -eq 0 ]
+  assert_out "Certificate:  not checked: FreeFrame's web entrance (Traefik) is not answering"
+  assert_no_out "DNS records point here"
+  # Answering but no certificate yet: then DNS is the thing to check.
+  export STUB_HEALTH_FAIL=""
+  ff status
+  assert_out "Check that the DNS records point here"
+}

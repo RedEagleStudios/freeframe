@@ -4065,7 +4065,7 @@ _ff_mount_of() {
 
 cmd_status() {
   local root file ch ver pinned url mode host storage latest line svc state st s found end smtp
-  local next timer dir last n bytes undo
+  local next timer dir last n bytes undo healthy=0
   local -a all=() rows=() dumps=()
   root=$(ff_root)
   file="$root/.env.prod"
@@ -4102,6 +4102,7 @@ cmd_status() {
   fi
   say "  Web address:  $url"
   if probe_health "$mode" "$host"; then
+    healthy=1
     say "  Health:       FreeFrame answers at its web address"
   else
     say "  Health:       FreeFrame does not answer at its web address (see why with: sudo freeframe logs)"
@@ -4109,6 +4110,8 @@ cmd_status() {
   if [[ $mode != off ]]; then
     if end=$(cert_expiry "$host"); then
       say "  Certificate:  valid until $end"
+    elif ((!healthy)); then
+      say "  Certificate:  not checked: FreeFrame's web entrance (Traefik) is not answering. Start it with: sudo freeframe restart"
     else
       say "  Certificate:  not issued yet, so browsers show a warning. Check that the DNS records point here, then run: sudo freeframe restart"
     fi
