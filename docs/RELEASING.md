@@ -48,9 +48,14 @@ release (soak it as `latest`, smoke-test, watch for breakage reports).
 
 **The installer's command uses `latest` for now.** The install command in the
 README and `docs/deployment.md` (`curl ... /latest/install.sh | sudo bash`) names
-the `latest` ref. When the first release containing the installer is promoted to
-`stable`, switch that command to `stable` in a one-line docs PR (ledger row M4 of
-the installer deploy ledger).
+the `latest` ref, and so do the published-images download commands there. When
+the first release containing the installer (and `docker-compose.images.yml`) is
+promoted to `stable`, switch those commands to `stable` in a docs PR. The stable
+install command must name the channel too:
+`curl -fsSL .../stable/install.sh | sudo FREEFRAME_CHANNEL=stable bash`.
+`install.sh` cannot see the URL it was downloaded from, and both it and the
+`freeframe` command default to `latest` when no channel is given, so a bare
+`| sudo bash` from the stable URL installs a server that follows `latest`.
 
 ## Rolling back a bad release
 
