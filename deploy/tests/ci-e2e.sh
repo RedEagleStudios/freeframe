@@ -114,6 +114,7 @@ mask_env_secrets() {
   local v
   sudo test -r "$ENV_FILE" || return 0
   while IFS= read -r v; do
+    # Masked late (after install), which is fine: throwaway values; phase_install's install.log grep guards regressions.
     printf '::add-mask::%s\n' "$v"
   done < <(secret_values)
 }
