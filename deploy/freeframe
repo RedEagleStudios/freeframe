@@ -4963,6 +4963,8 @@ cmd_status() {
       if [[ -n $pinned ]]; then
         say "                (first delete the FREEFRAME_VERSION line from $file, which keeps this server on $pinned)"
       fi
+    elif [[ ! $ver =~ ^v?[0-9] ]]; then
+      say "  Updates:      could not read the version this server runs, so it cannot be compared with the $ch channel ($latest)"
     elif _ff_version_gt "$ver" "$latest"; then
       say "  Updates:      none; this server runs $ver, ahead of the $ch channel ($latest)"
       if [[ $ch != latest ]]; then

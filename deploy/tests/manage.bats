@@ -76,6 +76,15 @@ setup() {
   assert_no_out "this is the newest release"
 }
 
+@test "status: an unreadable version is not called ahead of the channel" {
+  rm "$FF_ROOT/docker-compose.images.yml"
+  ff status
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "could not read the version this server runs"
+  assert_no_out "ahead of the"
+  assert_no_out "this is the newest release"
+}
+
 @test "status: no network is not an error" {
   export STUB_NET_DOWN=1
   ff status
