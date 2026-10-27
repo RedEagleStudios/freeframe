@@ -1913,6 +1913,24 @@ SUDO_C_LATEST='sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Tech
   done
 }
 
+@test "install.sh: a good download prints nothing, so the banner comes first" {
+  bootstrap_setup
+  run_bootstrap
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$output" "ran: install --channel latest"
+}
+
+@test "install.sh: run as bash -c, -q or any other option in \$0 is kept" {
+  bootstrap_setup
+  local script
+  script=$(cat "${BATS_TEST_DIRNAME}/../../install.sh")
+  run env PATH="$BIN:$PATH" bash -c "$script" -q --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "ran: install --channel latest -q --yes"
+  run env PATH="$BIN:$PATH" bash -c "$script" -x --yes
+  assert_out "ran: install --channel latest -x --yes"
+}
+
 # ---------------------------------------------------------------- hints and state lines
 
 @test "install: a program is listed as stopped only when stopping it worked" {

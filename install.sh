@@ -148,9 +148,10 @@ sudo_rs_would_freeze() {
 main() {
   # Run as bash -c "$(curl ...)" WORD ARGS, WORD is $0. The documented WORD
   # is install; an option there (the word left out) would be lost, so it is
-  # taken back. A leading install word among the arguments is dropped too.
+  # taken back (a login shell's own name, such as -bash, is not an option). A leading install word among the arguments is dropped too.
   case $0 in
-    --?* | -y | -h) set -- "$0" "$@" ;;
+    -- | -bash | -sh | -dash | -zsh | -ksh) ;;
+    -?*) set -- "$0" "$@" ;;
   esac
   if [ "${1:-}" = install ]; then shift; fi
 
@@ -215,7 +216,8 @@ main() {
   url="$RAW/$ref/deploy/freeframe"
   tmp=$(mktemp) || exit 1
 
-  echo "Downloading the freeframe command ($ref)..."
+  # Quiet when it works: the first thing an interactive install shows is
+  # the FreeFrame banner. A failure says so below.
   if ! curl -fsSL --retry 3 --max-time 60 "$url" -o "$tmp"; then
     rm -f "$tmp"
     echo "Could not download the freeframe command from $url" >&2

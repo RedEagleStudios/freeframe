@@ -231,6 +231,7 @@ Everything the installer does is written to **`/opt/freeframe/install.log`**. Ev
 | "The DNS records for ... do not point at this server" | The A record is missing or has not spread yet. Add the records the installer printed, wait, and run the command again. |
 | Browser warns about the certificate | The certificate has not arrived yet. Check the DNS records and that ports 80 and 443 are open, then run `sudo freeframe restart`. `sudo freeframe status` shows the certificate. |
 | "Could not download the freeframe command" | The server cannot reach `raw.githubusercontent.com`, or the channel has no installer yet. |
+| The command printed nothing, or only a `curl:` error | If the command printed nothing, check that this server can reach raw.githubusercontent.com (curl printed the reason). With `bash -c "$(curl ...)"`, a failed download leaves nothing to run, so the installer cannot say so itself. |
 
 Still stuck? Open an issue at <https://github.com/Techiebutler/freeframe/issues> and attach the end of `/opt/freeframe/install.log`. The log is private to the administrator, and it does not hold the admin password the installer makes for you.
 
