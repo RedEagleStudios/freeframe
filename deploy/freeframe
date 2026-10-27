@@ -924,6 +924,7 @@ FF_GUIDE_URL=https://github.com/Techiebutler/freeframe/blob/main/docs/deployment
 
 ff_is_root() { [[ $(id -u) == 0 ]]; }
 machine_arch() { uname -m; }
+_ff_kernel() { uname -s 2>/dev/null; }
 ff_sleep() { sleep "$1"; }
 
 # run_apt ARGS...: apt-get without questions, waiting for the apt lock that
@@ -1556,6 +1557,15 @@ _install_check_system() {
   id=$(_ff_os_field ID)
   ver=$(_ff_os_field VERSION_ID)
   pretty=$(_ff_os_field PRETTY_NAME)
+  if [[ -z $id ]]; then
+    case $(_ff_kernel) in
+      Darwin) pretty="macOS" ;;
+      Linux | "") pretty="a Linux system the installer cannot identify (it has no /etc/os-release)" ;;
+      *) pretty=$(_ff_kernel) ;;
+    esac
+    _ff_stop 3 "This computer runs $pretty, and the installer is for Linux servers only, so nothing was changed." \
+      "use a server with Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13, on amd64 or arm64. Elsewhere (a Mac with Docker Desktop, or another Linux), set FreeFrame up by hand as the guide explains: $FF_GUIDE_URL#quick-setup"
+  fi
   if ! os_supported "$id" "$ver"; then
     _ff_stop 3 "This server runs ${pretty:-an unknown system} (${id:-unknown} ${ver:-}), which is not supported yet, so nothing was changed." \
       "use a server with Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13. To set FreeFrame up by hand on another system, follow the guide: $FF_GUIDE_URL"
@@ -5647,7 +5657,12 @@ main() {
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   if ((BASH_VERSINFO[0] < 4)); then
     echo "freeframe needs bash 4 or newer (this is bash $BASH_VERSION)." >&2
-    echo "What to try: run it on the Ubuntu or Debian server, not on this computer." >&2
+    if [[ $(uname -s 2>/dev/null) == Darwin ]]; then
+      echo "It runs on the Linux server (Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13), not on a Mac." >&2
+      echo "What to try: run it on the server. To run FreeFrame on this Mac, use Docker Desktop and the manual setup: https://github.com/Techiebutler/freeframe/blob/main/docs/deployment.md#quick-setup" >&2
+    else
+      echo "What to try: run it on the Ubuntu or Debian server, not on this computer." >&2
+    fi
     exit 1
   fi
   set -Eeuo pipefail

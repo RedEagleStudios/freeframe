@@ -531,6 +531,21 @@ assert_root_untouched() {
   ff_install --yes
   [ "$status" -eq 3 ]
   assert_root_untouched
+  assert_out "a Linux system the installer cannot identify (it has no /etc/os-release)"
+  if [[ $output == *"( )"* ]]; then echo "$output"; false; fi
+}
+
+@test "install: on a Mac it says the installer is for Linux servers and points at the manual setup" {
+  plain_answers
+  rm -f "$FF_OS_RELEASE"
+  export STUB_KERNEL=Darwin
+  ff_install --yes
+  [ "$status" -eq 3 ]
+  assert_out "This computer runs macOS, and the installer is for Linux servers only, so nothing was changed."
+  assert_out "Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13, on amd64 or arm64"
+  assert_out "Docker Desktop"
+  assert_out "deployment.md#quick-setup"
+  assert_root_untouched
 }
 
 @test "install: an unsupported processor exits 3 before any change" {
@@ -1692,6 +1707,25 @@ SUDO_C_LATEST='sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Tech
   FREEFRAME_CHANNEL=stable run_bootstrap
   [ "$status" -eq 1 ]
   assert_out "sudo FREEFRAME_CHANNEL=latest bash"
+}
+
+@test "install.sh: on a Mac or Windows it stops before downloading and names the supported systems" {
+  bootstrap_setup
+  printf '%s\n' '#!/bin/sh' 'echo "${STUB_KERNEL:-Linux}"' >"$BIN/uname"
+  chmod +x "$BIN/uname"
+  STUB_KERNEL=Darwin run_bootstrap
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  assert_out "The FreeFrame installer is for Linux servers: Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13, on amd64 or arm64."
+  assert_out "This computer runs macOS, so nothing was changed."
+  assert_out "Docker Desktop"
+  [ ! -s "$CALLS" ]
+  STUB_KERNEL=MINGW64_NT-10.0-26100 run_bootstrap
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  assert_out "This computer runs Windows"
+  assert_out "WSL2"
+  [ ! -s "$CALLS" ]
+  STUB_KERNEL=Linux run_bootstrap --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
 }
 
 @test "install.sh: a bad channel name exits 2" {

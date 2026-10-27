@@ -10,6 +10,7 @@ _stub_log() { printf '%s\n' "$*" >>"$CALLS"; }
 
 ff_is_root() { [[ -z ${STUB_NOT_ROOT:-} ]]; }
 machine_arch() { printf '%s\n' "${STUB_ARCH:-x86_64}"; }
+_ff_kernel() { printf '%s\n' "${STUB_KERNEL:-Linux}"; }
 
 detect_foreign_install() {
   _stub_log detect_foreign_install

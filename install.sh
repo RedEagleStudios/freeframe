@@ -144,6 +144,21 @@ main() {
       ;;
   esac
 
+  # Linux servers only. On a Mac this would otherwise only stop later, at
+  # bash 3.2, without saying why.
+  kernel=$(uname -s 2>/dev/null) || kernel=""
+  if [ "$kernel" != Linux ]; then
+    case $kernel in
+      Darwin) what=macOS try="on a Mac, run FreeFrame with Docker Desktop and the manual setup in the guide: $GUIDE#quick-setup" ;;
+      MINGW* | MSYS* | CYGWIN*) what=Windows try="on Windows, Ubuntu in WSL2 with systemd switched on works for trying FreeFrame (not for a team to rely on: its address changes when Windows restarts, and it stops when the PC sleeps). Otherwise use a Linux server, or the manual setup in the guide: $GUIDE#quick-setup" ;;
+      *) what=${kernel:-an unknown system} try="use a Linux server, or the manual setup in the guide: $GUIDE#quick-setup" ;;
+    esac
+    echo "The FreeFrame installer is for Linux servers: Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13, on amd64 or arm64." >&2
+    echo "This computer runs $what, so nothing was changed." >&2
+    echo "What to try: $try" >&2
+    exit 1
+  fi
+
   if sudo_rs_would_freeze "$@"; then
     echo "This server's sudo (sudo-rs, which Ubuntu 26.04 uses) cannot pass the keyboard to a script that arrives through a pipe, so the installer's questions would freeze. Nothing was changed." >&2
     echo "What to try: run the installer this way instead, which works with every sudo:" >&2
