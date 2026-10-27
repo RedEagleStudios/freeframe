@@ -3545,7 +3545,12 @@ _update_undo_set() {
   f=$(_update_undo_file)
   (umask 077 && printf 'version=%s\nbackup=%s\ntime=%s\nphase=%s\n' "$1" "$2" \
     "${4:-$(date '+%Y-%m-%d %H:%M:%S %z')}" "$3" >"$f.tmp") &&
-    chmod 600 "$f.tmp" && mv -f "$f.tmp" "$f"
+    chmod 600 "$f.tmp" && mv -f "$f.tmp" "$f" || return 1
+  # On the disk, with its folder entry, before the update goes on: after a
+  # power loss the record must not come back with the phase from before
+  # (saved once the new version was started). A plain sync where sync
+  # takes no file names.
+  sync "$f" "$(ff_root)" 2>/dev/null || sync 2>/dev/null || true
 }
 
 # _update_undo_phase PHASE: the same record, now in PHASE.

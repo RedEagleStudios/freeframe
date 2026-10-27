@@ -680,3 +680,10 @@ killed_update_state() {
   assert_out "FreeFrame 1.22.0 runs and answers"
   assert_out "What to try: the update itself is done."
 }
+
+@test "update: the record is flushed to disk as saved, then as started, before the new version starts" {
+  ff update
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_order "sync $FF_ROOT/.update-undo $FF_ROOT [phase=saved]" "dc pull" \
+    "sync $FF_ROOT/.update-undo $FF_ROOT [phase=started]" "dc up -d --no-build"
+}

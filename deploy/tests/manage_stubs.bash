@@ -221,3 +221,11 @@ if [[ -n ${STUB_MV_FAIL:-}${STUB_MV_OLD_FAIL:-}${STUB_MV_HANG:-} ]]; then
     command mv "$@"
   }
 fi
+
+# sync: logged with the update record's phase at that moment, so a test can
+# tell the record was on disk before the new version started. The real sync
+# also runs (harmless in a test).
+sync() {
+  _stub_log "sync $* [$(grep -h '^phase=' "$FF_ROOT/.update-undo" 2>/dev/null || printf 'no record')]"
+  command sync "$@" 2>/dev/null || true
+}
