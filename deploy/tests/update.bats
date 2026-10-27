@@ -670,6 +670,19 @@ killed_update_state() {
   assert_not_called "dc "
 }
 
+@test "update: a failed backup after an earlier update's files were put back does not say it changed nothing" {
+  killed_update_state
+  STUB_PG_DOWN=1 FF_BACKUP_DB_WAIT=10 ff update
+  [ "$status" -eq 1 ]
+  [ ! -e "$FF_ROOT/.update-undo" ]
+  assert_out "putting its setup files from before back first"
+  assert_out "because the database could not be backed up first"
+  # The headline and the state line say the same thing.
+  assert_no_out "stopped before changing anything,"
+  assert_out "after putting back the setup files from before an earlier update that stopped part-way, and before changing anything else"
+  assert_out "the setup files from before an earlier update that stopped part-way were put back first."
+}
+
 @test "update: a signal after the new version answered does not advise a rollback that has nothing to do" {
   export STUB_TIMER_HANG=1
   ff_signal TERM timer update

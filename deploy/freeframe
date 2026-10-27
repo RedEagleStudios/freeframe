@@ -3684,6 +3684,17 @@ _update_unchanged() {
   fi
 }
 
+# _update_before_change: "before changing anything", or, once this update
+# has put an earlier one's setup files back (FF_UPDATE_PUT_BACK), what it
+# had done first.
+_update_before_change() {
+  if [[ -n ${FF_UPDATE_PUT_BACK:-} ]]; then
+    printf 'after putting back the setup files from before an earlier update that stopped part-way, and before changing anything else'
+  else
+    printf 'before changing anything'
+  fi
+}
+
 # cmd_update: `freeframe update`. Updates the freeframe command itself first
 # (and runs the new one), then: a database backup, the channel's setup files
 # and backup units, the fill-missing settings merge, the new images, a
@@ -3791,7 +3802,7 @@ cmd_update() {
   FF_STEP="backing up the database"
   say "Saving a backup of the database first..."
   if ! backup_create prune; then
-    install_fail "The update stopped before changing anything, because the database could not be backed up first." \
+    install_fail "The update stopped $(_update_before_change), because the database could not be backed up first." \
       "fix what the message above says, then run sudo freeframe update again."
   fi
   FF_UPDATE_BACKUP=$FF_BACKUP_MADE
@@ -3810,10 +3821,10 @@ cmd_update() {
   FF_STEP="saving the setup files in use"
   if ! _update_save_setup "$save_ref"; then
     if [[ -n $save_ref ]]; then
-      install_fail "FreeFrame runs version $old, but the setup files in $root are for $new, and the setup files of release $save_ref could not be downloaded to keep as the way back, so nothing was changed." \
+      install_fail "FreeFrame runs version $old, but the setup files in $root are for $new, and the setup files of release $save_ref could not be downloaded to keep as the way back, so $(_update_unchanged)." \
         "check that this server can reach raw.githubusercontent.com, then run sudo freeframe update again."
     fi
-    install_fail "The setup files in use could not be saved for a rollback, so the update stopped before changing anything." \
+    install_fail "The setup files in use could not be saved for a rollback, so the update stopped $(_update_before_change)." \
       "check that the disk is not full, then run sudo freeframe update again."
   fi
   # From the record on, until the new version starts, any stop (a failure, a
@@ -3822,7 +3833,7 @@ cmd_update() {
   FF_UPDATE_OLD=$old
   FF_UPDATE_PHASE=saved
   if ! _update_undo_set "$old" "$FF_UPDATE_BACKUP" saved; then
-    _update_fail_undone "The setup files in use could not be saved for a rollback, so the update stopped before changing anything." \
+    _update_fail_undone "The setup files in use could not be saved for a rollback, so the update stopped $(_update_before_change)." \
       "check that the disk is not full, then run sudo freeframe update again."
   fi
   FF_STATE="FreeFrame is running $old as before; its setup files are saved for a rollback."
