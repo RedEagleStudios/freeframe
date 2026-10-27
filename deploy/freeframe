@@ -3150,25 +3150,51 @@ ff_version() {
   printf '%s' "${v:-unknown}"
 }
 
-# _ff_version_gt A B: 0 when version A is newer than B (1.22.0 > 1.9.3; a
-# leading v is ignored).
+# _ff_version_gt A B: 0 when version A is newer than B. A leading v is
+# ignored; the dotted numbers compare as numbers (1.10.0 > 1.9.3); a
+# pre-release ranks below its release (1.22.0-rc1 < 1.22.0), and two
+# pre-releases compare part by part (rc.10 > rc.9), as in semantic versioning.
 _ff_version_gt() {
-  local a=${1#v} b=${2#v} i x y
+  local a=${1#v} b=${2#v} ca cb pa="" pb="" r=0
+  ca=${a%%-*} cb=${b%%-*}
+  [[ $a != *-* ]] || pa=${a#*-}
+  [[ $b != *-* ]] || pb=${b#*-}
+  _ff_parts_cmp "$ca" "$cb" 0 || r=$?
+  case $r in
+    0) return 0 ;;
+    1) return 1 ;;
+  esac
+  # Same release: no pre-release is newer than any pre-release.
+  if [[ -z $pa && -z $pb ]]; then return 1; fi
+  if [[ -z $pa ]]; then return 0; fi
+  if [[ -z $pb ]]; then return 1; fi
+  r=0
+  _ff_parts_cmp "$pa" "$pb" 1 || r=$?
+  ((r == 0))
+}
+
+# _ff_parts_cmp A B PRE: compare dot-separated parts: 0 when A is newer, 1
+# when older, 2 when equal. Numbers compare as numbers, anything else as
+# text. Missing parts count as 0, or (PRE=1, pre-release labels) as older.
+_ff_parts_cmp() {
+  local i x y
   local -a pa=() pb=()
-  IFS=.- read -ra pa <<<"$a"
-  IFS=.- read -ra pb <<<"$b"
+  IFS=. read -ra pa <<<"$1"
+  IFS=. read -ra pb <<<"$2"
   for ((i = 0; i < ${#pa[@]} || i < ${#pb[@]}; i++)); do
+    if ((i >= ${#pa[@]})) && [[ $3 == 1 ]]; then return 1; fi
+    if ((i >= ${#pb[@]})) && [[ $3 == 1 ]]; then return 0; fi
     x=${pa[i]:-0} y=${pb[i]:-0}
     if [[ $x =~ ^[0-9]+$ && $y =~ ^[0-9]+$ ]]; then
       ((10#$x == 10#$y)) && continue
-      ((10#$x > 10#$y))
-      return
+      if ((10#$x > 10#$y)); then return 0; fi
+      return 1
     fi
     [[ $x == "$y" ]] && continue
-    [[ $x > $y ]]
-    return
+    if [[ $x > $y ]]; then return 0; fi
+    return 1
   done
-  return 1
+  return 2
 }
 
 # remote_version CHANNEL: the version `freeframe update` would move to: the

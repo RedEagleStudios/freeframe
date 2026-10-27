@@ -177,3 +177,27 @@ setup() {
     assert_out "not installed"
   done
 }
+
+# ---------------------------------------------------------------- version order
+
+@test "_ff_version_gt: numbers compare as numbers, and a pre-release ranks below its release" {
+  _ff_version_gt 1.22.0 1.21.9
+  _ff_version_gt 1.10.0 1.9.0
+  _ff_version_gt v1.22.0 1.21.0
+  _ff_version_gt 1.22.0 1.22.0-rc1
+  _ff_version_gt 1.22.0-rc2 1.22.0-rc1
+  _ff_version_gt 1.22.0-rc.10 1.22.0-rc.9
+  _ff_version_gt 1.22.0-rc1 1.21.0
+  _ff_version_gt 1.22.1 1.22.0
+  if _ff_version_gt 1.22.0-rc1 1.22.0; then echo "rc ranked above its release"; false; fi
+  if _ff_version_gt 1.22.0 1.22.0; then echo "equal ranked newer"; false; fi
+  if _ff_version_gt 1.22.0 v1.22.0; then echo "v prefix counted"; false; fi
+  if _ff_version_gt 1.9.0 1.10.0; then echo "compared as text"; false; fi
+}
+
+@test "_ff_version_gt works under strict mode, where a non-zero step would end the script" {
+  run bash -c 'set -Eeuo pipefail; source "$1"; if _ff_version_gt 1.21.0 1.22.0; then echo newer; else echo older; fi; _ff_version_gt 1.22.0 1.22.0-rc1 && echo after' ff "$FF_SCRIPT"
+  [ "$status" -eq 0 ]
+  assert_out "older"
+  assert_out "after"
+}
