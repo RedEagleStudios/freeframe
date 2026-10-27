@@ -92,6 +92,15 @@ secret_options() {
   done | awk '!seen[$0]++'
 }
 
+# and_list WORD...: "a", "a and b", "a, b and c".
+and_list() {
+  while [ $# -gt 2 ]; do
+    printf '%s, ' "$1"
+    shift
+  done
+  if [ $# -eq 2 ]; then printf '%s and %s' "$1" "$2"; else printf '%s' "$1"; fi
+}
+
 # secret_variable OPTION: the FREEFRAME_ variable for a password option.
 secret_variable() {
   printf 'FREEFRAME_%s' "$(printf '%s' "${1#--}" | tr 'a-z-' 'A-Z_')"
@@ -196,9 +205,17 @@ main() {
     echo "This server's sudo (sudo-rs, which Ubuntu 26.04 uses) cannot pass the keyboard to a script that arrives through a pipe, so the installer's questions would freeze. Nothing was changed." >&2
     echo "What to try: run the installer this way instead, which works with every sudo:" >&2
     echo "  $(install_cmd "$ref" "$@")" >&2
-    for secret in $(secret_options "$@"); do
-      echo "Passwords and keys are left out of that command: type $secret again yourself, or give it as $(secret_variable "$secret") after sudo (other users of this server can see options with ps, but not variables), or leave it out and type it when the installer asks." >&2
-    done
+    secrets=$(secret_options "$@" | tr '\n' ' ')
+    if [ -n "$secrets" ]; then
+      vars=""
+      for o in $secrets; do vars="$vars $(secret_variable "$o")"; done
+      # shellcheck disable=SC2086 # option and variable names hold no spaces
+      if [ "$(echo $secrets | wc -w)" -eq 1 ]; then
+        echo "Passwords and keys are left out of that command: type $(and_list $secrets) again yourself, or give it as $(and_list $vars) after sudo (other users of this server can see options with ps, but not variables), or leave it out and type it when the installer asks." >&2
+      else
+        echo "Passwords and keys are left out of that command: type $(and_list $secrets) again yourself, or give them as $(and_list $vars) after sudo (other users of this server can see options with ps, but not variables), or leave them out and type them when the installer asks." >&2
+      fi
+    fi
     echo "To install without questions, keep the pipe and give every answer ahead of time with --yes; the guide shows how: $GUIDE" >&2
     exit 1
   fi

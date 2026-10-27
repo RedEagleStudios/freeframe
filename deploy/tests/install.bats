@@ -1913,6 +1913,16 @@ SUDO_C_LATEST='sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Tech
   done
 }
 
+@test "install.sh: under sudo-rs several secrets left out are named on one line" {
+  bootstrap_setup
+  under_sudo_rs
+  run_bootstrap --admin-password=one-secret --smtp-password two-secret --s3-secret-key=three-secret
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  [ "$(grep -c "left out of that command" <<<"$output")" -eq 1 ] || { echo "$output"; false; }
+  assert_out "Passwords and keys are left out of that command: type --admin-password, --smtp-password and --s3-secret-key again yourself, or give them as FREEFRAME_ADMIN_PASSWORD, FREEFRAME_SMTP_PASSWORD and FREEFRAME_S3_SECRET_KEY after sudo"
+  if [[ $output == *one-secret* || $output == *two-secret* || $output == *three-secret* ]]; then echo "$output"; false; fi
+}
+
 @test "install.sh: under sudo-rs a sudo started further up (sudo sh -c 'curl | bash') is not stopped" {
   # Measured on Ubuntu 26.04: only a direct curl ... | sudo bash freezes.
   bootstrap_setup
