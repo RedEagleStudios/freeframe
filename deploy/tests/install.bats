@@ -1889,6 +1889,30 @@ SUDO_C_LATEST='sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Tech
   assert_out "ran: install --channel latest --yes"
 }
 
+# ---------------------------------------------------------------- fix round 1
+
+@test "install.sh: under sudo-rs the suggested command never repeats a password or secret key" {
+  bootstrap_setup
+  under_sudo_rs
+  local opt form
+  for opt in --admin-password --s3-secret-key --smtp-password; do
+    for form in split joined; do
+      if [[ $form == split ]]; then
+        run_bootstrap --domain review.example.com "$opt" 'hunter22-secret'
+      else
+        run_bootstrap --domain review.example.com "$opt=hunter22-secret"
+      fi
+      [ "$status" -eq 1 ] || { echo "$output"; false; }
+      if [[ $output == *hunter22* ]]; then echo "$opt ($form) was echoed:"; echo "$output"; false; fi
+      if grep -F -- "  sudo " <<<"$output" | grep -qF -- "$opt"; then echo "$opt ($form) left in the command:"; echo "$output"; false; fi
+      # The rest of the answers are kept, and the left-out option is named.
+      assert_out 'install.sh)" install --domain review.example.com'
+      assert_out "Passwords and keys are left out of that command: type $opt again yourself, or give it as FREEFRAME_"
+      [ ! -s "$CALLS" ]
+    done
+  done
+}
+
 # ---------------------------------------------------------------- hints and state lines
 
 @test "install: a program is listed as stopped only when stopping it worked" {

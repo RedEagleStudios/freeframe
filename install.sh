@@ -59,13 +59,42 @@ install_cmd() {
   else
     printf 'sudo FREEFRAME_CHANNEL=%s bash -c "$(curl -fsSL %s/%s/install.sh)"' "$cmd_ref" "$RAW" "$cmd_ref"
   fi
-  if [ $# -gt 0 ]; then
-    printf ' install'
-    for cmd_arg in "$@"; do
-      printf ' %s' "$(quote "$cmd_arg")"
-    done
-  fi
+  # Passwords and keys are never printed back (secret_options names them).
+  cmd_skip=""
+  cmd_first=1
+  for cmd_arg in "$@"; do
+    if [ -n "$cmd_skip" ]; then
+      cmd_skip=""
+      continue
+    fi
+    case $cmd_arg in
+      --admin-password | --s3-secret-key | --smtp-password) cmd_skip=1 && continue ;;
+      --admin-password=* | --s3-secret-key=* | --smtp-password=*) continue ;;
+    esac
+    if [ -n "$cmd_first" ]; then
+      printf ' install'
+      cmd_first=""
+    fi
+    printf ' %s' "$(quote "$cmd_arg")"
+  done
   printf '\n'
+}
+
+# secret_options ARGS...: the password and key options among ARGS, one per
+# line, each once. install_cmd leaves them out of the command it shows.
+secret_options() {
+  for opt_arg in "$@"; do
+    case $opt_arg in
+      --admin-password | --admin-password=*) echo --admin-password ;;
+      --s3-secret-key | --s3-secret-key=*) echo --s3-secret-key ;;
+      --smtp-password | --smtp-password=*) echo --smtp-password ;;
+    esac
+  done | awk '!seen[$0]++'
+}
+
+# secret_variable OPTION: the FREEFRAME_ variable for a password option.
+secret_variable() {
+  printf 'FREEFRAME_%s' "$(printf '%s' "${1#--}" | tr 'a-z-' 'A-Z_')"
 }
 
 # not_yet LEAD IF: a "What to try" (LEAD, then IF, as "If it can,") for a
@@ -163,6 +192,9 @@ main() {
     echo "This server's sudo (sudo-rs, which Ubuntu 26.04 uses) cannot pass the keyboard to a script that arrives through a pipe, so the installer's questions would freeze. Nothing was changed." >&2
     echo "What to try: run the installer this way instead, which works with every sudo:" >&2
     echo "  $(install_cmd "$ref" "$@")" >&2
+    for secret in $(secret_options "$@"); do
+      echo "Passwords and keys are left out of that command: type $secret again yourself, or give it as $(secret_variable "$secret") after sudo (other users of this server can see options with ps, but not variables), or leave it out and type it when the installer asks." >&2
+    done
     echo "To install without questions, keep the pipe and give every answer ahead of time with --yes; the guide shows how: $GUIDE" >&2
     exit 1
   fi
