@@ -36,7 +36,7 @@ The command works from the first release after v1.21.0, the first that has the i
 If you need to set a variable (see [Unattended installs](#unattended-installs-cloud-init-ansible) below), put it after `sudo`, because `sudo` drops variables set before it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/latest/install.sh | sudo FREEFRAME_CHANNEL=latest bash
+curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/latest/install.sh | sudo FREEFRAME_DOMAIN=review.yourstudio.com bash
 ```
 
 What the installer does, in order:
@@ -232,7 +232,7 @@ Still stuck? Open an issue at <https://github.com/Techiebutler/freeframe/issues>
 - **Recommended** — Medium teams (10-50 users), regular video uploads
 - **Heavy Workload** — Large teams (50+ users), frequent 4K video processing
 
-> **Note:** Video transcoding is the most resource-intensive operation. Storage needs depend on your media volume — the actual media files are stored in S3, not on the server.
+> **Note:** Video transcoding is the most resource-intensive operation. Storage needs depend on your media volume and where it is kept: with your own S3 bucket the media files are stored there, not on the server; with storage on the server (the installer's default, or `docker-compose.storage.yml`) they need disk on it.
 
 ---
 
@@ -253,7 +253,7 @@ Best for most teams. A single server running Docker Compose.
 | **Azure** | B4s (4 vCPU, 8 GB) | ~$70 |
 | **Hostinger VPS** | KVM 4 (4 vCPU, 16 GB) | ~$16 |
 
-**Setup:** SSH into your server, install Docker, clone the repo, and follow the [Quick Setup](#quick-setup) below.
+**Setup:** SSH into your server and run the [installer](#install-on-a-fresh-server). To set it up by hand instead, install Docker and follow the [Quick Setup](#quick-setup) below.
 
 ### Cloud with Managed Services
 
@@ -269,15 +269,17 @@ For teams that want managed databases and less maintenance. Use external Postgre
 
 ### Bare Metal / On-Premise
 
-FreeFrame is fully self-contained. Install Docker on any Linux server (Ubuntu 22.04+ recommended) and follow the Quick Setup. Ideal for organizations that require media to stay on their own hardware.
+FreeFrame is fully self-contained. On Ubuntu or Debian, run the [installer](#install-on-a-fresh-server), which installs Docker too; on any other Linux server, install Docker and follow the Quick Setup. Ideal for organizations that require media to stay on their own hardware.
 
 ---
 
 ## Prerequisites
 
+For the manual setup below (the [installer](#install-on-a-fresh-server) sets up Docker and storage itself):
+
 - A server meeting the [hardware requirements](#hardware-requirements) with **Docker** and **Docker Compose** installed
 - A **domain name** pointed to your server's IP (for SSL — optional for testing)
-- An **S3-compatible storage** bucket (AWS S3, Cloudflare R2, Backblaze B2, etc.)
+- An **S3-compatible storage** bucket (AWS S3, Cloudflare R2, Backblaze B2, etc.), or storage on the server with `docker-compose.storage.yml`
 - An **SMTP server** or AWS SES for sending emails
 
 ## Quick Setup
@@ -376,7 +378,7 @@ With the HTTPS file, every plain-HTTP request is redirected to HTTPS, so opening
 
 ### Without SSL (HTTP only)
 
-Use `docker-compose.prod.yml` alone, the command at the top of this guide. FreeFrame then runs on **HTTP port 80** only, whatever `DOMAIN` and `ACME_EMAIL` are set to. This is fine for:
+Leave out `-f docker-compose.https.yml`, as in the [Quick Setup](#quick-setup) commands. FreeFrame then runs on **HTTP port 80** only, whatever `DOMAIN` and `ACME_EMAIL` are set to. This is fine for:
 - Local testing of the production build
 - Running behind an external reverse proxy that handles SSL
 
@@ -823,7 +825,7 @@ Your media files are already in S3. For redundancy:
 | Database | PostgreSQL | **Critical** — all users, projects, comments, share links |
 | Media files | S3 bucket | **Important** — uploaded assets and transcoded files |
 | Environment config | `.env.prod` | **Important** — save a copy outside the server |
-| SSL certificates | `letsencrypt/` volume | Low — Traefik auto-renews them |
+| SSL certificates | `letsencrypt/` volume | Low: with HTTPS on (`docker-compose.https.yml`, or the installer's HTTPS), Traefik renews them on its own |
 
 ---
 
