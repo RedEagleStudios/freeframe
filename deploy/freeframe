@@ -4813,9 +4813,10 @@ cmd_status() {
     say "  Updates:      Could not check for a newer release (GitHub did not answer)."
   fi
   if _update_undo_read; then
-    # The record also stands while an update runs; the lock tells them apart.
+    # The record also stands while an update or a rollback of it runs; the
+    # lock tells them apart from one that stopped, not from each other.
     if _ff_lock_busy; then
-      say "                An update is running right now (it started ${FF_UNDO_TIME:-a moment ago}). Check again once it has finished."
+      say "                A freeframe update or rollback is running right now (the update began ${FF_UNDO_TIME:-a moment ago}). Check again once it has finished."
     else
       say "                An update did not finish. To go back to ${FF_UNDO_VERSION:-the version from before}, run: sudo freeframe rollback"
     fi

@@ -770,8 +770,8 @@ killed_update_state() {
   ff status
   exec 9>&-
   [ "$status" -eq 0 ] || { echo "$output"; false; }
-  assert_out "An update is running right now (it started 2026-10-20 03:00:00 +0000). Check again once it has finished."
-  assert_no_out "rollback"
+  assert_out "A freeframe update or rollback is running right now (the update began 2026-10-20 03:00:00 +0000). Check again once it has finished."
+  assert_no_out "run: sudo freeframe rollback"
   # Once nothing holds the lock, the record is an update that did not finish.
   ff status
   assert_out "An update did not finish. To go back to 1.21.0, run: sudo freeframe rollback"

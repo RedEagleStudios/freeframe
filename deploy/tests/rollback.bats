@@ -227,6 +227,22 @@ assert_not_started() {
   assert_out "An update did not finish. To go back to 1.21.0, run: sudo freeframe rollback"
 }
 
+@test "status: while a rollback holds the lock over the record, the line is true for a rollback too" {
+  command -v flock >/dev/null || skip "no flock"
+  failed_update
+  local t
+  t=$(sed -n 's/^time=//p' "$FF_ROOT/.update-undo")
+  # A rollback is running: it holds the lock, and the record stands.
+  exec 9>>"$FF_ROOT/.freeframe.lock"
+  flock -n 9
+  ff status
+  exec 9>&-
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "A freeframe update or rollback is running right now (the update began $t). Check again once it has finished."
+  assert_no_out "An update is running"
+  assert_no_out "run: sudo freeframe rollback"
+}
+
 @test "rollback: compose files that do not parse are no dead end: it stops by project label" {
   failed_update
   export STUB_CONFIG_FAIL_NEW=1
