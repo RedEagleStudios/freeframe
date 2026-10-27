@@ -134,7 +134,7 @@ Release notes are on the [Releases page](https://github.com/Techiebutler/freefra
 
 ### Install on a fresh server
 
-The easiest way, and the one we recommend if you have not run a server before. Rent a server, run one command, and answer five questions: your web address, an email for certificate notices, where to keep footage (on the server or in an S3 bucket), your mail server (SMTP), and your admin account. The installer sets up Docker, starts FreeFrame, gets a free HTTPS certificate, creates your admin account and turns on nightly backups.
+The easiest way, and the one we recommend if you have not run a server before. Rent a server, run one command, and answer four short questions: your web address (with an email for certificate notices when it uses HTTPS), where to keep footage (on the server or in an S3 bucket), your mail server (SMTP), and your admin account. The installer sets up Docker, starts FreeFrame, gets a free HTTPS certificate, creates your admin account and turns on nightly backups.
 
 What to rent:
 
@@ -145,10 +145,16 @@ What to rent:
 Log in to the server and run:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/latest/install.sh | sudo bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/latest/install.sh)"
 ```
 
-The command works from the first release after v1.21.0, the first that has the installer. `latest` is the newest published release; the command will move to `stable` once the first release with the installer has been promoted there. To set a variable, put it after `sudo`: `curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/latest/install.sh | sudo FREEFRAME_DOMAIN=review.yourstudio.com bash`.
+The installer is for **Linux servers only**:
+
+- **Supported:** Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13, on amd64 or arm64.
+- **Not macOS or Windows.** On a Mac, use the [manual compose setup](#or-set-it-up-by-hand) with Docker Desktop. On Windows, Ubuntu in WSL2 with systemd switched on works for trying FreeFrame, but it is not something a team should rely on: its address changes when Windows restarts, and it stops when the PC sleeps.
+- **Other Linux distributions:** use the [manual compose setup](#or-set-it-up-by-hand).
+
+The command works from the first release after v1.21.0, the first that has the installer. `latest` is the newest published release; the command will move to `stable` once the first release with the installer has been promoted there. To set a variable, put it after `sudo`: `sudo FREEFRAME_DOMAIN=review.yourstudio.com bash -c "$(curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/latest/install.sh)"`. Use this `bash -c` form rather than `curl ... | sudo bash`: on Ubuntu 26.04, whose `sudo` is sudo-rs, a piped script cannot read your answers (the installer notices and shows this command instead). A piped command is fine only for an [unattended install](docs/deployment.md#unattended-installs-cloud-init-ansible) with `--yes`.
 
 When it finishes, open the address it prints and sign in with your admin account, then invite your team from the admin area. Without email set up, sign-in codes and invitations are not sent and there is no password reset; invitation links can still be copied from the admin page.
 

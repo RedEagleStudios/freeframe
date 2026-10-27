@@ -47,15 +47,17 @@ release (soak it as `latest`, smoke-test, watch for breakage reports).
   (e.g. docs-only).
 
 **The installer's command uses `latest` for now.** The install command in the
-README and `docs/deployment.md` (`curl ... /latest/install.sh | sudo bash`) names
+README and `docs/deployment.md` (`sudo bash -c "$(curl -fsSL .../latest/install.sh)"`) names
 the `latest` ref, and so do the published-images download commands there. When
 the first release containing the installer (and `docker-compose.images.yml`) is
 promoted to `stable`, switch those commands to `stable` in a docs PR. The stable
 install command must name the channel too:
-`curl -fsSL .../stable/install.sh | sudo FREEFRAME_CHANNEL=stable bash`.
+`sudo FREEFRAME_CHANNEL=stable bash -c "$(curl -fsSL .../stable/install.sh)"`.
 `install.sh` cannot see the URL it was downloaded from, and both it and the
 `freeframe` command default to `latest` when no channel is given, so a bare
-`| sudo bash` from the stable URL installs a server that follows `latest`.
+`bash -c` of the stable URL installs a server that follows `latest`. Keep the
+`bash -c` form: a piped `curl ... | sudo bash` cannot ask its questions under
+sudo-rs (Ubuntu 26.04), and install.sh stops it.
 
 ## Rolling back a bad release
 

@@ -6,7 +6,7 @@ This guide covers deploying FreeFrame to a production server using Docker Compos
 
 ## Install on a fresh server
 
-This is the easiest way to run FreeFrame, and the one we recommend if you have not run a server before. You rent a small Linux server, paste one command, and answer five questions. The installer does the rest: it sets up Docker (the program FreeFrame runs inside), starts FreeFrame, gets a free HTTPS certificate, creates your admin account and turns on nightly backups. It takes a few minutes.
+This is the easiest way to run FreeFrame, and the one we recommend if you have not run a server before. You rent a small Linux server, paste one command, and answer four short questions. The installer does the rest: it sets up Docker (the program FreeFrame runs inside), starts FreeFrame, gets a free HTTPS certificate, creates your admin account and turns on nightly backups. It takes a few minutes.
 
 The manual ways further down this guide ([run the published images](#run-the-published-images) and [build from source](#build-from-source)) stay fully supported. Use them if you already run servers your own way, or if your server cannot use the installer.
 
@@ -26,8 +26,14 @@ Any provider works: Hetzner, DigitalOcean, AWS, Google Cloud, Azure, Hostinger, 
 Log in to the server and run:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/latest/install.sh | sudo bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/latest/install.sh)"
 ```
+
+The installer is for **Linux servers only**:
+
+- **Supported:** Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13, on amd64 or arm64.
+- **Not macOS or Windows.** On a Mac, use the manual compose setup ([run the published images](#run-the-published-images)) with Docker Desktop. On Windows, Ubuntu in WSL2 with systemd switched on works for trying FreeFrame, but it is not something a team should rely on: its address changes when Windows restarts, and it stops when the PC sleeps.
+- **Other Linux distributions:** use the manual compose setup ([run the published images](#run-the-published-images)).
 
 This downloads a small script and runs it as the administrator (`sudo`). The script runs `freeframe install`, which checks the server first and changes nothing if a check fails. You can read the script before running it: it is [`install.sh`](../install.sh) in this repository.
 
@@ -36,8 +42,16 @@ The command works from the first release after v1.21.0, the first that has the i
 If you need to set a variable (see [Unattended installs](#unattended-installs-cloud-init-ansible) below), put it after `sudo`, because `sudo` drops variables set before it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/latest/install.sh | sudo FREEFRAME_DOMAIN=review.yourstudio.com bash
+sudo FREEFRAME_DOMAIN=review.yourstudio.com bash -c "$(curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/latest/install.sh)"
 ```
+
+To give answers as options instead, write `install` after the closing quote, then the options. With `bash -c`, the first word after the script is only its name, so `install` must be there:
+
+```bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/latest/install.sh)" install --domain review.yourstudio.com
+```
+
+**Why `bash -c` and not `curl ... | sudo bash`?** Ubuntu 26.04's `sudo` is sudo-rs, which cannot pass your keyboard to a script that arrives through a pipe: the first question would freeze. The installer notices this before it downloads anything, and shows the `bash -c` command to use instead. The `bash -c` form works with every `sudo`. A piped command is still fine for [unattended installs](#unattended-installs-cloud-init-ansible), which ask nothing.
 
 What the installer does, in order:
 
@@ -52,24 +66,26 @@ Everything it does is also written to `/opt/freeframe/install.log`. FreeFrame li
 
 ### 3. The questions
 
+The questions come as numbered steps (`Step 1 of 4`, and so on). Where there are choices, the installer shows a numbered menu with only the choices that fit your server, and the suggested one in brackets: press Enter to take it.
+
 **1. Web address.** The address your team types in the browser. You have three choices:
 
-- **Your own domain**, for example `review.yourstudio.com`. This is the right choice for real use. You will need to point the domain at the server first; see [The DNS step](#the-dns-step) below.
-- **The free automatic address**: press Enter, and FreeFrame uses an address of the form `<your-server-ip>.sslip.io` (for example `203.0.113.10.sslip.io`) with a real HTTPS certificate. sslip.io is a free public service that turns any IP address into a name. It is temporary: it is fine for trying FreeFrame, but it belongs to the IP address, so use your own domain for production. You can switch later with `sudo freeframe configure`.
-- **This network only.** For a server inside an office that people reach only from the office network. FreeFrame then uses plain HTTP on the server's own address, with no certificate. See [A server in your office](#a-server-in-your-office-behind-a-router-nat) below.
+- **Your own domain**, for example `review.yourstudio.com`. This is the right choice for real use. Choose it, then type the domain (you can also type the domain straight at the menu). You will need to point the domain at the server first; see [The DNS step](#the-dns-step) below.
+- **The free automatic address**, offered when the server has a public IP address: press Enter, and FreeFrame uses an address of the form `<your-server-ip>.sslip.io` (for example `203.0.113.10.sslip.io`) with a real HTTPS certificate. sslip.io is a free public service that turns any IP address into a name. It is temporary: it is fine for trying FreeFrame, but it belongs to the IP address, so use your own domain for production. You can switch later with `sudo freeframe configure`.
+- **This network only.** For a server inside an office that people reach only from the office network. FreeFrame then uses plain HTTP on the server's own address, with no certificate. See [A server in your office](#a-server-in-your-office-behind-a-router-nat) below. On a server without a public IP address this is the suggested choice. On a public server the menu calls it "Plain HTTP on this server's address".
 
-**2. Email for certificate notices.** Only asked when you use HTTPS. Let's Encrypt, the free service that issues the HTTPS certificate, writes to this address if something needs attention, such as a certificate that cannot be renewed. Use an address that someone reads.
+**Email for certificate notices** (part of the web address step). Only asked when you use HTTPS. Let's Encrypt, the free service that issues the HTTPS certificate, writes to this address if something needs attention, such as a certificate that cannot be renewed. Use an address that someone reads.
 
-**3. Where footage is kept.**
+**2. Where footage is kept.**
 
 - **On this server** (the simplest). Uploaded files live on the server's disk. The installer tells you roughly how many hours of 1080p footage fit.
 - **In an S3 bucket you already have** (AWS S3, Cloudflare R2, Backblaze B2, DigitalOcean Spaces). "S3" is the standard way storage services share files. The installer asks for the bucket's address (endpoint; press Enter for AWS S3), bucket name, access key, secret key and region (for Cloudflare R2 type `auto`), all of which your storage provider shows you. For AWS S3 the installer prints, at the end, the CORS rules to paste into the bucket so that browsers may upload to it (AWS does not set them for you).
 
-**4. Email (SMTP).** FreeFrame sends sign-in codes and invitations by email. Type your mail provider's server address (for example `smtp.postmarkapp.com`), then its port (usually 587), user name, password and the address emails are sent from. Press Enter at the first question to skip it and add email later with `sudo freeframe configure`.
+**3. Email (SMTP).** FreeFrame sends sign-in codes and invitations by email. Choose to set up a mail server, then type your mail provider's server address (for example `smtp.postmarkapp.com`), its port (usually 587), user name, password and the address emails are sent from. Or press Enter to skip it and add email later with `sudo freeframe configure`.
 
 > **Without email, sign-in codes and invitation emails are not sent, and there is no password reset.** Invitation links can still be copied from the admin page and sent by hand. You sign in as the admin with the password you choose, so you are not locked out. Setting up email is worth doing before you invite a team.
 
-**5. Your admin account.** Your name, your email address, and a password of 8 to 72 characters. If you press Enter instead of choosing a password, the installer makes a strong one for you, **shows it once on the screen at the end, and saves it nowhere**. Write it down before you close the window.
+**4. Your admin account.** Your name, your email address, and a password of 8 to 72 characters. If you press Enter instead of choosing a password, the installer makes a strong one for you, **shows it once on the screen at the end, and saves it nowhere**. Write it down before you close the window.
 
 Then the installer shows what it is about to do and asks `Install now? [Y/n]`.
 
@@ -90,8 +106,8 @@ You manage DNS at the company where you bought the domain, or at whoever you poi
 Add an A record with the name of your address and the server's IP address as the value. The installer prints exactly what to add, for example:
 
 ```
-Add an A record with the name review and the value 203.0.113.10   (for review.yourstudio.com)
-Add an A record with the name storage.review and the value 203.0.113.10   (for storage.review.yourstudio.com)
+Add an A record with the name review and the value 203.0.113.10 (for review.yourstudio.com)
+Add an A record with the name storage.review and the value 203.0.113.10 (for storage.review.yourstudio.com)
 ```
 
 The second line appears when footage is kept on the server: uploads go to a second name, `storage.` followed by your address. If a name already has an AAAA record (the IPv6 version of an A record), remove it unless it points at this server. If you use Cloudflare, set the records to "DNS only" (grey cloud, not the orange proxied cloud): the installer checks that the name leads to the server itself, and the certificate is issued to the server.
@@ -100,12 +116,12 @@ New records usually work within a few minutes, and sometimes take up to an hour.
 
 ### A server in your office (behind a router, NAT)
 
-A server in an office or at home usually sits behind a router. It has a private address on the office network (like `192.168.1.50`) and shares one public address with everything else. This is called NAT. The installer notices it and, at the first question, offers **this network only** (type `local`).
+A server in an office or at home usually sits behind a router. It has a private address on the office network (like `192.168.1.50`) and shares one public address with everything else. This is called NAT. The installer notices it, and the web address menu says so under **This network only, plain HTTP**.
 
-- **To use FreeFrame inside the office only,** choose `local`. FreeFrame then answers on plain HTTP at the server's own address, for example `http://192.168.1.50`. Browsers mark it "Not secure"; that is normal on a private network. If footage is kept on the server, uploads also use port 9000 on the server.
+- **To use FreeFrame inside the office only,** choose **This network only** (or type `local`). FreeFrame then answers on plain HTTP at the server's own address, for example `http://192.168.1.50`. Browsers mark it "Not secure"; that is normal on a private network. If footage is kept on the server, uploads also use port 9000 on the server.
 - **To reach FreeFrame from outside the office,** the router must **forward ports 80 and 443 to the server** (a "port forward" or "virtual server" rule in the router's settings), and you should use a domain pointing at the office's public address. The automatic `sslip.io` address also needs the same forwarding. If ports 80 and 443 are not forwarded, the certificate cannot be issued, and the installer falls back to plain HTTP on the server's local address after a few minutes. It says so when it does.
 
-Cloud servers (AWS, Google Cloud, Azure) behave like normal public servers: open ports 80 and 443 in the provider's firewall or security group and everything works as described above. Because these servers have a private address inside the provider's network, the installer may show the same "router" hint; ignore it and press Enter or type your domain.
+Cloud servers (AWS, Google Cloud, Azure) behave like normal public servers: open ports 80 and 443 in the provider's firewall or security group and everything works as described above. Because these servers have a private address inside the provider's network, the installer may show the same "behind a router" hint; ignore it and press Enter or type your domain.
 
 ### When it finishes
 
@@ -162,7 +178,7 @@ After the install, the `freeframe` command is on the server. All commands need `
 
 ### Unattended installs (cloud-init, Ansible)
 
-For a script with nobody at the keyboard, give every answer ahead of time. Each question has an environment variable and a matching option (`--domain`, `--admin-email` and so on; an option wins over its variable). Add `FREEFRAME_YES=1` (or `--yes`) so the installer does not wait for a terminal.
+For a script with nobody at the keyboard, give every answer ahead of time. This is the one case for a piped command (`curl ... | bash`): a run that asks nothing works with every `sudo`, sudo-rs included. With someone at the keyboard, use the `bash -c` command from [Run the command](#2-run-the-command). Each question has an environment variable and a matching option (`--domain`, `--admin-email` and so on; an option wins over its variable). Add `FREEFRAME_YES=1` (or `--yes`) so the installer does not wait for a terminal.
 
 | Variable | Meaning |
 |---|---|
@@ -204,7 +220,8 @@ Everything the installer does is written to **`/opt/freeframe/install.log`**. Ev
 
 | What you see | What it means |
 |---|---|
-| "This server runs ... which is not supported yet" | The system is not Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13, or the processor is not amd64 or arm64. Nothing was changed. Use a supported server, or follow the manual steps below. |
+| "This server runs ... which is not supported yet", or "The FreeFrame installer is for Linux servers" | The system is not Ubuntu 22.04, 24.04 or 26.04, or Debian 12 or 13 (a Mac or Windows included), or the processor is not amd64 or arm64. Nothing was changed. Use a supported server, or follow the manual steps below. |
+| "This server's sudo (sudo-rs ...) cannot pass the keyboard to a script that arrives through a pipe" | You ran `curl ... \| sudo bash` on Ubuntu 26.04. Nothing was changed. Run the `sudo bash -c "$(curl ...)"` command the message shows. |
 | "This server has ... MB of memory. FreeFrame needs at least 2 GB" | The server is too small. Choose one with 4 GB or more. |
 | "This server already runs FreeFrame that was set up by hand" | See [If you already run FreeFrame](#if-you-already-run-freeframe) above. |
 | "Port 80 (or 443) is used by ..." | Another program, often Apache or nginx, uses the web ports. With a terminal, the installer offers to stop it; otherwise stop it yourself and run the command again. |
