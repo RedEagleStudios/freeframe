@@ -422,6 +422,28 @@ assert_put_back() {
   assert_put_back
 }
 
+@test "update: a signal in the middle of the replace waits for it to finish, so the set on disk is whole" {
+  # The saved copy cannot be put back here, so what is on disk is the
+  # replace's own work. The signal arrives while the third file is moved;
+  # the units come after it and hold the release number.
+  export STUB_MV_HANG=docker-compose.https.yml STUB_PUTBACK_FAIL=1
+  ff_signal HUP mv update
+  [ "$status" -eq 1 ]
+  local f
+  for f in $SETUP_NAMES; do
+    cmp "$STUB_REMOTE/$f" "$FF_ROOT/$f" || { echo "$f is not the new one"; return 1; }
+  done
+  cmp "$STUB_REMOTE/deploy/systemd/freeframe-backup.service" "$FF_ROOT/systemd/freeframe-backup.service"
+  cmp "$STUB_REMOTE/deploy/systemd/freeframe-backup.timer" "$FF_ROOT/systemd/freeframe-backup.timer"
+  [ -z "$(ls -A "$FF_ROOT" | grep '^\.download')" ]
+  # The signal still stops the update, and the state it gives is true.
+  assert_out "stopped (SIGHUP)"
+  [ -e "$FF_ROOT/.update-undo" ]
+  assert_out "run: sudo freeframe rollback"
+  assert_no_out "update again"
+  assert_not_called "dc pull"
+}
+
 @test "update: stopped (TERM) right after the record is written, nothing stays changed" {
   keep_files
   export STUB_UNDO_SET_HANG=1
