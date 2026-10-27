@@ -11,6 +11,9 @@ common_setup() {
   for v in $(compgen -v | grep -E '^(FREEFRAME|FF)_' || true); do
     unset "$v"
   done
+  # The screen width and colour come from the terminal, not from the shell
+  # the suite runs in.
+  unset COLUMNS NO_COLOR
   FF_SCRIPT="${BATS_TEST_DIRNAME}/../freeframe"
   export FF_ROOT="$BATS_TEST_TMPDIR/root"
   mkdir -p "$FF_ROOT"

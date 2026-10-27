@@ -869,9 +869,9 @@ assert_root_untouched() {
   export FF_TTY="$BATS_TEST_TMPDIR/tty" STUB_LOCAL_IP=10.0.0.5
   ff_install
   [ "$status" -eq 0 ] || { echo "$output"; false; }
-  assert_out "This server reaches the internet through a router (its own address is 10.0.0.5)."
-  assert_out "choose 'this network only'"
-  assert_out "type: local"
+  assert_out "This network only, plain HTTP"
+  assert_out "http://10.0.0.5"
+  assert_out "Behind a router, so only people on this network can reach it."
   assert_has "$ENV" "FRONTEND_URL=https://203-0-113-7.sslip.io"
 }
 
@@ -892,7 +892,7 @@ assert_root_untouched() {
     "long-password-1" "long-password-1" "y" >"$BATS_TEST_TMPDIR/tty"
   FF_TTY="$BATS_TEST_TMPDIR/tty" ff_install
   [ "$status" -eq 0 ] || { echo "$output"; false; }
-  if grep -q "through a router" <<<"$output"; then echo "$output"; false; fi
+  if grep -q "Behind a router" <<<"$output"; then echo "$output"; false; fi
 }
 
 @test "NAT ruling: behind NAT and unattended, the default is still the automatic address" {
@@ -948,6 +948,294 @@ assert_root_untouched() {
   ff_install --yes
   [ "$status" -eq 0 ] || { echo "$output"; false; }
   assert_has "$ENV" "FRONTEND_URL=http://203.0.113.7"
+}
+
+# ---------------------------------------------------------------- first-run screens
+
+# tty_answers LINE...: the lines typed at the terminal, in order.
+tty_answers() {
+  printf '%s\n' "$@" >"$BATS_TEST_TMPDIR/tty"
+  export FF_TTY="$BATS_TEST_TMPDIR/tty"
+}
+
+# The rest of a typical interactive run after the web address step:
+# storage 1, skip email, name, email, password twice, confirm.
+REST=(1 "" "Grace" "grace@example.com" "long-password-1" "long-password-1" "y")
+
+# step_headers: the "Step N of M" headers shown, one per line, as "N/M Title".
+step_headers() {
+  sed -nE 's/^.*Step ([0-9]+) of ([0-9]+) [^A-Za-z]+ ([A-Za-z][A-Za-z ]*[A-Za-z]).*$/\1\/\2 \3/p' <<<"$output"
+}
+
+@test "screens: an interactive install shows the banner and welcome first, then checks the server" {
+  tty_answers "" "certs@example.com" "${REST[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out " | _| '_/ -_) -_) _| '_/ _\` | '  \/ -_)"
+  assert_out "Self-hosted review for your team's video, images and audio"
+  assert_out "Welcome! This sets up FreeFrame on this server."
+  assert_out "Four short questions. Press Enter to take the suggestion in [brackets]"
+  assert_out "Nothing is installed until you confirm. Press Ctrl+C any time to stop."
+  [[ $output == *"Welcome!"*"Checking this server ... ok"*"Step 1 of 4"* ]] || { echo "$output"; false; }
+  # Printed once, and the banner stays out of install.log.
+  [ "$(grep -c "Self-hosted review" <<<"$output")" -eq 1 ]
+  if grep -q "Welcome!" "$FF_ROOT/install.log"; then cat "$FF_ROOT/install.log"; false; fi
+}
+
+@test "screens: an unattended install prints a one-line header instead of the banner" {
+  plain_answers
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "FreeFrame installer"
+  if [[ $output == *"Welcome!"* || $output == *"Self-hosted review"* || $output == *"Step 1"* ]]; then echo "$output"; false; fi
+}
+
+@test "screens: no banner when FreeFrame is already installed, or for help" {
+  plain_answers
+  : >"$ENV"
+  : >"$FF_ROOT/.installed"
+  tty_answers ""
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "already installed"
+  if [[ $output == *"Self-hosted review"* ]]; then echo "$output"; false; fi
+  run bash "$FF_SCRIPT" help
+  if [[ $output == *"Self-hosted review"* ]]; then echo "$output"; false; fi
+}
+
+@test "screens: the server check is one line with what was found" {
+  unset LC_ALL LC_CTYPE
+  export LANG=C.UTF-8 FF_CORES=20 FF_RAM_MB=15800 STUB_FREE_MB=976000
+  os_release ubuntu 26.04 resolute
+  tty_answers "" "certs@example.com" "${REST[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -qxF " Checking this server ... ok  (ubuntu 26.04 · 20 cores · 15 GB memory · 953 GB free)" <<<"$output" ||
+    { echo "$output"; false; }
+}
+
+@test "screens: warnings from the server check come after its line" {
+  export FF_RAM_MB=3000
+  tty_answers "" "certs@example.com" "${REST[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  [[ $output == *"Checking this server ... ok"*"about 3 GB of memory"*"Step 1 of 4"* ]] || { echo "$output"; false; }
+}
+
+@test "screens: a refusal during the server check ends the check line first" {
+  export STUB_NET_DOWN=ghcr.io
+  tty_answers "" "certs@example.com" "${REST[@]}"
+  ff_install
+  [ "$status" -eq 1 ]
+  grep -qxF " Checking this server ... stopped" <<<"$output" || { echo "$output"; false; }
+  assert_out "cannot reach ghcr.io"
+}
+
+@test "screens: HTTPS answers give four consecutive steps, with the certificate email inside step 1" {
+  unset LC_ALL LC_CTYPE
+  export LANG=C.UTF-8
+  tty_answers "" "certs@example.com" "${REST[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(step_headers)" "$(printf '%s\n' "1/4 Web address" "2/4 Storage" "3/4 Email" "4/4 Admin account")"
+  assert_out "Step 1 of 4 · Web address"
+  assert_out "Email for certificate notices"
+}
+
+@test "screens: plain HTTP answers also give four consecutive steps" {
+  unset LC_ALL LC_CTYPE
+  export LANG=C
+  tty_answers 3 "${REST[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(step_headers)" "$(printf '%s\n' "1/4 Web address" "2/4 Storage" "3/4 Email" "4/4 Admin account")"
+  if [[ $output == *"certificate notices"* ]]; then echo "$output"; false; fi
+  # Without a UTF-8 locale the separator is plain.
+  assert_out "Step 1 of 4 - Web address"
+}
+
+@test "screens: only the questions asked are counted" {
+  export FREEFRAME_ADMIN_NAME=Grace FREEFRAME_ADMIN_EMAIL=grace@example.com FREEFRAME_ADMIN_PASSWORD=long-password-1
+  tty_answers 3 1 "" "y"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(step_headers)" "$(printf '%s\n' "1/3 Web address" "2/3 Storage" "3/3 Email")"
+  assert_out "Three short questions"
+}
+
+@test "screens: a domain given ahead of time leaves the certificate email as its own step 1" {
+  export FREEFRAME_DOMAIN=review.example.com
+  tty_answers "certs@example.com" "${REST[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(step_headers)" "$(printf '%s\n' "1/4 Certificate email" "2/4 Storage" "3/4 Email" "4/4 Admin account")"
+  assert_has "$ENV" "ACME_EMAIL=certs@example.com"
+}
+
+@test "screens: the web address menu with a public IP offers three choices, the temporary address first" {
+  tty_answers "" "certs@example.com" "${REST[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "How will your team open FreeFrame in the browser?"
+  assert_out "   1) Free temporary address, with HTTPS   203-0-113-7.sslip.io"
+  assert_out "   2) Your own domain                      for example review.yourstudio.com"
+  assert_out "   3) Plain HTTP on this server's address  http://203.0.113.7"
+  assert_out " Choose 1, 2 or 3 [1]: "
+  assert_has "$ENV" "FRONTEND_URL=https://203-0-113-7.sslip.io"
+}
+
+@test "screens: menu 1 is the temporary address, 2 asks for the domain, 3 is plain HTTP" {
+  tty_answers 1 "certs@example.com" "${REST[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_has "$ENV" "FREEFRAME_HTTPS=sslip"
+
+  rm -rf "$FF_ROOT" && mkdir -p "$FF_ROOT"
+  tty_answers 2 "review.example.com" "certs@example.com" "${REST[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out " Domain: "
+  assert_has "$ENV" "FRONTEND_URL=https://review.example.com"
+
+  rm -rf "$FF_ROOT" && mkdir -p "$FF_ROOT"
+  tty_answers 3 "${REST[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_has "$ENV" "FRONTEND_URL=http://203.0.113.7"
+  assert_has "$ENV" "FREEFRAME_HTTPS=off"
+}
+
+@test "screens: at the menu a typed domain means option 2, and local means option 3" {
+  tty_answers "Review.Example.com" "certs@example.com" "${REST[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_has "$ENV" "FRONTEND_URL=https://review.example.com"
+  if [[ $output == *" Domain: "* ]]; then echo "$output"; false; fi
+
+  local word
+  for word in local "this network only"; do
+    rm -rf "$FF_ROOT" && mkdir -p "$FF_ROOT"
+    tty_answers "$word" "${REST[@]}"
+    export STUB_LOCAL_IP=10.0.0.5
+    ff_install
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    assert_has "$ENV" "FRONTEND_URL=http://10.0.0.5"
+  done
+}
+
+@test "screens: a menu answer that is not a choice is asked again" {
+  tty_answers 7 "http://x y" "" "certs@example.com" "${REST[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "Type 1, 2 or 3, or a domain such as review.yourstudio.com."
+  assert_has "$ENV" "FREEFRAME_HTTPS=sslip"
+}
+
+@test "screens: without a public IP the menu is this network or your own domain, this network first" {
+  export STUB_PUBLIC_IP="" STUB_LOCAL_IP=192.168.1.20
+  tty_answers "" "${REST[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "   1) This network only, plain HTTP        http://192.168.1.20"
+  assert_out "   2) Your own domain"
+  assert_out " Choose 1 or 2 [1]: "
+  if [[ $output == *"temporary"*"Choose"* ]]; then echo "$output"; false; fi
+  assert_has "$ENV" "FRONTEND_URL=http://192.168.1.20"
+
+  rm -rf "$FF_ROOT" && mkdir -p "$FF_ROOT"
+  tty_answers 2 "review.example.com" "certs@example.com" "${REST[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_has "$ENV" "FRONTEND_URL=https://review.example.com"
+}
+
+@test "screens: storage and email are numbered menus with defaults" {
+  tty_answers "" "certs@example.com" 2 "" footage AKIAX "se-cret" "" 2 "smtp.example.com" "" "mailer@example.com" \
+    "mail-pass" "" "Grace" "grace@example.com" "long-password-1" "long-password-1" "y"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "Where should uploaded footage be kept?"
+  assert_out "   1) On this server"
+  assert_out "   2) In an S3 bucket you already have"
+  assert_out "   1) Skip for now, and add it later"
+  assert_out "   2) Set up a mail server now"
+  assert_out " Mail server: "
+  assert_has "$ENV" "S3_BUCKET=footage"
+  assert_has "$ENV" "SMTP_HOST=smtp.example.com"
+  assert_has "$ENV" "SMTP_PORT=587"
+}
+
+@test "screens: the summary is a block of rows before Install now" {
+  tty_answers "" "certs@example.com" "${REST[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  [[ $output == *"Ready to install"*"   Web address   https://203-0-113-7.sslip.io (a free temporary address)"*"   Admin         Grace <grace@example.com>"*"Install now? [Y/n]"* ]] ||
+    { echo "$output"; false; }
+}
+
+@test "screens: at a narrow width descriptive text wraps between words" {
+  export COLUMNS=40 STUB_LOCAL_IP=10.0.0.5
+  tty_answers "" "certs@example.com" "${REST[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  local line long="" shown
+  # The fake terminal does not echo the answers, so each question would run
+  # into the next line: end every question there.
+  shown=$(sed -E 's/(Your name|Your email|Password|Type it again|Choose [0-9, or]+ \[[0-9]\]|Email for certificate notices( \[[^]]*\])?|Install now\? \[Y\/n\]): /\1:\n/g' <<<"$output")
+  while IFS= read -r line; do
+    # Whole by design: the machine-read ready line, paths and commands.
+    case $line in *"FreeFrame is ready: "* | *"/"* | *"sudo "* | *"====="*) continue ;; esac
+    if ((${#line} > 39)); then long+="$line"$'\n'; fi
+  done <<<"$shown"
+  [ -z "$long" ] || { echo "lines over 39 columns:"; echo "$long"; false; }
+  # A long sentence comes back whole when its lines are joined.
+  local flat
+  flat=$(tr '\n' ' ' <<<"$output" | tr -s ' ')
+  [[ $flat == *"Nothing is installed until you confirm. Press Ctrl+C any time to stop."* ]] || { echo "$output"; false; }
+  [[ $flat == *"Behind a router, so only people on this network can reach it."* ]] || { echo "$output"; false; }
+}
+
+@test "screens: without a terminal or COLUMNS, nothing is wrapped" {
+  tty_answers "" "certs@example.com" "${REST[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out " Nothing is installed until you confirm. Press Ctrl+C any time to stop."
+}
+
+@test "screens: with colour on, install.log gets no escape codes" {
+  export FF_FORCE_COLOR=1 TERM=xterm
+  tty_answers "" "certs@example.com" "${REST[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  [[ $output == *$'\e['* ]] || { echo "no colour on the screen"; false; }
+  if grep -q $'\e' "$FF_ROOT/install.log"; then echo "escape codes in install.log:"; grep -n $'\e' "$FF_ROOT/install.log" | cat -v; false; fi
+  grep -q "Checking this server ... ok" "$FF_ROOT/install.log"
+  grep -q "FreeFrame is ready: https://203-0-113-7.sslip.io" "$FF_ROOT/install.log"
+}
+
+@test "screens: NO_COLOR and TERM=dumb turn the colour off" {
+  export FF_FORCE_COLOR=1 NO_COLOR=1 TERM=xterm
+  tty_answers "" "certs@example.com" "${REST[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  if [[ $output == *$'\e'* ]]; then echo "$output" | cat -v; false; fi
+  rm -rf "$FF_ROOT" && mkdir -p "$FF_ROOT"
+  unset NO_COLOR
+  export TERM=dumb
+  tty_answers "" "certs@example.com" "${REST[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  if [[ $output == *$'\e'* ]]; then echo "$output" | cat -v; false; fi
+}
+
+@test "screens: the ready screen keeps the lines scripts read" {
+  plain_answers
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -qxF "FreeFrame is ready: http://203.0.113.7" <<<"$output" || { echo "$output"; false; }
+  ff_install --yes
+  grep -qxF "FreeFrame is already installed on this server, so nothing was changed." <<<"$output" || { echo "$output"; false; }
+  grep -qxF "To move to the newest release, run: sudo freeframe update" <<<"$output" || { echo "$output"; false; }
 }
 
 # ---------------------------------------------------------------- server fixes
