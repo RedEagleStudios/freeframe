@@ -3680,7 +3680,12 @@ cmd_update() {
     ref="v${pinned#v}"
     if ! _ff_valid_ref "$ref"; then
       _ff_stop 1 "FREEFRAME_VERSION in $file ('$pinned') is not a release number, so nothing was changed." \
-        "set it to a release such as 1.21.0, or delete that line to follow the $ch channel."
+        "set it to a release such as 1.22.0, or delete the FREEFRAME_VERSION line to follow the $ch channel."
+    fi
+    # Releases up to 1.21.0 have no setup files for this command.
+    if ! _ff_version_gt "$pinned" 1.21.0; then
+      _ff_stop 1 "This server is pinned to version $pinned (FREEFRAME_VERSION in $file), and freeframe update can only manage releases after 1.21.0, which have the setup files it needs. Nothing was changed." \
+        "delete the FREEFRAME_VERSION line from $file to follow the $ch channel, then run sudo freeframe update."
     fi
   fi
 

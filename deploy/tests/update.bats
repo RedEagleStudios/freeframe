@@ -290,17 +290,17 @@ newest_dump() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null | tail -1)
 }
 
 @test "update: a pinned server takes its setup files from the pinned release's tag and says it stays" {
-  printf 'FREEFRAME_VERSION=1.20.0\n' >>"$ENV"
+  printf 'FREEFRAME_VERSION=1.22.5\n' >>"$ENV"
   ff update
   [ "$status" -eq 0 ] || { echo "$output"; false; }
-  assert_out "pinned to version 1.20.0"
-  grep -qx "fetch v1.20.0 docker-compose.images.yml" "$CALLS"
-  grep -qx "fetch v1.20.0 deploy/systemd/freeframe-backup.timer" "$CALLS"
+  assert_out "pinned to version 1.22.5"
+  grep -qx "fetch v1.22.5 docker-compose.images.yml" "$CALLS"
+  grep -qx "fetch v1.22.5 deploy/systemd/freeframe-backup.timer" "$CALLS"
   assert_not_called "fetch latest docker-compose"
   # The command itself still comes from the channel.
   grep -qx "fetch latest deploy/freeframe" "$CALLS"
-  assert_has "$ENV" "FREEFRAME_VERSION=1.20.0"
-  assert_out "FreeFrame stays on the pinned version 1.20.0"
+  assert_has "$ENV" "FREEFRAME_VERSION=1.22.5"
+  assert_out "FreeFrame stays on the pinned version 1.22.5"
   assert_no_out "newest release"
 }
 
@@ -539,5 +539,24 @@ assert_put_back() {
   assert_out "run: sudo freeframe rollback"
   assert_no_out "Nothing has been changed"
   assert_no_out "update again"
+}
+
+@test "update: a server pinned to 1.21.0 or earlier is told it cannot be managed this way" {
+  printf 'FREEFRAME_VERSION=1.21.0\n' >>"$ENV"
+  ff update
+  [ "$status" -eq 1 ]
+  assert_out "after 1.21.0"
+  assert_out "delete the FREEFRAME_VERSION line"
+  assert_not_called "fetch v1.21.0"
+  assert_not_called "dc "
+}
+
+@test "update: a pinned release whose files cannot be downloaded suggests removing the pin" {
+  printf 'FREEFRAME_VERSION=1.22.0\n' >>"$ENV"
+  export STUB_FETCH_FAIL_REF=v1.22.0
+  ff update
+  [ "$status" -eq 1 ]
+  assert_out "release v1.22.0"
+  assert_out "delete the FREEFRAME_VERSION line"
 }
 
