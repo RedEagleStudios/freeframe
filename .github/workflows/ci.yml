@@ -377,6 +377,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install pinned ShellCheck and bats-core
         run: |
@@ -431,6 +433,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Check the runner and make the admin password
         run: bash deploy/tests/ci-e2e.sh prepare
