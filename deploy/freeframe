@@ -3667,9 +3667,14 @@ cmd_update() {
       _update_undo_clear
     else
       # Its new version was started (and did not come up): removing the
-      # record is right only when that new version works.
-      _ff_stop 1 "An earlier update did not finish (it started ${FF_UNDO_TIME:-earlier}, from version ${FF_UNDO_VERSION:-unknown}), so this update did not start. Nothing was changed." \
-        "to go back to ${FF_UNDO_VERSION:-the version from before}, run: sudo freeframe rollback. If FreeFrame works well on the new version as it is now, remove the record instead: sudo rm $(_ff_q "$(_update_undo_file)"), then run sudo freeframe update again."
+      # record is right only when that new version works, so it is offered
+      # only while the new version (the files on disk) is what runs.
+      try="to go back to ${FF_UNDO_VERSION:-the version from before}, run: sudo freeframe rollback."
+      running=$(_ff_running_version)
+      if [[ -n $running && $running != "${FF_UNDO_VERSION:-}" && $running == "$(ff_version)" ]]; then
+        try+=" If FreeFrame works well on $running as it is now, remove the record instead: sudo rm $(_ff_q "$(_update_undo_file)"), then run sudo freeframe update again."
+      fi
+      _ff_stop 1 "An earlier update did not finish (it started ${FF_UNDO_TIME:-earlier}, from version ${FF_UNDO_VERSION:-unknown}), so this update did not start. Nothing was changed." "$try"
     fi
   fi
   ch=$(ff_channel "$file")

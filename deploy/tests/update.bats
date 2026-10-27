@@ -490,11 +490,20 @@ assert_put_back() {
   [ ! -e "$FF_ROOT/.update-undo" ]
 }
 
-@test "update: a record of an update whose new version started is refused, and removing it is offered" {
+# started_record: what an update leaves once it started 1.22.0 and that did
+# not come up: the new release's files on disk, and the record.
+started_record() {
+  local f
+  for f in $SETUP_NAMES; do cp "$STUB_REMOTE/$f" "$FF_ROOT/$f"; done
   mkdir -p "$BK"
   printf 'PGDMP before\n' >"$BK/freeframe-20261020-030000.dump"
   printf 'version=1.21.0\nbackup=%s\ntime=2026-10-20 03:00:00 +0000\nphase=started\n' "$BK/freeframe-20261020-030000.dump" \
     >"$FF_ROOT/.update-undo"
+}
+
+@test "update: a record of an update whose new version started is refused, and removing it is offered" {
+  started_record
+  export STUB_RUNNING_IMAGE=ghcr.io/techiebutler/freeframe-api:1.22.0
   ff update
   [ "$status" -eq 1 ]
   assert_out "sudo freeframe rollback"
@@ -504,6 +513,23 @@ assert_put_back() {
   ff update
   [ "$status" -eq 1 ]
   assert_out "sudo freeframe rollback"
+  assert_not_called "fetch latest docker-compose"
+}
+
+@test "update: removing a started update's record is offered only while the new version is what runs" {
+  started_record
+  # The new version never came up in place of the old one (its start failed).
+  export STUB_RUNNING_IMAGE=ghcr.io/techiebutler/freeframe-api:1.21.0
+  ff update
+  [ "$status" -eq 1 ]
+  assert_out "run: sudo freeframe rollback"
+  assert_no_out "sudo rm"
+  # Nothing runs at all.
+  unset STUB_RUNNING_IMAGE
+  ff update
+  [ "$status" -eq 1 ]
+  assert_out "run: sudo freeframe rollback"
+  assert_no_out "sudo rm"
   assert_not_called "fetch latest docker-compose"
 }
 

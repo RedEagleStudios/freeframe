@@ -185,12 +185,15 @@ assert_not_started() {
 
 @test "update: refuses while an earlier update's record stands, naming rollback and how to drop the record" {
   failed_update
-  ff update
+  # The new version is what runs (it did not answer): removing the record
+  # is offered too.
+  STUB_RUNNING_IMAGE=ghcr.io/techiebutler/freeframe-api:1.22.0 ff update
   [ "$status" -eq 1 ]
   assert_out "An earlier update did not finish"
   assert_out "sudo freeframe rollback"
   assert_out "sudo rm '$FF_ROOT/.update-undo'"
-  assert_not_called "dc "
+  # Only asked which version runs; nothing else.
+  if grep '^dc ' "$CALLS" | grep -vx 'dc ps --format {{.Image}} api'; then false; fi
   assert_not_called fetch
 }
 
