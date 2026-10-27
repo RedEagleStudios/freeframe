@@ -136,12 +136,13 @@ There are two ways to run FreeFrame in production. Both use the same `.env.prod`
 
 ### Run the published images
 
-No clone and no build: the server needs only the compose files and your settings. Published images exist from v1.21.0 on.
+No clone and no build: the server needs only the compose files and your settings. This works from the first release after v1.21.0, the first that has these compose files.
 
 ```bash
 mkdir freeframe && cd freeframe
 for f in docker-compose.prod.yml docker-compose.images.yml .env.example; do
-  curl -fsSLO "https://raw.githubusercontent.com/Techiebutler/freeframe/stable/$f"
+  curl -fsSLO "https://raw.githubusercontent.com/Techiebutler/freeframe/latest/$f" \
+    || { echo "Could not download $f: stop here and check the ref." >&2; break; }
 done
 cp .env.example .env.prod
 # Edit .env.prod: set your credentials, S3, email config
@@ -149,6 +150,8 @@ cp .env.example .env.prod
 # and add -f docker-compose.https.yml below (see docs/deployment.md)
 docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.images.yml up -d
 ```
+
+`latest` is the newest published release. We will switch these commands to `stable`, the release we have validated for production, once the first release containing these files has been promoted there.
 
 `docker-compose.images.yml` names the release it belongs to, so downloading the files again from the same ref and running `docker compose pull` then `up -d` is how you update. To pin a version, set `FREEFRAME_VERSION` in `.env.prod`.
 

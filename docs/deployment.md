@@ -71,12 +71,13 @@ There are two ways to run FreeFrame in production: **run the published images** 
 
 ### Run the published images
 
-Published images exist from v1.21.0 on. You need only the compose files and your settings; download them from the ref you want to follow (`stable` for production, `latest` for early adopters, or a pinned `vX.Y.Z`):
+This works from the first release after v1.21.0, the first that has these compose files. You need only the compose files and your settings; download them from the ref you want to follow (`latest`, or a pinned `vX.Y.Z` from the first release after v1.21.0 on). `latest` is the newest published release. We will switch these commands to `stable`, the release we have validated for production, once the first release containing these files has been promoted there.
 
 ```bash
 mkdir freeframe && cd freeframe
 for f in docker-compose.prod.yml docker-compose.images.yml .env.example; do
-  curl -fsSLO "https://raw.githubusercontent.com/Techiebutler/freeframe/stable/$f"
+  curl -fsSLO "https://raw.githubusercontent.com/Techiebutler/freeframe/latest/$f" \
+    || { echo "Could not download $f: stop here and check the ref." >&2; break; }
 done
 
 # Create your production environment file and edit it with your actual credentials.
@@ -134,13 +135,19 @@ ACME_EMAIL=admin@your-domain.com
 FRONTEND_URL=https://your-domain.com
 ```
 
-Then start (or restart) the services with both compose files:
+Then add `-f docker-compose.https.yml` to the command you already use, and start (or restart) the services. Building from source:
 
 ```bash
 docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.https.yml up -d --build
 ```
 
-Use the same two `-f` flags for every later `docker compose` command (`ps`, `logs`, `down`). Traefik will:
+Running the published images (download `docker-compose.https.yml` next to the other compose files first):
+
+```bash
+docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.images.yml -f docker-compose.https.yml up -d
+```
+
+Use the same `-f` flags for every later `docker compose` command (`ps`, `logs`, `down`). Traefik will:
 - Request an SSL certificate from Let's Encrypt for `DOMAIN`
 - Serve your site over HTTPS on port 443
 - Redirect plain HTTP on port 80 to HTTPS
@@ -612,7 +619,8 @@ Your media files are already in S3. For redundancy:
 ```bash
 cd freeframe
 for f in docker-compose.prod.yml docker-compose.images.yml; do
-  curl -fsSLO "https://raw.githubusercontent.com/Techiebutler/freeframe/stable/$f"
+  curl -fsSLO "https://raw.githubusercontent.com/Techiebutler/freeframe/latest/$f" \
+    || { echo "Could not download $f: stop here and check the ref." >&2; break; }
 done
 docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.images.yml pull
 docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.images.yml up -d
@@ -728,7 +736,7 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml ps
 
 ### `failed to resolve reference ... not found`
 
-With `docker-compose.images.yml`, a version that has no published image prints `failed to resolve reference ghcr.io/techiebutler/freeframe-api:<version>: ... not found`, followed by an error about the build context (the build section of `docker-compose.prod.yml` needs the source tree, which you do not have). Read the pair as "that version is not published". Check `FREEFRAME_VERSION` in `.env.prod` (digits and dots only, no leading `v`) and that the compose files you downloaded belong to a release from v1.21.0 on. A new release's images can take a little while to appear after the release itself.
+With `docker-compose.images.yml`, a version that has no published image prints `failed to resolve reference ghcr.io/techiebutler/freeframe-api:<version>: ... not found`, followed by an error about the build context (the build section of `docker-compose.prod.yml` needs the source tree, which you do not have). Read the pair as "that version is not published". Check `FREEFRAME_VERSION` in `.env.prod` (digits and dots only, no leading `v`) and that the compose files you downloaded belong to the first release after v1.21.0 or a later one. A new release's images can take a little while to appear after the release itself.
 
 You must build yourself when you deploy under a sub-path (`NEXT_PUBLIC_BASE_PATH`), use hardware-accelerated transcoding, or run local changes. Clone the repository and run `docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build` without `docker-compose.images.yml`. Adding `--build` to a command that does include the images file also builds from source, but it needs the source tree next to the compose file.
 

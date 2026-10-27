@@ -8,7 +8,7 @@
 #
 # This file only adds `image:` lines. With an image and a build section both
 # present, `up` pulls the image and never builds; `up --build` still builds
-# from source. docker-compose.prod.yml on its own is unchanged, so nothing
+# from source. docker-compose.prod.yml on its own behaves as before, so nothing
 # changes for anyone who does not pass this file.
 #
 # The default version below is the release this file belongs to, so the compose
@@ -16,9 +16,9 @@
 # checks it against CHANGELOG.md). Set FREEFRAME_VERSION in .env.prod to pin
 # another version, for example when rolling back.
 #
-# Published images exist from v1.21.0 on. The web image is built for the
-# domain root: for a sub-path deployment (NEXT_PUBLIC_BASE_PATH) build from
-# source instead.
+# This file exists from the first release after v1.21.0 on. The web image
+# is built for the domain root: for a sub-path deployment
+# (NEXT_PUBLIC_BASE_PATH) build from source instead.
 # ============================================================
 
 services:
