@@ -2673,6 +2673,23 @@ _ff_lock() {
   flock -n "$FF_LOCK_FD"
 }
 
+# _ff_lock_busy: 0 when another freeframe command holds the lock right now
+# (status asks; it never keeps the lock).
+_ff_lock_busy() {
+  local f fd
+  f="$(ff_root)/.freeframe.lock"
+  command -v flock >/dev/null 2>&1 || return 1
+  [[ -r $f ]] || return 1
+  exec {fd}<"$f"
+  if flock -n "$fd"; then
+    flock -u "$fd"
+    exec {fd}<&-
+    return 1
+  fi
+  exec {fd}<&-
+  return 0
+}
+
 # _ff_log_open COMMAND: write to install.log (mode 600) without copying the
 # screen into it; for the nightly backup, whose own messages go to the
 # journal.
@@ -4734,7 +4751,12 @@ cmd_status() {
     say "  Updates:      Could not check for a newer release (GitHub did not answer)."
   fi
   if _update_undo_read; then
-    say "                An update did not finish. To go back to ${FF_UNDO_VERSION:-the version from before}, run: sudo freeframe rollback"
+    # The record also stands while an update runs; the lock tells them apart.
+    if _ff_lock_busy; then
+      say "                An update is running right now (it started ${FF_UNDO_TIME:-a moment ago}). Check again once it has finished."
+    else
+      say "                An update did not finish. To go back to ${FF_UNDO_VERSION:-the version from before}, run: sudo freeframe rollback"
+    fi
   fi
   say "  Web address:  $url"
   if probe_health "$mode" "$host"; then

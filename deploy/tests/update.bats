@@ -748,3 +748,22 @@ killed_update_state() {
   assert_out "were put back first"
   assert_no_out "othing was changed"
 }
+
+@test "status: while an update holds the lock, its record is shown as an update in progress" {
+  command -v flock >/dev/null || skip "no flock"
+  killed_update_state
+  exec 9>>"$FF_ROOT/.freeframe.lock"
+  flock -n 9
+  ff status
+  exec 9>&-
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "An update is running right now (it started 2026-10-20 03:00:00 +0000). Check again once it has finished."
+  assert_no_out "rollback"
+  # Once nothing holds the lock, the record is an update that did not finish.
+  ff status
+  assert_out "An update did not finish. To go back to 1.21.0, run: sudo freeframe rollback"
+  # status itself leaves the lock free.
+  exec 9>>"$FF_ROOT/.freeframe.lock"
+  flock -n 9
+  exec 9>&-
+}
