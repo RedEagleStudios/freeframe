@@ -6639,8 +6639,8 @@ _uninstall_saved_settings() {
 # final backup and the settings are saved: the folder they are in and the
 # final backup's name. A run that finds it finishes an uninstall that
 # stopped part-way, in the same folder. Whether that run backs up is decided
-# from the server, not the marker: only when FreeFrame's database can no
-# longer be there (_uninstall_db_state) is no backup made. It goes with
+# from the server, not the marker: only when the database's volume is gone
+# (_uninstall_db_state) is no backup made. It goes with
 # .env.prod, and every command that starts FreeFrame again removes it
 # (_uninstall_marker_cancel), so it stands only while an uninstall is really
 # unfinished. Nothing in it is trusted beyond _uninstall_saved_ok.
@@ -6694,21 +6694,61 @@ _uninstall_resume() {
 }
 
 # _uninstall_db_state ROOT: FF_U_DB_GONE when an uninstall that stopped
-# part-way has already taken FreeFrame's database away: its volume is
-# deleted, or the setup files that start it are removed. Only then does the
-# run that finishes it make no backup; otherwise it backs up as a first run
-# does (an empty database is then passed over, not saved).
+# part-way has already deleted the database's volume (freeframe_pgdata):
+# only then does the run that finishes it make no backup; otherwise it
+# backs up as a first run does (an empty database is then passed over, not
+# saved). FF_U_SETUP_GONE when the setup files that start the database are
+# missing: a backup cannot be made then, so the run stops before removing
+# anything (_uninstall_check_backup) unless this run has --skip-backup.
 _uninstall_db_state() {
   local root=$1
-  FF_U_DB_GONE=""
+  FF_U_DB_GONE="" FF_U_SETUP_GONE=""
+  if [[ ! -f $root/docker-compose.prod.yml || ! -f $root/docker-compose.images.yml ]]; then FF_U_SETUP_GONE=1; fi
   [[ -n ${FF_U_RESUME:-} ]] || return 0
-  if [[ ! -f $root/docker-compose.prod.yml || ! -f $root/docker-compose.images.yml ||
-    " ${FF_U_VOLUMES[*]} " != *" freeframe_pgdata "* ]]; then
-    FF_U_DB_GONE=1
-  fi
+  if [[ " ${FF_U_VOLUMES[*]} " != *" freeframe_pgdata "* ]]; then FF_U_DB_GONE=1; fi
   return 0
 }
 
+# _uninstall_none_words: FF_U_NONE and FF_U_NONE_YET, what has been removed
+# so far in the words every failure uses (an earlier run may have removed
+# part of FreeFrame already).
+_uninstall_none_words() {
+  if [[ -n ${FF_U_RESUME:-} ]]; then
+    FF_U_NONE="nothing more was removed (an earlier uninstall had already removed part of FreeFrame)"
+    FF_U_NONE_YET="An earlier uninstall already removed part of FreeFrame; this run has removed nothing more yet"
+  else
+    FF_U_NONE="nothing was removed"
+    FF_U_NONE_YET="Nothing has been removed yet"
+  fi
+}
+
+# _uninstall_setup_gone_msg: why no backup can be made while the database's
+# setup files are missing, in plain words.
+_uninstall_setup_gone_msg() {
+  local msg root
+  root=$(ff_root)
+  msg="The setup files in $root are gone, so FreeFrame's database cannot be backed up"
+  if [[ " ${FF_U_VOLUMES[*]} " == *" freeframe_pgdata "* ]]; then
+    msg+=", although its volume (freeframe_pgdata) is still there"
+  fi
+  msg+="."
+  if [[ -n ${FF_U_PREV_FINAL:-} ]]; then
+    msg+=" The final backup the earlier uninstall made ($FF_U_PREV_FINAL) is in $FF_U_PREV_SAVED."
+  fi
+  printf '%s' "$msg"
+}
+
+# _uninstall_check_backup: a backup that cannot be made stops the run here,
+# before anything (more) is removed; only --skip-backup on this run goes on.
+_uninstall_check_backup() {
+  local flags=""
+  _uninstall_backup_made || return 0
+  [[ -n ${FF_U_SETUP_GONE:-} ]] || return 0
+  [[ -z ${FF_DELETE_DATA:-} ]] || flags=" --delete-data"
+  _uninstall_none_words
+  _ff_stop 1 "$(_uninstall_setup_gone_msg) So the uninstall stopped, and $FF_U_NONE." \
+    "to remove FreeFrame without a final backup, run: sudo freeframe uninstall --skip-backup$flags (the database stays in its volume unless --delete-data is given too)"
+}
 # _uninstall_marker_cancel: FreeFrame was started again, so an uninstall
 # that stopped part-way is not unfinished any more: its marker goes, with
 # one line (on stderr, as some callers print into a sentence).
@@ -6741,23 +6781,40 @@ _uninstall_backup_made() { [[ -z ${FF_SKIP_BACKUP:-} && -z ${FF_U_DB_GONE:-} ]];
 
 # _uninstall_db_copy: what copy of the database is left once its volume is
 # deleted, as it really is.
-_uninstall_db_copy() {
-  local newest when
-  if _uninstall_backup_made; then
-    printf 'a final backup is made first%s, and is then the only copy of the database' "${FF_U_RESUME:+ (if the database still has data)}"
-  elif [[ -n ${FF_U_PREV_FINAL:-} ]]; then
-    printf 'the final backup the earlier uninstall made (%s) is then the only copy of the database' "$FF_U_PREV_FINAL"
-  else
-    newest=$(_uninstall_newest_dump)
-    if [[ -n $newest ]]; then
-      when=$(_ff_stamp_date "${newest##*/}")
-      printf 'no final backup of the database exists: the newest backup is %s%s, and anything changed since then is lost' "${newest##*/}" "${when:+ (made $when)}"
-    else
-      printf 'no backup of the database exists at all, so nothing can bring it back'
-    fi
-  fi
+# _uninstall_dump_count: how many ordinary backups there are, in
+# $FF_ROOT/backups and in the earlier uninstall's folder.
+_uninstall_dump_count() {
+  local f n=0
+  while IFS= read -r f; do
+    if [[ $f != *-before-rollback.dump ]]; then n=$((n + 1)); fi
+  done < <(_ff_backup_dumps "$(ff_root)/backups"; if [[ -n ${FF_U_PREV_OK:-} ]]; then _ff_backup_dumps "$FF_U_PREV_SAVED"; fi)
+  printf '%s' "$n"
 }
 
+_uninstall_db_copy() {
+  local newest name when what
+  if _uninstall_backup_made; then
+    printf 'a final backup is made first%s, and is then the newest copy of the database' "${FF_U_RESUME:+ (if the database still has data)}"
+    return 0
+  fi
+  newest=$(_uninstall_newest_dump)
+  if [[ -z $newest ]]; then
+    printf 'no backup of the database exists at all, so nothing can bring it back'
+    return 0
+  fi
+  name=${newest##*/}
+  when=$(_ff_stamp_date "$name")
+  if [[ $name == "${FF_U_PREV_FINAL:-}" ]]; then
+    what="the final backup the earlier uninstall made ($name)"
+  else
+    what="the backup $name${when:+ (made $when)}"
+  fi
+  if [[ $(_uninstall_dump_count) == 1 ]]; then
+    printf 'no final backup is made now, so %s is then the only copy of the database' "$what"
+  else
+    printf 'no final backup is made now, so the newest copy of the database is %s, and anything changed since then is lost' "$what"
+  fi
+}
 _uninstall_marker_set() {
   local f
   f=$(_uninstall_marker_file)
@@ -6887,13 +6944,22 @@ _uninstall_notes() {
       where="in a folder that is no longer there. This run finishes it; anything still in $root/backups and a copy of the settings go to a new folder."
     fi
     if [[ -n ${FF_U_DB_GONE:-} ]]; then
-      how="It makes no new backup: the earlier run already took FreeFrame's database away (its volume or the setup files that start it are removed), and starting it now would only make an empty one."
+      how="It makes no new backup: the earlier run already deleted the database's volume (freeframe_pgdata), and starting the database now would only make an empty one."
+    elif [[ -n ${FF_SKIP_BACKUP:-} && -n ${FF_U_SETUP_GONE:-} ]]; then
+      how="$(_uninstall_setup_gone_msg) With --skip-backup this run goes on without a final backup."
     elif [[ -n ${FF_SKIP_BACKUP:-} ]]; then
       how="FreeFrame's database is still there; with --skip-backup no final backup of it is made."
+    elif [[ -n ${FF_U_SETUP_GONE:-} ]]; then
+      how="$(_uninstall_setup_gone_msg) So the uninstall stops before removing anything more, unless --skip-backup is given."
     else
       how="FreeFrame's database is still there, so a final backup of it is made first, as in a first run."
     fi
     say "An earlier freeframe uninstall stopped part-way, after it saved the backups and a copy of the settings $where $how"
+    say ""
+  fi
+  # A first run whose setup files are missing (a re-run says it above).
+  if [[ -z ${FF_U_RESUME:-} && -n ${FF_U_SETUP_GONE:-} ]] && _uninstall_backup_made; then
+    say "$(_uninstall_setup_gone_msg) So the uninstall stops before removing anything, unless --skip-backup is given."
     say ""
   fi
   if [[ -f $(_restore_undo_file) ]]; then
@@ -6959,7 +7025,7 @@ _uninstall_plan() {
     say "  - in $home/freeframe-removed-<date>-<time>/, readable by root only:"
   fi
   if [[ -n ${FF_U_DB_GONE:-} ]]; then
-    say "      no new backup: the earlier uninstall already took the database away"
+    say "      no new backup: the earlier uninstall already deleted the database's volume"
   elif [[ -n ${FF_SKIP_BACKUP:-} ]]; then
     say "      no final backup (--skip-backup)"
   else
@@ -7032,9 +7098,9 @@ _uninstall_backup() {
   local try="fix what the message above says, then run $FF_RERUN again. To remove FreeFrame without a final backup instead, run: sudo freeframe uninstall --skip-backup (the database stays in its Docker volume unless --delete-data is given too)"
   if [[ -n ${FF_U_DB_GONE:-} ]]; then
     if [[ -n ${FF_U_PREV_FINAL:-} ]]; then
-      say "No new backup: the earlier uninstall already took FreeFrame's database away. Its final backup ($FF_U_PREV_FINAL) is kept in $FF_U_PREV_SAVED."
+      say "No new backup: the earlier uninstall already deleted the database's volume. Its final backup ($FF_U_PREV_FINAL) is kept in $FF_U_PREV_SAVED."
     else
-      say "No backup was made: the earlier uninstall already took FreeFrame's database away, and no final backup of it is left."
+      say "No backup was made: the earlier uninstall already deleted the database's volume, and made no final backup that is still here."
     fi
     _ff_log_lines "uninstall: finishing an earlier uninstall; the database is gone, no new backup"
     return 0
@@ -7281,12 +7347,14 @@ _uninstall_summary() {
     say "To delete them later (this cannot be undone):"
     say "  sudo docker volume rm ${FF_U_VOLUMES[*]}"
   fi
-  dump=${FF_U_FINAL:-}
-  label="the final backup"
-  if [[ -n ${FF_U_FINAL_EARLIER:-} ]]; then label="the earlier uninstall's final backup"; fi
+  # This run's final backup; otherwise the newest in the folder, which is
+  # the earlier run's final one only when nothing newer is there.
+  dump="" label="the final backup"
+  if [[ -n ${FF_U_FINAL:-} && -z ${FF_U_FINAL_EARLIER:-} ]]; then dump=$FF_U_FINAL; fi
   if [[ -z $dump ]]; then
     dump=$(_ff_backup_newest "$saved")
     label="the newest backup"
+    if [[ -n $dump && $dump == "${FF_U_FINAL:-}" ]]; then label="the earlier uninstall's final backup"; fi
   fi
   if [[ -f $saved/.env.prod ]]; then
     say ""
@@ -7389,6 +7457,7 @@ cmd_uninstall() {
     _ff_stop 2 "--delete-data deletes FreeFrame's data for good, so it asks you to type delete first, and there is no terminal here to ask. Nothing was changed." \
       "to delete it without a question, add --confirm-delete-data: sudo freeframe uninstall --yes --delete-data --confirm-delete-data"
   fi
+  _uninstall_check_backup
   _uninstall_notes "$root"
   _uninstall_plan "$root" "$bin"
   say ""
@@ -7428,13 +7497,8 @@ cmd_uninstall() {
   FF_STOPPED=()
   FF_ADMIN_CREATED="" FF_PW_GENERATED=""
   FF_RERUN="sudo freeframe uninstall$flags"
-  if [[ -n $FF_U_RESUME ]]; then
-    FF_U_NONE="nothing more was removed (an earlier uninstall had already removed part of FreeFrame)"
-    FF_U_NONE_YET="An earlier uninstall already removed part of FreeFrame; this run has removed nothing more yet"
-  else
-    FF_U_NONE="nothing was removed"
-    FF_U_NONE_YET="Nothing has been removed yet"
-  fi
+  _uninstall_check_backup
+  _uninstall_none_words
   FF_STATE="$FF_U_NONE_YET."
   FF_STATE_PREFIX="" FF_RECORD_NEW="" FF_DROP_STARTED="" FF_UPDATE_PHASE=""
   # Read now: it names the channel kept in the settings, which go away.

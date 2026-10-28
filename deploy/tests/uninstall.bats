@@ -574,7 +574,7 @@ plant_marker() {
   ff uninstall --skip-backup --delete-data
   [ "$status" -eq 0 ] || { echo "$output"; false; }
   assert_not_called "pg_dump"
-  assert_out "no final backup of the database exists: the newest backup is freeframe-20261027-030000.dump"
+  assert_out "the newest copy of the database is the backup freeframe-20261027-030000.dump"
   assert_out "the earlier uninstall made no final backup"
   assert_no_out "is then the only copy"
   assert_out "sudo freeframe restore '$(saved_dir)/freeframe-20261027-030000.dump'"
@@ -636,6 +636,138 @@ plant_marker() {
   FF_ROOT="$FF_ROOT/." ff uninstall --yes
   [ "$status" -eq 0 ] || { echo "$output"; false; }
   assert_no_out "rm -rf '$FF_ROOT/.'"
+}
+
+# setup_gone_rerun: a first run with --skip-backup stops at dc down; then the
+# compose file goes missing while the database's volume stays.
+setup_gone_rerun() {
+  STUB_DOWN_FAIL=1 ff uninstall --yes --skip-backup
+  [ "$status" -eq 1 ] || { echo "$output"; return 1; }
+  rm -f "$FF_ROOT/docker-compose.prod.yml"
+  grep -q '^freeframe_pgdata|' "$STUB_DIR/dk/volumes"
+  : >"$CALLS"
+}
+
+# assert_nothing_more_removed: a re-run that stopped removed nothing more.
+assert_nothing_more_removed() {
+  grep -q '^freeframe_pgdata|' "$STUB_DIR/dk/volumes" || { echo "pgdata deleted"; return 1; }
+  [ -f "$ENV" ]
+  [ -x "$FF_BIN_DIR/freeframe" ]
+  [ -f "$FF_SYSTEMD_DIR/freeframe-backup.timer" ]
+  assert_not_called "pg_dump"
+  assert_not_called "dc down"
+  assert_not_called "docker rm"
+  assert_not_called "docker volume rm"
+  assert_not_called "rm -rf"
+}
+
+@test "uninstall rerun: setup files gone with the database's volume still there stops with --delete-data, removing nothing more" {
+  setup_gone_rerun
+  ff uninstall --yes --delete-data --confirm-delete-data
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  assert_out "The setup files in $FF_ROOT are gone, so FreeFrame's database cannot be backed up"
+  assert_out "freeframe_pgdata"
+  assert_out "is still there"
+  assert_out "sudo freeframe uninstall --skip-backup"
+  assert_no_out "took the database away"
+  assert_no_out "already deleted"
+  # Stopped up front: no plan, and no try at starting the database.
+  assert_no_out "This removes FreeFrame from this server:"
+  assert_not_called "dc up"
+  assert_nothing_more_removed
+}
+
+@test "uninstall rerun: setup files gone with the database's volume still there stops without --delete-data too" {
+  setup_gone_rerun
+  ff uninstall --yes
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  assert_out "cannot be backed up"
+  assert_no_out "This removes FreeFrame from this server:"
+  assert_not_called "dc up"
+  assert_nothing_more_removed
+}
+
+@test "uninstall rerun: setup files gone, --skip-backup on this run goes on, after no backup is typed" {
+  setup_gone_rerun
+  answers "remove" "nope"
+  ff uninstall --skip-backup --delete-data
+  [ "$status" -eq 1 ]
+  assert_out "type: no backup"
+  assert_nothing_more_removed
+  answers "remove" "no backup" "delete"
+  ff uninstall --skip-backup --delete-data
+  [ "$status" -eq 0 ] || { echo "$output"; cat "$CALLS"; false; }
+  assert_not_called "pg_dump"
+  ! grep -q '|freeframe$' "$STUB_DIR/dk/volumes"
+  assert_no_out "took the database away"
+  assert_removed
+}
+
+@test "uninstall rerun --dry-run: setup files gone with the volume still there says the real run would stop" {
+  setup_gone_rerun
+  ff uninstall --dry-run --delete-data
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "cannot be backed up"
+  assert_no_out "took the database away"
+  assert_no_out "already deleted"
+  assert_nothing_more_removed
+}
+
+@test "uninstall rerun --skip-backup with a newer backup than the earlier final: the question and the restore line name the newest" {
+  STUB_DOWN_FAIL=1 ff uninstall --yes
+  [ "$status" -eq 1 ]
+  local d
+  d=$(saved_dir)
+  printf 'PGDMP nightly\n' >"$BK/freeframe-20991028-030000.dump"
+  cp "$ENV" "$BK/freeframe-20991028-030000.env.prod"
+  answers "remove" "no backup" "delete"
+  ff uninstall --skip-backup --delete-data
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "the newest copy of the database is the backup freeframe-20991028-030000.dump"
+  assert_no_out "is then the only copy"
+  assert_out "sudo freeframe restore '$d/freeframe-20991028-030000.dump'"
+}
+
+@test "uninstall rerun --skip-backup with the earlier final as the only backup: only then is it called the only copy" {
+  STUB_DOWN_FAIL=1 ff uninstall --yes
+  [ "$status" -eq 1 ]
+  local d final
+  d=$(saved_dir)
+  final=$(sed -n 's/^final=//p' "$FF_ROOT/.uninstall-saved")
+  rm -f "$d"/freeframe-2026102[67]-030000.*
+  answers "remove" "no backup" "delete"
+  ff uninstall --skip-backup --delete-data
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "the final backup the earlier uninstall made ($final) is then the only copy of the database"
+  assert_out "sudo freeframe restore '$d/$final'"
+}
+
+@test "uninstall rerun: an empty database goes on without a backup, and says so" {
+  STUB_DOWN_FAIL=1 ff uninstall --yes
+  [ "$status" -eq 1 ]
+  : >"$CALLS"
+  STUB_DB_EMPTY=1 ff uninstall --yes --delete-data --confirm-delete-data
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "FreeFrame's database is empty (it has no tables), so no final backup was made of it; this run goes on without one."
+  assert_not_called "pg_dump"
+  assert_removed
+}
+
+@test "a start that fails keeps an unfinished uninstall's marker" {
+  plant_marker
+  STUB_UP_FAIL=1 ff restart
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  [ -f "$FF_ROOT/.uninstall-saved" ]
+  assert_no_out "is cancelled"
+}
+
+@test "restore's restart after an early failure cancels an unfinished uninstall's marker" {
+  plant_marker
+  STUB_MAINT_FAIL=1 ff restore --yes "$BK/freeframe-20261026-030000.dump"
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  assert_out "FreeFrame has been started again."
+  [ ! -e "$FF_ROOT/.uninstall-saved" ]
+  assert_out "An earlier freeframe uninstall that did not finish is cancelled"
 }
 
 @test "restart cancels an unfinished uninstall's marker, and says so" {
@@ -821,8 +953,18 @@ plant_marker() {
   local d final
   d=$(saved_dir)
   final=$(sed -n 's/^final=//p' "$FF_ROOT/.uninstall-saved")
+  # The database's volume is still there but cannot be backed up now: the
+  # re-run stops, and says the earlier final backup is safe.
   : >"$CALLS"
   ff uninstall --yes
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  assert_out "cannot be backed up"
+  assert_out "$final"
+  assert_not_called "pg_dump"
+  assert_not_called "dc down"
+  # --skip-backup on this run goes on.
+  : >"$CALLS"
+  ff uninstall --yes --skip-backup
   [ "$status" -eq 0 ] || { echo "$output"; cat "$CALLS"; false; }
   assert_not_called "pg_dump"
   assert_no_out "othing was removed"
