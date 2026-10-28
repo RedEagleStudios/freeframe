@@ -218,7 +218,7 @@ Without the settings file the installer refuses the kept volumes (they look like
 
 If an update or a restore did not finish, `uninstall` still runs, and says first what is lost: an unfinished update's way back (`sudo freeframe rollback`), or, after an unfinished restore, that the database may be empty (the copy from before that restore is kept with the other backups). It refuses a server that runs FreeFrame set up by hand. While another `freeframe` command is running it does not start, and says so: run it again once that one has finished.
 
-**If it stops part-way** (a volume that cannot be deleted, a full disk), run the same command again. It finds the folder the first run saved in, keeps using it and makes no new backup: the database may already be removed, and starting it again would only make an empty one. The first run's final backup stays the one to restore.
+**If it stops part-way** (a volume that cannot be deleted, a full disk), run the same command again. It finds the folder the first run saved in and keeps using it. While FreeFrame's database is still there it makes a final backup again, as a first run does. Once the first run has taken the database away (its volume deleted, or the setup files that start it removed), it makes none, because starting the database then would only make an empty one, and it says so. The summary names the newest backup really made as the one to restore. Starting FreeFrame again instead (`restart`, `update`, `configure`, `rollback`, `restore` or the installer) cancels the unfinished uninstall.
 
 ### Unattended installs (cloud-init, Ansible)
 
