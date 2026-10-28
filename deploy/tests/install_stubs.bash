@@ -190,3 +190,7 @@ install_nvidia_toolkit() {
   fi
   STUB_GPU=ready
 }
+
+# STUB_OTHER_CONTAINERS: how many containers that are not FreeFrame's run.
+_gpu_other_containers() { printf '%s' "${STUB_OTHER_CONTAINERS:-0}"; }
+

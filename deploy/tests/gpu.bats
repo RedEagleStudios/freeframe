@@ -598,3 +598,14 @@ toolkit_stubs() {
   ((SECONDS - t0 < 15))
 }
 
+@test "_gpu_other_containers: counts running containers that are not FreeFrame's" {
+  fake_prog docker 'case "$1" in ps) printf "%s\n" freeframe freeframe "" other ;; esac'
+  assert_eq "$(_gpu_other_containers)" 2
+  fake_prog docker 'case "$1" in ps) printf "%s\n" freeframe ;; esac'
+  assert_eq "$(_gpu_other_containers)" 0
+  fake_prog docker 'exit 0'
+  assert_eq "$(_gpu_other_containers)" 0
+  fake_docker ""
+  assert_eq "$(_gpu_other_containers)" 0
+}
+

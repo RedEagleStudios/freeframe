@@ -2529,3 +2529,32 @@ rest_gpu() { REST_GPU=(1 "" "Grace" "grace@example.com" "long-password-1" "long-
   assert_not_called "fetch latest"
 }
 
+@test "gpu screens: with other containers running, the Video processing step and the summary say they stop for a moment" {
+  export STUB_GPU=notoolkit STUB_OTHER_CONTAINERS=2
+  rest_gpu y
+  tty_answers 3 "${REST_GPU[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  [[ $output == *"Video processing"*"2 other containers are running on this server"*"Use the NVIDIA GPU"* ]] || { echo "$output"; false; }
+  assert_out "every container on this server stops for a moment"
+  [[ $output == *"Ready to install"*"stops the 2 other containers running on this server for a moment"*"Install now?"* ]] ||
+    { echo "$output"; false; }
+}
+
+@test "gpu: unattended with --gpu nvidia and another container running, the summary says it stops for a moment" {
+  plain_answers
+  export STUB_GPU=notoolkit STUB_OTHER_CONTAINERS=1
+  ff_install --yes --gpu nvidia
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "stops the 1 other container running on this server for a moment"
+}
+
+@test "gpu screens: with no other containers, no word about them" {
+  export STUB_GPU=notoolkit
+  rest_gpu y
+  tty_answers 3 "${REST_GPU[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_no_out "other container"
+}
+
