@@ -2674,6 +2674,7 @@ recreates() { grep -c '^dc up -d --no-build --no-deps --force-recreate worker$' 
     assert_not_called "nvidia-smi"
     assert_not_called "ps -q --status running worker"
     assert_not_called "force-recreate"
+    assert_no_out "Checking that video processing can use the GPU"
     if grep -q '^GPU self-check' "$FF_ROOT/install.log"; then cat "$FF_ROOT/install.log"; false; fi
   done
 }
