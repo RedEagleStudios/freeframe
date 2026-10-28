@@ -2483,3 +2483,26 @@ rest_gpu() { REST_GPU=(1 "" "Grace" "grace@example.com" "long-password-1" "long-
   grep -l '^FREEFRAME_GPU=nvidia$' "$FF_ROOT"/.env.prod.* >/dev/null
   assert_not_called install_nvidia_toolkit
 }
+
+# ---------------------------------------------------------------- fix round 1
+
+@test "gpu screens: the banner is printed before the GPU is detected" {
+  export STUB_GPU=notoolkit STUB_GPU_MARK=1
+  rest_gpu y
+  tty_answers 3 "${REST_GPU[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  [[ $output == *"Self-hosted review for your team's video, images and audio"*"<<detect_gpu>>"*"Welcome!"*"Five short questions"* ]] ||
+    { echo "$output"; false; }
+  # The banner is the first thing on the screen.
+  [[ ${output%%<<detect_gpu>>*} == *"| __| _ ___ ___| __|"* ]] || { echo "$output"; false; }
+}
+
+@test "gpu screens: unattended, the one-line header is printed before the GPU is detected" {
+  plain_answers
+  export STUB_GPU_MARK=1
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  [[ $output == *"FreeFrame installer (--yes"*"<<detect_gpu>>"* ]] || { echo "$output"; false; }
+}
+

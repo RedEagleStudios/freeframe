@@ -153,6 +153,8 @@ derive_env() {
 # makes a notoolkit or noruntime GPU ready, unless STUB_GPU_SETUP_FAIL.
 detect_gpu() {
   _stub_log detect_gpu
+  # STUB_GPU_MARK: show on the screen where the detection ran.
+  [[ -z ${STUB_GPU_MARK:-} ]] || printf '<<detect_gpu>>\n' >&2
   FF_GPU_VENDOR=none FF_GPU_NAME="" FF_GPU_DRIVER="" FF_GPU_STATE=none FF_GPU_WSL=${STUB_GPU_WSL:-}
   case ${STUB_GPU:-none} in
     ready | notoolkit | noruntime)

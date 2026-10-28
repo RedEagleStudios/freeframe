@@ -2275,7 +2275,7 @@ ART
   _ff_lines " " " " 2 "Self-hosted review for your team's video, images and audio"
 }
 
-# _install_welcome: the banner, then what is about to happen. Interactive
+# _install_welcome: what is about to happen, after the banner. Interactive
 # installs only, before the server check.
 _install_welcome() {
   local n=${FF_QTOTAL:-0} count
@@ -2287,7 +2287,6 @@ _install_welcome() {
     5) count="Five short questions" ;;
     *) count="$n short questions" ;;
   esac
-  _install_banner
   say ""
   _ff_p "Welcome! This sets up FreeFrame on this server."
   say ""
@@ -3529,12 +3528,17 @@ cmd_install() {
   fi
 
   _ff_screen_setup
+  # The banner (or the one-line header) first, before anything that can
+  # take a moment: the GPU check waits for nvidia-smi and docker info.
+  if _ff_interactive; then
+    _install_banner
+  else
+    say "FreeFrame installer (--yes: no questions; every answer is given ahead of time)"
+  fi
   _install_gpu_check "$file"
   if _ff_interactive; then
     _install_count_steps "$file"
     _install_welcome
-  else
-    say "FreeFrame installer (--yes: no questions; every answer is given ahead of time)"
   fi
   _install_log_start
   FF_STATE="Nothing has been installed yet; the installer has only written its log."
