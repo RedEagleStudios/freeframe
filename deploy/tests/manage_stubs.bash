@@ -316,3 +316,11 @@ docker_status() {
   _stub_log docker_status
   if [[ -e $STUB_DIR/docker-down ]]; then printf 'down\n'; else printf 'ok\n'; fi
 }
+
+# dc with a time limit: logged, then the stubbed dc.
+dc_bounded() {
+  _stub_log "dc_bounded $*"
+  shift
+  dc "$@"
+}
+

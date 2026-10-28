@@ -391,3 +391,12 @@ setup() {
   assert_out "video"
 }
 
+@test "status gpu: asking the worker is bounded in time" {
+  printf 'services:\n  worker: {}\n' >"$FF_ROOT/docker-compose.gpu.yml"
+  env_set "$ENV" FREEFRAME_GPU nvidia
+  export STUB_GPU=ready STUB_WORKER_GPU="GPU 0: NVIDIA L4 (UUID: GPU-1)"
+  ff status
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -qx "dc_bounded 30 exec -T worker nvidia-smi -L" "$CALLS" || { cat "$CALLS"; false; }
+}
+

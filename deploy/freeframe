@@ -875,6 +875,17 @@ dc() {
   (cd "$root" && docker compose --project-name freeframe --env-file "$root/.env.prod" "${files[@]}" "$@")
 }
 
+# dc_bounded SECONDS ARGS...: dc, stopped after SECONDS (and killed 5
+# seconds later if it ignores that), for a question that must not hang.
+dc_bounded() {
+  local secs=$1 root
+  local -a files=()
+  shift
+  root=$(ff_root)
+  read -ra files <<<"$(compose_files "$root/.env.prod")"
+  (cd "$root" && timeout -k 5 "$secs" docker compose --project-name freeframe --env-file "$root/.env.prod" "${files[@]}" "$@")
+}
+
 # ------------------------------------------------------------
 # Backups
 # ------------------------------------------------------------
@@ -1170,7 +1181,7 @@ _gpu_smi() {
 # _gpu_query SMI: "NAME, DRIVER" for each GPU. Bounded: a wedged driver can
 # leave nvidia-smi hanging.
 _gpu_query() {
-  timeout "${FF_GPU_SMI_TIMEOUT:-20}" "$1" --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null
+  timeout -k 5 "${FF_GPU_SMI_TIMEOUT:-20}" "$1" --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null
 }
 
 _gpu_has_toolkit() { command -v nvidia-ctk >/dev/null 2>&1 || command -v nvidia-container-toolkit >/dev/null 2>&1; }
@@ -1180,7 +1191,7 @@ _gpu_has_toolkit() { command -v nvidia-ctk >/dev/null 2>&1 || command -v nvidia-
 _gpu_docker_runtimes() {
   command -v docker >/dev/null 2>&1 || return 0
   # shellcheck disable=SC2016 # a Go template, not a shell expansion
-  timeout 20 docker info --format '{{range $k, $v := .Runtimes}}{{$k}} {{end}}' 2>/dev/null || true
+  timeout -k 5 "${FF_DOCKER_INFO_TIMEOUT:-20}" docker info --format '{{range $k, $v := .Runtimes}}{{$k}} {{end}}' 2>/dev/null || true
 }
 
 # FF_GPU_VENDOR is for the tests and anyone reading the result; the script
@@ -6104,7 +6115,7 @@ _status_gpu() {
     say "${pre}on the CPU: the GPU is chosen (FREEFRAME_GPU=nvidia), but docker-compose.gpu.yml is missing from $root, so the worker runs without it. To fetch it, run: sudo freeframe update"
     return 0
   fi
-  if out=$(dc exec -T worker nvidia-smi -L 2>/dev/null) && [[ $out == "GPU "* ]]; then
+  if out=$(dc_bounded 30 exec -T worker nvidia-smi -L 2>/dev/null) && [[ $out == "GPU "* ]]; then
     name=${out%%$'\n'*}
     name=${name#GPU *: }
     name=${name% (UUID:*}
@@ -6112,7 +6123,7 @@ _status_gpu() {
     return 0
   fi
   detect_gpu
-  if [[ -z $(dc ps -q --status running worker 2>/dev/null) ]]; then
+  if [[ -z $(dc_bounded 30 ps -q --status running worker 2>/dev/null) ]]; then
     if [[ $FF_GPU_STATE == ready ]]; then
       say "${pre}set to the GPU, but the worker that processes video is not running. Start it with: sudo freeframe restart"
     else

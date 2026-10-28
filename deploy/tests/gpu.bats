@@ -566,3 +566,35 @@ toolkit_stubs() {
   assert_eq "$(_gpu_daemon_undo)" "sudo rm -f $FF_DOCKER_DAEMON_JSON && sudo systemctl restart docker"
 }
 
+@test "gpu detect: an nvidia-smi that ignores the stop signal is killed" {
+  pci_display 0000:01:00.0 0x10de
+  fake_prog nvidia-smi 'trap "" TERM; exec sleep 30'
+  export FF_GPU_SMI_TIMEOUT=1
+  local t0=$SECONDS
+  detect_gpu
+  assert_eq "$FF_GPU_STATE" nodriver
+  ((SECONDS - t0 < 15))
+}
+
+@test "gpu detect: a docker info that ignores the stop signal is killed" {
+  pci_display 0000:01:00.0 0x10de
+  fake_prog nvidia-smi "$(smi_body "NVIDIA L4" 580.95.05)"
+  fake_prog nvidia-ctk 'exit 0'
+  fake_prog docker 'trap "" TERM; exec sleep 30'
+  export FF_DOCKER_INFO_TIMEOUT=1
+  local t0=$SECONDS
+  detect_gpu
+  assert_eq "$FF_GPU_STATE" noruntime
+  ((SECONDS - t0 < 15))
+}
+
+@test "dc_bounded: docker compose that hangs is stopped after the time given" {
+  printf 'FREEFRAME_HTTPS=off\n' >"$F"
+  fake_prog docker 'trap "" TERM; exec sleep 30'
+  local t0=$SECONDS
+  run dc_bounded 1 exec -T worker nvidia-smi -L
+  # 124 or 137: timeout stopped it (not "command not found").
+  [[ $status == 124 || $status == 137 ]] || { echo "status $status: $output"; false; }
+  ((SECONDS - t0 < 15))
+}
+
