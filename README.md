@@ -134,7 +134,7 @@ Release notes are on the [Releases page](https://github.com/Techiebutler/freefra
 
 ### Install on a fresh server
 
-The easiest way, and the one we recommend if you have not run a server before. Rent a server, run one command, and answer four short questions: your web address (with an email for certificate notices when it uses HTTPS), where to keep footage (on the server or in an S3 bucket), your mail server (SMTP), and your admin account. The installer sets up Docker, starts FreeFrame, gets a free HTTPS certificate, creates your admin account and turns on nightly backups. It also tells you whether video is processed on the GPU or the CPU: an NVIDIA GPU whose driver works can be used with one confirmation (the installer sets up NVIDIA's container toolkit), see [Video processing on a GPU](docs/deployment.md#video-processing-on-a-gpu).
+The easiest way, and the one we recommend if you have not run a server before. Rent a server, run one command, and answer a few short questions: your web address (with an email for certificate notices when it uses HTTPS), where to keep footage (on the server or in an S3 bucket), your mail server (SMTP), your admin account and, on a server with an NVIDIA GPU, whether to use it. The installer sets up Docker, starts FreeFrame, gets a free HTTPS certificate, creates your admin account and turns on nightly backups. It also tells you whether video is processed on the GPU or the CPU: an NVIDIA GPU whose driver works can be used with one confirmation (the installer sets up NVIDIA's container toolkit), see [Video processing on a GPU](docs/deployment.md#video-processing-on-a-gpu).
 
 What to rent:
 

@@ -6,7 +6,7 @@ This guide covers deploying FreeFrame to a production server using Docker Compos
 
 ## Install on a fresh server
 
-This is the easiest way to run FreeFrame, and the one we recommend if you have not run a server before. You rent a small Linux server, paste one command, and answer four short questions. The installer does the rest: it sets up Docker (the program FreeFrame runs inside), starts FreeFrame, gets a free HTTPS certificate, creates your admin account and turns on nightly backups. It takes a few minutes.
+This is the easiest way to run FreeFrame, and the one we recommend if you have not run a server before. You rent a small Linux server, paste one command, and answer four or five short questions (the fifth only on a server with an NVIDIA GPU that Docker cannot use yet). The installer does the rest: it sets up Docker (the program FreeFrame runs inside), starts FreeFrame, gets a free HTTPS certificate, creates your admin account and turns on nightly backups. It takes a few minutes.
 
 The manual ways further down this guide ([run the published images](#run-the-published-images) and [build from source](#build-from-source)) stay fully supported. Use them if you already run servers your own way, or if your server cannot use the installer.
 
