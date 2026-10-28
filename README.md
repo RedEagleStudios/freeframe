@@ -158,9 +158,13 @@ The command works from the first release after v1.21.0, the first that has the i
 
 When it finishes, open the address it prints and sign in with your admin account, then invite your team from the admin area. Without email set up, sign-in codes and invitations are not sent and there is no password reset; invitation links can still be copied from the admin page.
 
-Afterwards the `freeframe` command looks after the server: `sudo freeframe status`, `update` (backs up first), `rollback`, `configure`, `backup`, `restore`, `logs` and `restart`. Nightly backups run at 03:00 and the last 7 are kept, on the same server, so copy them elsewhere now and then. Uploaded media in bundled storage is not in them.
+Afterwards the `freeframe` command looks after the server: `sudo freeframe status`, `update` (backs up first), `rollback`, `configure`, `backup`, `restore`, `logs`, `restart` and `uninstall`. Nightly backups run at 03:00 and the last 7 are kept, on the same server, so copy them elsewhere now and then. Uploaded media in bundled storage is not in them.
 
 The installer refuses a server that already runs FreeFrame set up by hand, and leaves it alone. For the DNS step, an office server behind a router, moving to a new server, unattended installs (cloud-init, Ansible) and troubleshooting, see the **[installation guide](docs/deployment.md#install-on-a-fresh-server)**.
+
+#### Removing FreeFrame
+
+`sudo freeframe uninstall` takes FreeFrame off the server. It first saves a final backup of the database and moves it, with every earlier backup and a copy of the settings file, to `/root/freeframe-removed-<date>-<time>/`. Then it removes FreeFrame's containers, the nightly backup, `/opt/freeframe` and the `freeframe` command. Your data stays in its Docker volumes (the database, and footage kept on the server) unless you add `--delete-data`, and Docker itself is left alone. Run `sudo freeframe uninstall --dry-run` first to see exactly what it would remove and keep. To put FreeFrame back later, or to run it unattended, see [Removing FreeFrame](docs/deployment.md#removing-freeframe) in the guide.
 
 ### Or set it up by hand
 

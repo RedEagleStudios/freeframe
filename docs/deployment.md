@@ -162,6 +162,7 @@ After the install, the `freeframe` command is on the server. All commands need `
 | `sudo freeframe restore` | Lists the backups. `sudo freeframe restore FILE` puts one back (replaces the current database, after saving a copy of it). |
 | `sudo freeframe logs` | Shows FreeFrame's recent messages and follows new ones (Ctrl-C stops). `sudo freeframe logs api` shows one part only. |
 | `sudo freeframe restart` | Restarts every part of FreeFrame and waits until it answers. |
+| `sudo freeframe uninstall` | Removes FreeFrame from the server, after a final backup, and keeps its data unless you add `--delete-data`. `--dry-run` shows what it would do. See [Removing FreeFrame](#removing-freeframe). |
 
 **Updating.** Run `sudo freeframe update`. It saves a backup of the database first, then downloads and starts the new version, and prints the version before and after. If the new version does not come up, it says so and tells you to run `sudo freeframe rollback`. The rollback puts back the previous version and the database as it was just before the update, so anything people did in FreeFrame after the update began is lost. It keeps the server on the old version until you remove the `FREEFRAME_VERSION` line from `/opt/freeframe/.env.prod`.
 
@@ -190,6 +191,32 @@ After the install, the `freeframe` command is on the server. All commands need `
    - If the old server used the free automatic (`sslip.io`) address, run `sudo freeframe configure --https sslip --yes`. It works out the new server's own automatic address from its public IP address.
    - Otherwise, run `sudo freeframe configure` and type the new web address: your domain, or the new server's IP address for "this network only".
 7. If footage was kept on the old server, copy the media to the new one as well; the restore brings back the database only. Using your own S3 bucket avoids this: the new server simply uses the same bucket.
+
+### Removing FreeFrame
+
+`sudo freeframe uninstall` removes what the installer set up. Run `sudo freeframe uninstall --dry-run` first: it prints exactly what would be removed and kept, and changes nothing.
+
+It says what it will do and asks you to type the web address (or the word `remove`). Then, in this order, it:
+
+1. **Saves a final backup** of the database (starting the database on its own if FreeFrame is stopped) and moves it, every backup in `/opt/freeframe/backups`, `install.log` and a copy of `.env.prod` to `/root/freeframe-removed-<date>-<time>/`, readable by root only. If the backup fails, nothing is removed. `--skip-backup` makes no final backup; in a terminal you confirm that by typing `no backup`.
+2. **Removes** FreeFrame's containers and network, the nightly backup timer, `/opt/freeframe` and, last, the `freeframe` command.
+3. **Keeps your data** in its Docker volumes: `freeframe_pgdata` (the database), `freeframe_miniodata` (footage kept on the server), `freeframe_letsencrypt` (the certificates) and `freeframe_redisdata` (the job queue). It prints their names and the command that deletes them later. Footage in your own S3 bucket is never touched.
+
+Docker and its images, NVIDIA's container toolkit, the apt sources, the swap file and the firewall rules are left alone; it prints how to remove each if you want to.
+
+**Putting FreeFrame back.** With the volumes kept, put the saved settings back and run the install command. It uses the settings and the volumes, so the database, footage and certificates come back. It still asks for an admin account, but the database already has one, so none is made: sign in as before.
+
+```bash
+sudo mkdir -p /opt/freeframe
+sudo install -m 600 /root/freeframe-removed-<date>-<time>/.env.prod /opt/freeframe/.env.prod
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/latest/install.sh)"
+```
+
+Without the settings file the installer refuses the kept volumes (they look like a FreeFrame set up by hand) and points at the saved settings. If the volumes are gone, the same steps give an empty FreeFrame; then `sudo freeframe restore /root/freeframe-removed-<date>-<time>/freeframe-<date>-<time>.dump` puts the final backup back. A backup holds the database only, not footage kept on the server.
+
+**Deleting the data too.** `--delete-data` also deletes the volumes, for good. It asks you to type `delete`, even with `--yes`. For an unattended run, give all three: `sudo freeframe uninstall --yes --delete-data --confirm-delete-data`. Without `--yes`, `uninstall` needs a terminal to ask in; with `--yes` it asks nothing, apart from the `delete` question.
+
+If an update or a restore did not finish, `uninstall` still runs, and says first what is lost: an unfinished update's way back (`sudo freeframe rollback`), or, after an unfinished restore, that the database may be empty (the copy from before that restore is kept with the other backups). It refuses a server that runs FreeFrame set up by hand, and waits its turn behind another `freeframe` command.
 
 ### Unattended installs (cloud-init, Ansible)
 
