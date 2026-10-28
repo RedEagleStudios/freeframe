@@ -253,7 +253,7 @@ SCRIPT
 
 @test "update: a failed image download puts the setup files from before back and drops the record" {
   cp "$FF_ROOT/docker-compose.images.yml" "$BATS_TEST_TMPDIR/images.before"
-  export STUB_PULL_FAIL=1
+  export STUB_PULL_FAIL=1 STUB_PULL_ERR='dial tcp: lookup ghcr.io: no such host'
   ff update
   [ "$status" -eq 1 ]
   assert_out "could not be downloaded"
@@ -333,6 +333,48 @@ SCRIPT
   assert_not_called "fetch latest"
   assert_has "$ENV" "FREEFRAME_CHANNEL=stable"
   assert_has "$FF_ROOT/$(env_backups | head -1)" "FREEFRAME_CHANNEL=latest"
+}
+
+@test "update: a release that is not published is not reported as a network problem, and nothing was changed" {
+  cp "$FF_ROOT/docker-compose.images.yml" "$BATS_TEST_TMPDIR/images.before"
+  export STUB_PULL_FAIL=1 STUB_PULL_ERR='Error response from daemon: manifest unknown'
+  ff update
+  [ "$status" -eq 1 ]
+  assert_out "FreeFrame 1.22.0 is not available on ghcr.io yet (the release may not be published, or its images are not public)."
+  assert_out "check https://github.com/Techiebutler/freeframe/releases for a newer release, then run sudo freeframe update again later. Nothing was changed, so running it again is safe."
+  assert_no_out "can reach ghcr.io"
+  assert_no_out "could not be downloaded"
+  assert_not_called "dc up -d"
+  cmp "$FF_ROOT/docker-compose.images.yml" "$BATS_TEST_TMPDIR/images.before"
+}
+
+@test "update: a download that cannot reach ghcr.io keeps the network advice" {
+  export STUB_PULL_FAIL=1 STUB_PULL_ERR='Error response from daemon: Get "https://ghcr.io/v2/": dial tcp 140.82.112.34:443: i/o timeout'
+  ff update
+  [ "$status" -eq 1 ]
+  assert_out "FreeFrame 1.22.0 could not be downloaded."
+  assert_out "check that this server can reach ghcr.io, then run sudo freeframe update again."
+  assert_no_out "is not available on ghcr.io"
+}
+
+@test "update: a full disk during the download says so and shows how to see the free space" {
+  export STUB_PULL_FAIL=1 STUB_PULL_ERR='failed to register layer: no space left on device'
+  ff update
+  [ "$status" -eq 1 ]
+  assert_out "The disk is full"
+  assert_out "df -h /var/lib/docker"
+  assert_out "then run sudo freeframe update again."
+  assert_no_out "can reach ghcr.io"
+}
+
+@test "update: a download that fails for another reason points at install.log without guessing" {
+  export STUB_PULL_FAIL=1 STUB_PULL_ERR='something unexpected happened'
+  ff update
+  [ "$status" -eq 1 ]
+  assert_out "The download of FreeFrame 1.22.0 from ghcr.io failed."
+  assert_out "install.log"
+  assert_no_out "can reach ghcr.io"
+  assert_no_out "is not available on ghcr.io"
 }
 
 @test "update: --channel is not saved when the update fails, at any step" {

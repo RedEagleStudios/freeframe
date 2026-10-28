@@ -74,6 +74,15 @@ assert_out() {
   fi
 }
 
+assert_no_out() {
+  if [[ $output == *"$1"* ]]; then
+    echo "expected output not to contain: $1"
+    echo "--- output ---"
+    echo "$output"
+    return 1
+  fi
+}
+
 # FF_ROOT holds nothing at all.
 assert_root_untouched() {
   local left
@@ -2104,4 +2113,102 @@ SUDO_C_LATEST='sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Tech
   # An explicit --channel still wins.
   run bash -c 'source "$1"; main install --channel v1.22.0 --bogus' ff "$FF_SCRIPT"
   assert_out 'sudo FREEFRAME_CHANNEL=v1.22.0 bash -c "$(curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/v1.22.0/install.sh)" install --help'
+}
+
+# ------------------------------------------------- why the download failed
+
+# _pull_kind OUTPUT: what _ff_pull_failure_kind says about docker's output.
+_pull_kind() { bash -c 'source "$1"; _ff_pull_failure_kind "$2"' ff-kind "$FF_SCRIPT" "$1"; }
+
+@test "pull failure kind: a release that is not published or not public" {
+  local o
+  for o in \
+    'Error response from daemon: manifest unknown' \
+    'Error response from daemon: Head "https://ghcr.io/v2/techiebutler/freeframe-api/manifests/9.9.9": denied' \
+    ' api Error failed to resolve reference "ghcr.io/techiebutler/freeframe-api:9.9.9": ghcr.io/techiebutler/freeframe-api:9.9.9: not found' \
+    'Error response from daemon: error from registry: requested access to the resource is denied' \
+    'Error response from daemon: Head "https://ghcr.io/v2/techiebutler/freeframe-web/manifests/1.2.3": unauthorized' \
+    'pull access denied for ghcr.io/techiebutler/freeframe-web, repository does not exist or may require authorization: Requested access to the resource is denied'; do
+    run _pull_kind "$o"
+    [ "$status" -eq 0 ]
+    assert_eq "$output" missing
+  done
+}
+
+@test "pull failure kind: the registry cannot be reached" {
+  local o
+  for o in \
+    'Error response from daemon: Get "https://ghcr.io/v2/": dial tcp: lookup ghcr.io on 127.0.0.53:53: no such host' \
+    'Error response from daemon: Get "https://ghcr.io/v2/": dial tcp 140.82.112.34:443: i/o timeout' \
+    'Error response from daemon: Get "https://ghcr.io/v2/": dial tcp 140.82.112.34:443: connect: connection refused' \
+    'Error response from daemon: Get "https://ghcr.io/v2/": net/http: TLS handshake timeout' \
+    'Error response from daemon: Get "https://ghcr.io/v2/": dial tcp 2606:50c0::1:443: connect: network is unreachable'; do
+    run _pull_kind "$o"
+    [ "$status" -eq 0 ]
+    assert_eq "$output" network
+  done
+}
+
+@test "pull failure kind: a full disk wins over the other words around it" {
+  run _pull_kind 'failed to register layer: write /var/lib/docker/tmp/x: no space left on device'
+  assert_eq "$output" disk
+  run _pull_kind 'Error response from daemon: Get "https://ghcr.io/v2/": dial tcp: lookup ghcr.io: no such host
+write /var/lib/docker/tmp/x: no space left on device'
+  assert_eq "$output" disk
+}
+
+@test "pull failure kind: anything else, an empty output, or a missing program, is other" {
+  local o
+  for o in '' 'something unexpected happened' 'error getting credentials - err: exec: "docker-credential-desktop": executable file not found in $PATH'; do
+    run _pull_kind "$o"
+    [ "$status" -eq 0 ]
+    assert_eq "$output" other
+  done
+}
+
+@test "install: a release that is not published is not reported as a network problem" {
+  plain_answers
+  export STUB_PULL_FAIL=1 STUB_PULL_ERR='Error response from daemon: manifest unknown'
+  ff_install --yes
+  [ "$status" -eq 1 ]
+  assert_out "is not available on ghcr.io yet (the release may not be published, or its images are not public)."
+  assert_out "check https://github.com/Techiebutler/freeframe/releases for a newer release; to pin a release that is published, set FREEFRAME_VERSION in $FF_ROOT/.env.prod, then run sudo freeframe install again."
+  assert_out "continues from here"
+  assert_no_out "can reach ghcr.io"
+  assert_no_out "could not be downloaded"
+  # What docker said is in the log, for whoever has to look.
+  grep -q "manifest unknown" "$FF_ROOT/install.log"
+}
+
+@test "install: a download that cannot reach ghcr.io keeps the network advice" {
+  plain_answers
+  export STUB_PULL_FAIL=1 STUB_PULL_ERR='Error response from daemon: Get "https://ghcr.io/v2/": dial tcp: lookup ghcr.io: no such host'
+  ff_install --yes
+  [ "$status" -eq 1 ]
+  assert_out "could not be downloaded."
+  assert_out "check that this server can reach ghcr.io, then run sudo freeframe install again."
+  assert_no_out "is not available on ghcr.io"
+}
+
+@test "install: a full disk during the download says so and shows how to see the free space" {
+  plain_answers
+  export STUB_PULL_FAIL=1 STUB_PULL_ERR='failed to register layer: no space left on device'
+  ff_install --yes
+  [ "$status" -eq 1 ]
+  assert_out "The disk is full"
+  assert_out "df -h /var/lib/docker"
+  assert_out "then run sudo freeframe install again."
+  assert_no_out "can reach ghcr.io"
+}
+
+@test "install: a download that fails for another reason points at install.log without guessing" {
+  plain_answers
+  export STUB_PULL_FAIL=1 STUB_PULL_ERR='something unexpected happened'
+  ff_install --yes
+  [ "$status" -eq 1 ]
+  assert_out "from ghcr.io failed."
+  assert_out "install.log"
+  assert_no_out "can reach ghcr.io"
+  assert_no_out "is not available on ghcr.io"
+  assert_no_out "disk is full"
 }

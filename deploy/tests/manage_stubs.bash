@@ -217,7 +217,10 @@ dc() {
       ;;
     pull*)
       [[ -z ${STUB_PULL_HANG:-} ]] || _stub_hang pull
-      [[ -z ${STUB_PULL_FAIL:-} ]]
+      # STUB_PULL_FAIL: the download fails; STUB_PULL_ERR is what docker prints.
+      [[ -n ${STUB_PULL_FAIL:-} ]] || return 0
+      [[ -z ${STUB_PULL_ERR:-} ]] || printf '%s\n' "$STUB_PULL_ERR" >&2
+      return 1
       ;;
     "up -d"*) [[ -z ${STUB_UP_FAIL:-} ]] ;;
     "logs "*) printf 'api-1  | started\n' ;;

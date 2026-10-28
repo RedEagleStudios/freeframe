@@ -125,7 +125,12 @@ dc() {
       ;;
     "ps -q "*) [[ -z ${STUB_OURS_RUNNING:-} ]] || echo 0123456789ab ;;
     "stop traefik") [[ -n ${STUB_TRAEFIK_STUCK:-} ]] || : >"$STUB_DIR/traefik-stopped" ;;
-    pull*) [[ -z ${STUB_PULL_FAIL:-} ]] ;;
+    # STUB_PULL_FAIL: the download fails; STUB_PULL_ERR is what docker prints.
+    pull*)
+      [[ -n ${STUB_PULL_FAIL:-} ]] || return 0
+      [[ -z ${STUB_PULL_ERR:-} ]] || printf '%s\n' "$STUB_PULL_ERR" >&2
+      return 1
+      ;;
     *) return 0 ;;
   esac
 }

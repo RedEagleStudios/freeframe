@@ -2808,14 +2808,83 @@ _install_traefik_closed() {
   fi
 }
 
+# _ff_pull_failure_kind OUTPUT: why `docker compose pull` failed, from what it
+# printed: missing (the release is not published, or its images are not
+# public), network (ghcr.io cannot be reached), disk (the disk is full) or
+# other. A full disk is checked first, since it can show up next to the other
+# messages. Pure: prints one word and nothing else.
+_ff_pull_failure_kind() {
+  local o=${1,,}
+  if [[ $o == *"no space left on device"* ]]; then
+    printf 'disk'
+  elif [[ $o == *"dial tcp"* || $o == *"no such host"* || $o == *"i/o timeout"* ||
+    $o == *"connection refused"* || $o == *"tls handshake timeout"* ||
+    $o == *"network is unreachable"* ]]; then
+    printf 'network'
+  elif [[ $o == *"executable file not found"* ]]; then
+    # A missing helper program (a credentials helper), not a missing release.
+    printf 'other'
+  elif [[ $o == *"not found"* || $o == *"manifest unknown"* || $o == *"denied"* ||
+    $o == *"unauthorized"* ]]; then
+    printf 'missing'
+  else
+    printf 'other'
+  fi
+}
+
+# _ff_pull_logged: `dc pull`, with its output (both streams) going to
+# install.log as before, and kept in FF_PULL_OUT so that a failure can be told
+# apart. The output is only ever classified, never shown.
+_ff_pull_logged() {
+  local rc=0
+  FF_PULL_OUT=$(dc pull 2>&1) || rc=$?
+  if [[ -n $FF_PULL_OUT ]]; then printf '%s\n' "$FF_PULL_OUT" >>"${FF_LOG:-/dev/null}"; fi
+  return "$rc"
+}
+
+# _ff_pull_failure_text COMMAND VERSION: sets FF_PULL_MSG and FF_PULL_TRY for
+# the download that just failed (COMMAND is install or update), from the
+# output _ff_pull_logged kept. In an update nothing has changed yet, which
+# the advice says.
+_ff_pull_failure_text() {
+  local cmd=$1 v=$2 subj="FreeFrame" again kind
+  [[ -z $v || $v == unknown ]] || subj="FreeFrame $v"
+  again="then run sudo freeframe $cmd again."
+  kind=$(_ff_pull_failure_kind "${FF_PULL_OUT:-}")
+  case $kind in
+    missing)
+      if [[ -z $v || $v == unknown ]]; then subj="This release of FreeFrame"; fi
+      FF_PULL_MSG="$subj is not available on ghcr.io yet (the release may not be published, or its images are not public)."
+      if [[ $cmd == update ]]; then
+        FF_PULL_TRY="check https://github.com/Techiebutler/freeframe/releases for a newer release, then run sudo freeframe update again later. Nothing was changed, so running it again is safe."
+      else
+        FF_PULL_TRY="check https://github.com/Techiebutler/freeframe/releases for a newer release; to pin a release that is published, set FREEFRAME_VERSION in $(ff_root)/.env.prod, $again"
+      fi
+      ;;
+    network)
+      FF_PULL_MSG="$subj could not be downloaded."
+      FF_PULL_TRY="check that this server can reach ghcr.io, $again"
+      ;;
+    disk)
+      FF_PULL_MSG="The disk is full, so $subj could not be downloaded."
+      FF_PULL_TRY="free some space (see how much is left with: df -h /var/lib/docker), $again"
+      ;;
+    *)
+      FF_PULL_MSG="The download of $subj from ghcr.io failed."
+      FF_PULL_TRY="read the end of ${FF_LOG:-$(ff_root)/install.log} to see what Docker said, $again"
+      ;;
+  esac
+}
+
 _install_start_step() {
   local out s
   local -a all=() svcs=()
   if [[ ${FF_SKIP_PULL:-} != 1 ]]; then
     FF_STEP="downloading FreeFrame"
     _ff_p "Downloading FreeFrame (about 2 GB; this can take a few minutes)..."
-    if ! _ff_logged dc pull; then
-      install_fail "FreeFrame could not be downloaded." "check that this server can reach ghcr.io, then run sudo freeframe install again."
+    if ! _ff_pull_logged; then
+      _ff_pull_failure_text install "$(ff_version)"
+      install_fail "$FF_PULL_MSG" "$FF_PULL_TRY"
     fi
   fi
   FF_STEP="starting FreeFrame"
@@ -4483,9 +4552,9 @@ cmd_update() {
   if [[ ${FF_SKIP_PULL:-} != 1 ]]; then
     FF_STEP="downloading FreeFrame $new"
     say "Downloading FreeFrame $new (this can take a few minutes)..."
-    if ! _ff_logged dc pull; then
-      _update_fail_undone "FreeFrame $new could not be downloaded." \
-        "check that this server can reach ghcr.io, then run sudo freeframe update again."
+    if ! _ff_pull_logged; then
+      _ff_pull_failure_text update "$new"
+      _update_fail_undone "$FF_PULL_MSG" "$FF_PULL_TRY"
     fi
   fi
 
