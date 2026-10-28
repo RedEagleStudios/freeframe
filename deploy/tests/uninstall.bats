@@ -1,0 +1,650 @@
+#!/usr/bin/env bats
+# `freeframe uninstall`: a final backup first, then FreeFrame's containers,
+# its nightly backup, $FF_ROOT and the command, keeping the Docker volumes
+# unless --delete-data. Side effects stubbed (uninstall_stubs.bash): Docker's
+# objects are lines in files, $FF_ROOT_HOME stands in for /root.
+#
+# shellcheck disable=SC2154 # bats' run sets $output and $status
+
+load manage_helpers
+
+setup() {
+  manage_setup
+  STUBS="${BATS_TEST_DIRNAME}/uninstall_stubs.bash"
+  installed_server sslip bundled 1.21.0
+  export FF_ROOT_HOME="$BATS_TEST_TMPDIR/roothome"
+  mkdir -p "$FF_ROOT_HOME"
+  chmod 700 "$FF_ROOT_HOME"
+  export FF_FSTAB="$BATS_TEST_TMPDIR/fstab"
+  : >"$FF_FSTAB"
+  # The nightly backup as install_backup_timer leaves it.
+  cp "$FF_ROOT"/systemd/freeframe-backup.* "$FF_SYSTEMD_DIR/"
+  mkdir -p "$FF_SYSTEMD_DIR/timers.target.wants"
+  ln -s ../freeframe-backup.timer "$FF_SYSTEMD_DIR/timers.target.wants/freeframe-backup.timer"
+  # Two nightly backups and the log.
+  mkdir -p "$BK"
+  chmod 700 "$BK"
+  local s
+  for s in 20261026-030000 20261027-030000; do
+    printf 'PGDMP %s\n' "$s" >"$BK/freeframe-$s.dump"
+    cp "$ENV" "$BK/freeframe-$s.env.prod"
+  done
+  chmod 600 "$BK"/*
+  printf '===== freeframe install =====\n' >"$FF_ROOT/install.log"
+  dk_server
+}
+
+# dk_server: the containers, volumes and network `freeframe install` makes,
+# plus another project's volume and Docker's own network.
+dk_server() {
+  local d="$STUB_DIR/dk" s image
+  mkdir -p "$d"
+  : >"$d/containers"
+  for s in traefik postgres redis api worker email_worker maintenance_worker beat web minio; do
+    case $s in
+      api | worker | email_worker | maintenance_worker | beat) image=ghcr.io/techiebutler/freeframe-api:1.21.0 ;;
+      web) image=ghcr.io/techiebutler/freeframe-web:1.21.0 ;;
+      *) image=$s:latest ;;
+    esac
+    printf 'id-%s|freeframe|%s|%s|%s\n' "$s" "$FF_ROOT" "$s" "$image" >>"$d/containers"
+  done
+  printf '%s\n' 'freeframe_pgdata|freeframe' 'freeframe_redisdata|freeframe' 'freeframe_letsencrypt|freeframe' \
+    'freeframe_miniodata|freeframe' 'other_data|other' >"$d/volumes"
+  printf '%s\n' 'net-ff|freeframe_default|freeframe' 'net-br|bridge|' >"$d/networks"
+}
+
+# saved_dir: the one folder an uninstall saved its files in.
+saved_dir() {
+  local d
+  d=$(find "$FF_ROOT_HOME" -mindepth 1 -maxdepth 1 -name 'freeframe-removed-*' -type d)
+  [[ -n $d && $(printf '%s\n' "$d" | wc -l) -eq 1 ]] || { echo "saved folders: '$d'"; return 1; }
+  printf '%s' "$d"
+}
+
+# answers LINE...: what is typed at the terminal, one line per question.
+answers() {
+  printf '%s\n' "$@" >"$BATS_TEST_TMPDIR/tty"
+  export FF_TTY="$BATS_TEST_TMPDIR/tty"
+}
+
+# assert_nothing_changed: nothing removed, moved or stopped.
+assert_nothing_changed() {
+  [ -f "$ENV" ] || { echo "the settings file is gone"; return 1; }
+  [ -f "$FF_ROOT/.installed" ]
+  [ -x "$FF_BIN_DIR/freeframe" ]
+  [ -f "$FF_SYSTEMD_DIR/freeframe-backup.timer" ]
+  [ -f "$BK/freeframe-20261026-030000.dump" ]
+  grep -q '^id-api|' "$STUB_DIR/dk/containers"
+  grep -q '^freeframe_pgdata|' "$STUB_DIR/dk/volumes"
+  assert_not_called "dc down"
+  assert_not_called "systemctl disable"
+  assert_not_called "docker rm"
+  assert_not_called "docker volume rm"
+  assert_not_called "rm -rf"
+  [ -z "$(ls -A "$FF_ROOT_HOME")" ] || { echo "saved: $(ls -A "$FF_ROOT_HOME")"; return 1; }
+}
+
+# assert_removed: everything this installer set up is gone.
+assert_removed() {
+  [ ! -e "$FF_ROOT" ] || { echo "left in $FF_ROOT:"; ls -A "$FF_ROOT"; return 1; }
+  [ ! -e "$FF_BIN_DIR/freeframe" ]
+  [ ! -e "$FF_SYSTEMD_DIR/freeframe-backup.timer" ]
+  [ ! -e "$FF_SYSTEMD_DIR/freeframe-backup.service" ]
+  [ ! -L "$FF_SYSTEMD_DIR/timers.target.wants/freeframe-backup.timer" ]
+  ! grep -q '|freeframe|' "$STUB_DIR/dk/containers"
+  ! grep -q '|freeframe$' "$STUB_DIR/dk/networks"
+}
+
+# --- Refusals ------------------------------------------------------------
+
+@test "uninstall: needs root, and changes nothing without it" {
+  STUB_NOT_ROOT=1 ff uninstall --yes
+  [ "$status" -eq 2 ]
+  assert_out "Please run this as root."
+  assert_out "sudo freeframe uninstall"
+  assert_nothing_changed
+}
+
+@test "uninstall: with no FreeFrame from this installer there is nothing to remove, and nothing changes" {
+  rm -f "$ENV" "$FF_ROOT/.installed"
+  ff uninstall --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "there is nothing to remove"
+  assert_out "Nothing was changed."
+  assert_not_called "dc "
+  assert_not_called "systemctl"
+  assert_not_called "docker rm"
+  assert_not_called "rm -rf"
+  [ -x "$FF_BIN_DIR/freeframe" ]
+  [ -f "$BK/freeframe-20261026-030000.dump" ]
+  [ -z "$(ls -A "$FF_ROOT_HOME")" ]
+  # The folder holds backups: it is never offered for deletion.
+  assert_out "backups"
+  assert_no_out "sudo rm -rf"
+}
+
+@test "uninstall: a FreeFrame set up by hand is refused and never touched" {
+  printf '%s\n' "id-clone|freeframe|/home/me/freeframe|api|freeframe-api" >>"$STUB_DIR/dk/containers"
+  ff uninstall --yes
+  [ "$status" -eq 3 ] || { echo "$output"; false; }
+  assert_out "set up by hand"
+  assert_out "nothing was changed"
+  assert_nothing_changed
+  grep -q '^id-clone|' "$STUB_DIR/dk/containers"
+}
+
+@test "uninstall: a git checkout in the FreeFrame folder is refused" {
+  mkdir "$FF_ROOT/.git"
+  ff uninstall --yes
+  [ "$status" -eq 3 ]
+  assert_out "set up by hand"
+  assert_nothing_changed
+}
+
+@test "uninstall: Docker not answering stops before changing anything" {
+  STUB_DOCKER_DOWN=1 ff uninstall --yes
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  assert_out "stopped before changing anything"
+  assert_out "sudo systemctl start docker"
+  assert_nothing_changed
+}
+
+@test "uninstall: waits its turn behind another freeframe command, with the busy message" {
+  command -v flock >/dev/null || skip "no flock"
+  exec 9>>"$FF_ROOT/.freeframe.lock"
+  flock -n 9
+  ff uninstall --yes
+  exec 9>&-
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  assert_out "Another freeframe command (an update, rollback, backup, restore, restart, configure or uninstall) is running right now, so the uninstall did not start. Nothing was changed."
+  assert_not_called "pg_dump"
+  assert_nothing_changed
+}
+
+@test "uninstall: other words and answers are refused" {
+  ff uninstall now
+  [ "$status" -eq 2 ]
+  assert_out "freeframe uninstall takes no other words"
+  ff uninstall --yes --domain review.example.com
+  [ "$status" -eq 2 ]
+  assert_out "--domain"
+  assert_nothing_changed
+}
+
+@test "uninstall options belong to uninstall only" {
+  local o
+  for o in --dry-run --delete-data --confirm-delete-data --skip-backup; do
+    ff status "$o"
+    [ "$status" -eq 2 ] || { echo "$o: $output"; false; }
+    assert_out "$o"
+    assert_out "freeframe uninstall"
+  done
+  assert_not_called "probe_health"
+}
+
+@test "uninstall: --confirm-delete-data without --delete-data is a mistake, not a deletion" {
+  ff uninstall --yes --confirm-delete-data
+  [ "$status" -eq 2 ]
+  assert_out "--confirm-delete-data"
+  assert_out "--delete-data"
+  assert_nothing_changed
+}
+
+# --- Confirmation --------------------------------------------------------
+
+@test "uninstall: with no terminal and no --yes it refuses and names --yes" {
+  ff uninstall
+  [ "$status" -eq 2 ] || { echo "$output"; false; }
+  assert_out "no terminal here to ask"
+  assert_out "sudo freeframe uninstall --yes"
+  assert_nothing_changed
+}
+
+@test "uninstall: explains what is removed and kept, and a wrong answer cancels" {
+  answers "yes"
+  ff uninstall
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  assert_out "This removes FreeFrame from this server:"
+  assert_out "It keeps:"
+  assert_out "freeframe_pgdata"
+  assert_out "the database"
+  assert_out "freeframe_miniodata"
+  assert_out "type its web address (203-0-113-7.sslip.io) or the word remove"
+  assert_out "Uninstall cancelled. Nothing was changed."
+  assert_nothing_changed
+}
+
+@test "uninstall: typing the web address goes ahead" {
+  answers "203-0-113-7.sslip.io"
+  ff uninstall
+  [ "$status" -eq 0 ] || { echo "$output"; cat "$CALLS"; false; }
+  assert_removed
+}
+
+@test "uninstall: typing the full address, in capitals, goes ahead" {
+  answers "HTTPS://203-0-113-7.SSLIP.IO/"
+  ff uninstall
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_removed
+}
+
+@test "uninstall: typing remove goes ahead" {
+  answers " remove "
+  ff uninstall
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_removed
+}
+
+@test "uninstall: the answers ending cancels" {
+  answers
+  ff uninstall
+  [ "$status" -eq 1 ]
+  assert_out "Nothing was changed."
+  assert_nothing_changed
+}
+
+# --- The run -------------------------------------------------------------
+
+@test "uninstall --yes: final backup, everything moved to the saved folder, FreeFrame removed, volumes kept" {
+  ff uninstall --yes
+  [ "$status" -eq 0 ] || { echo "$output"; cat "$CALLS"; false; }
+  assert_removed
+  local d f final
+  d=$(saved_dir)
+  [[ ${d##*/} =~ ^freeframe-removed-[0-9]{8}-[0-9]{6}$ ]]
+  [ "$(stat -c %a "$d" 2>/dev/null || stat -f %Lp "$d")" = 700 ]
+  # The two earlier backups and the final one, with their settings copies.
+  [ -f "$d/freeframe-20261026-030000.dump" ]
+  [ -f "$d/freeframe-20261027-030000.env.prod" ]
+  final=$(cd "$d" && ls freeframe-*.dump | grep -v -e 20261026-030000 -e 20261027-030000)
+  [ -n "$final" ]
+  grep -q '^PGDMP current database' "$d/$final"
+  [ -f "$d/${final%.dump}.env.prod" ]
+  # A copy of the settings and the log.
+  [ -f "$d/.env.prod" ]
+  [ -f "$d/install.log" ]
+  grep -q '===== freeframe install =====' "$d/install.log"
+  grep -q '===== freeframe uninstall' "$d/install.log"
+  for f in "$d"/* "$d"/.env.prod; do
+    [ "$(stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f")" = 600 ] || { echo "$f is not 600"; false; }
+  done
+  # The settings copy is the settings, byte for byte.
+  grep -q '^JWT_SECRET=' "$d/.env.prod"
+  # Volumes kept, named, with the command that deletes them later.
+  grep -q '^freeframe_pgdata|' "$STUB_DIR/dk/volumes"
+  grep -q '^freeframe_miniodata|' "$STUB_DIR/dk/volumes"
+  assert_not_called "docker volume rm"
+  assert_not_called "--volumes"
+  assert_out "FreeFrame has been removed from this server."
+  assert_out "sudo docker volume rm freeframe_letsencrypt freeframe_miniodata freeframe_pgdata freeframe_redisdata"
+  assert_no_out "other_data"
+  # The way back.
+  assert_out "sudo mkdir -p '$FF_ROOT'"
+  assert_out "sudo install -m 600 '$d/.env.prod' '$FF_ROOT/.env.prod'"
+  assert_out 'sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Techiebutler/freeframe/latest/install.sh)"'
+  assert_out "sudo freeframe restore '$d/$final'"
+  # Left alone, with how to remove each.
+  assert_out "sudo docker image prune -a"
+  assert_out "sudo apt remove docker-ce"
+  assert_not_called "docker image"
+  assert_not_called "apt"
+  assert_not_called "ufw"
+}
+
+@test "uninstall: the backup comes before any removal, and the command goes last" {
+  ff uninstall --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_order "dc exec -T postgres pg_dump" "dc config -q" "dc down --remove-orphans" \
+    "systemctl disable --now freeframe-backup.timer" "systemctl daemon-reload" \
+    "rm -rf -- $FF_ROOT" "rm -f -- $FF_BIN_DIR/freeframe"
+  # Nothing is removed before the backup is saved.
+  local first_removal backup
+  backup=$(grep -n 'pg_dump' "$CALLS" | head -1 | cut -d: -f1)
+  first_removal=$(grep -n -E '^(dc down|systemctl disable|docker rm|docker volume rm|rm -rf)' "$CALLS" | head -1 | cut -d: -f1)
+  ((backup < first_removal))
+  # The command is the last thing removed.
+  [ "$(grep -E '^(rm |dc down|docker rm|docker volume rm|docker network rm|systemctl)' "$CALLS" | tail -1)" = "rm -f -- $FF_BIN_DIR/freeframe" ]
+}
+
+@test "uninstall: a stopped database is started on its own for the final backup" {
+  STUB_PG_STOPPED=1 ff uninstall --yes
+  [ "$status" -eq 0 ] || { echo "$output"; cat "$CALLS"; false; }
+  assert_order "dc up -d --no-build postgres" "dc exec -T postgres pg_dump" "dc down"
+  assert_not_called "dc up -d --no-build --"
+  assert_removed
+}
+
+@test "uninstall: a backup that fails stops everything, with nothing removed, and names --skip-backup" {
+  STUB_PG_DOWN=1 FF_BACKUP_DB_WAIT=5 ff uninstall --yes
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  assert_out "The final backup could not be made, so nothing was removed."
+  assert_out "sudo freeframe uninstall --skip-backup"
+  assert_nothing_changed
+  [ -f "$FF_ROOT/install.log" ]
+}
+
+@test "uninstall: a backup that fails stops the database again when it was this run that started it" {
+  STUB_PG_STOPPED=1 STUB_PG_DOWN=1 FF_BACKUP_DB_WAIT=5 ff uninstall --yes
+  [ "$status" -eq 1 ]
+  assert_order "dc up -d --no-build postgres" "dc stop postgres"
+  assert_nothing_changed
+}
+
+@test "uninstall --skip-backup --yes: no final backup, the earlier ones still kept" {
+  ff uninstall --yes --skip-backup
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_not_called "pg_dump"
+  assert_not_called "pg_isready"
+  local d
+  d=$(saved_dir)
+  [ "$(cd "$d" && ls freeframe-*.dump)" = "$(printf '%s\n' freeframe-20261026-030000.dump freeframe-20261027-030000.dump)" ]
+  [ -f "$d/.env.prod" ]
+  assert_out "No final backup was made (--skip-backup)"
+  assert_removed
+}
+
+@test "uninstall --skip-backup in a terminal asks for it again in words" {
+  answers "remove" "yes"
+  ff uninstall --skip-backup
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  assert_out "type: no backup"
+  assert_out "Uninstall cancelled. Nothing was changed."
+  assert_nothing_changed
+  answers "remove" "no backup"
+  ff uninstall --skip-backup
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_not_called "pg_dump"
+  assert_removed
+}
+
+# --- Data ----------------------------------------------------------------
+
+@test "uninstall --delete-data in a terminal needs delete typed as well" {
+  answers "remove" "yes"
+  ff uninstall --delete-data
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  assert_out "type: delete"
+  assert_out "Uninstall cancelled. Nothing was changed."
+  assert_nothing_changed
+  answers "remove" "delete"
+  ff uninstall --delete-data
+  [ "$status" -eq 0 ] || { echo "$output"; cat "$CALLS"; false; }
+  assert_removed
+  ! grep -q '|freeframe$' "$STUB_DIR/dk/volumes"
+  grep -q '^other_data|other$' "$STUB_DIR/dk/volumes"
+  assert_order "dc exec -T postgres pg_dump" "dc down" "docker volume rm freeframe_letsencrypt" "rm -rf -- $FF_ROOT"
+  assert_out "Deleted for good: the Docker volumes freeframe_letsencrypt, freeframe_miniodata, freeframe_pgdata and freeframe_redisdata"
+  assert_no_out "sudo docker volume rm"
+}
+
+@test "uninstall --yes --delete-data still asks for delete on a terminal" {
+  answers "no"
+  ff uninstall --yes --delete-data
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  assert_out "type: delete"
+  assert_nothing_changed
+}
+
+@test "uninstall --yes --delete-data with no terminal refuses and names --confirm-delete-data" {
+  ff uninstall --yes --delete-data
+  [ "$status" -eq 2 ] || { echo "$output"; false; }
+  assert_out "--confirm-delete-data"
+  assert_nothing_changed
+}
+
+@test "uninstall --yes --delete-data --confirm-delete-data: unattended, deletes the volumes too" {
+  ff uninstall --yes --delete-data --confirm-delete-data
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_removed
+  ! grep -q '|freeframe$' "$STUB_DIR/dk/volumes"
+  # The final backup is still made first, and kept.
+  local d
+  d=$(saved_dir)
+  [ "$(cd "$d" && ls freeframe-*.dump | wc -l | tr -d ' ')" = 3 ]
+  assert_out "sudo freeframe restore '$d/"
+}
+
+@test "uninstall: volumes that cannot be deleted stop the run and say what is left" {
+  STUB_VOLRM_FAIL=1 ff uninstall --yes --delete-data --confirm-delete-data
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  assert_out "could not be deleted"
+  local d
+  d=$(saved_dir)
+  assert_out "$d"
+  # FreeFrame's folder and command are still here, so a second run can finish.
+  [ -f "$ENV" ]
+  [ -x "$FF_BIN_DIR/freeframe" ]
+}
+
+# --- Fallbacks and leftovers ---------------------------------------------
+
+@test "uninstall: setup files that do not parse fall back to removing by project label" {
+  STUB_CONFIG_FAIL=1 ff uninstall --yes --skip-backup
+  [ "$status" -eq 0 ] || { echo "$output"; cat "$CALLS"; false; }
+  assert_not_called "dc down"
+  grep -q "^docker rm -f id-traefik id-postgres" "$CALLS"
+  grep -q "^docker network rm net-ff$" "$CALLS"
+  assert_removed
+}
+
+@test "uninstall: an unfinished install (settings, no .installed) is removed too" {
+  rm -f "$FF_ROOT/.installed"
+  ff uninstall --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_removed
+}
+
+@test "uninstall: running it twice, the second run says there is nothing to remove" {
+  ff uninstall --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  : >"$CALLS"
+  ff uninstall --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "there is nothing to remove"
+  assert_not_called "dc "
+  assert_not_called "rm -"
+  # The data the first run kept is pointed at, not touched.
+  assert_out "$(saved_dir)"
+  grep -q '^freeframe_pgdata|' "$STUB_DIR/dk/volumes"
+}
+
+@test "uninstall: with nothing installed, a command or folder left by an install that stopped early is named" {
+  rm -f "$ENV" "$FF_ROOT/.installed"
+  rm -rf "$BK"
+  ff uninstall --yes
+  [ "$status" -eq 0 ]
+  assert_out "$FF_BIN_DIR/freeframe"
+  assert_out "sudo rm -rf '$FF_ROOT' '$FF_BIN_DIR/freeframe'"
+  [ -x "$FF_BIN_DIR/freeframe" ]
+}
+
+@test "uninstall: a timer that is already gone is not an error" {
+  rm -f "$FF_SYSTEMD_DIR"/freeframe-backup.* "$FF_SYSTEMD_DIR/timers.target.wants/freeframe-backup.timer"
+  : >"$CALLS"
+  ff uninstall --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_not_called "systemctl disable"
+  assert_removed
+}
+
+@test "uninstall: stopped while removing the folder, the settings file is still there and a second run finishes" {
+  STUB_RM_FAIL=docker-compose.prod.yml ff uninstall --yes
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  assert_out "could not be removed completely"
+  [ -f "$ENV" ]
+  [ -x "$FF_BIN_DIR/freeframe" ]
+  ff uninstall --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_removed
+}
+
+# --- Unfinished records --------------------------------------------------
+
+@test "uninstall: an unfinished restore is warned about, says what is lost, and the uninstall still runs" {
+  printf '%s\n' "$BK/freeframe-20261026-030000.dump" >"$FF_ROOT/.restore-undo"
+  ff uninstall --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "A restore of the database did not finish"
+  assert_out "may be empty"
+  assert_out "freeframe-20261026-030000.dump"
+  [ -f "$(saved_dir)/freeframe-20261026-030000.dump" ]
+  assert_removed
+}
+
+@test "uninstall: an unfinished update is warned about: the way back is lost, its backup is kept" {
+  mkdir -p "$FF_ROOT/rollback"
+  printf 'version=1.20.0\nbackup=%s\ntime=2026-10-27 10:00:00 +0000\nphase=started\n' \
+    "$BK/freeframe-20261027-030000.dump" >"$FF_ROOT/.update-undo"
+  ff uninstall --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "An update did not finish"
+  assert_out "sudo freeframe rollback"
+  assert_out "1.20.0"
+  assert_out "freeframe-20261027-030000.dump"
+  [ -f "$(saved_dir)/freeframe-20261027-030000.dump" ]
+  assert_removed
+}
+
+# --- Dry run -------------------------------------------------------------
+
+@test "uninstall --dry-run: says what would be removed and kept, and changes nothing" {
+  local before after
+  before=$(cd "$FF_ROOT" && find . -print0 | LC_ALL=C sort -z | xargs -0 ls -ld 2>/dev/null | awk '{ print $1, $5, $NF }')
+  cp "$STUB_DIR/dk/containers" "$BATS_TEST_TMPDIR/c.before"
+  cp "$STUB_DIR/dk/volumes" "$BATS_TEST_TMPDIR/v.before"
+  ff uninstall --dry-run
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "Dry run: nothing was changed."
+  assert_out "This removes FreeFrame from this server:"
+  assert_out "10 containers"
+  assert_out "freeframe-backup.timer"
+  assert_out "$FF_ROOT"
+  assert_out "$FF_BIN_DIR/freeframe"
+  assert_out "a final backup of the database"
+  assert_out "2 backups"
+  assert_out "freeframe_pgdata"
+  assert_out "freeframe_miniodata"
+  assert_out "To remove FreeFrame, run: sudo freeframe uninstall"
+  after=$(cd "$FF_ROOT" && find . -print0 | LC_ALL=C sort -z | xargs -0 ls -ld 2>/dev/null | awk '{ print $1, $5, $NF }')
+  assert_eq "$after" "$before"
+  cmp "$STUB_DIR/dk/containers" "$BATS_TEST_TMPDIR/c.before"
+  cmp "$STUB_DIR/dk/volumes" "$BATS_TEST_TMPDIR/v.before"
+  assert_not_called "pg_dump"
+  assert_not_called "dc up"
+  assert_nothing_changed
+  # It does not take the lock: install.log is not even opened.
+  [ "$(cat "$FF_ROOT/install.log")" = "===== freeframe install =====" ]
+}
+
+@test "uninstall --dry-run does not need the lock, and says when another command is running" {
+  command -v flock >/dev/null || skip "no flock"
+  exec 9>>"$FF_ROOT/.freeframe.lock"
+  flock -n 9
+  ff uninstall --dry-run
+  exec 9>&-
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "This removes FreeFrame from this server:"
+  assert_out "Another freeframe command"
+  assert_nothing_changed
+}
+
+@test "uninstall --dry-run --delete-data --skip-backup: the volumes are listed as deleted, and no final backup" {
+  ff uninstall --dry-run --delete-data --skip-backup
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "deleted for good"
+  assert_out "no final backup"
+  assert_out "To remove FreeFrame, run: sudo freeframe uninstall --delete-data --skip-backup"
+  assert_nothing_changed
+}
+
+@test "uninstall --dry-run: footage in an S3 bucket is said to be untouched" {
+  rm -rf "$FF_ROOT" "$BATS_TEST_TMPDIR/bin-dir"
+  mkdir -p "$FF_ROOT"
+  installed_server sslip s3 1.21.0
+  ff uninstall --dry-run
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "the S3 bucket media"
+}
+
+@test "uninstall --dry-run on a server with nothing installed says so" {
+  rm -f "$ENV" "$FF_ROOT/.installed"
+  ff uninstall --dry-run
+  [ "$status" -eq 0 ]
+  assert_out "there is nothing to remove"
+}
+
+@test "uninstall --dry-run of a FreeFrame set up by hand says it would refuse" {
+  printf '%s\n' "id-clone|freeframe|/home/me/freeframe|api|freeframe-api" >>"$STUB_DIR/dk/containers"
+  ff uninstall --dry-run
+  [ "$status" -eq 3 ]
+  assert_out "set up by hand"
+  assert_nothing_changed
+}
+
+# --- Words ---------------------------------------------------------------
+
+@test "uninstall: no secret is ever printed" {
+  local k v secrets=()
+  for k in $SECRET_KEYS; do
+    v=$(env_get "$ENV" "$k")
+    [[ -z $v ]] || secrets+=("$v")
+  done
+  ((${#secrets[@]} >= 4))
+  ff uninstall --dry-run
+  for v in "${secrets[@]}"; do assert_no_out "$v"; done
+  answers "nope"
+  ff uninstall
+  for v in "${secrets[@]}"; do assert_no_out "$v"; done
+  ff uninstall --yes
+  [ "$status" -eq 0 ]
+  for v in "${secrets[@]}"; do assert_no_out "$v"; done
+}
+
+@test "uninstall: what is left alone is named with how to remove it, the optional parts only when present" {
+  ff uninstall --dry-run
+  assert_out "sudo docker image prune -a"
+  assert_no_out "nvidia-container-toolkit"
+  assert_no_out "/swapfile"
+  assert_no_out "ufw delete"
+  printf '/swapfile none swap sw 0 0\n' >"$FF_FSTAB"
+  STUB_UFW=1 STUB_TOOLKIT=1 ff uninstall --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "sudo apt remove nvidia-container-toolkit"
+  assert_out "sudo swapoff /swapfile"
+  assert_out "sudo ufw delete allow 80/tcp"
+  assert_not_called "ufw"
+  assert_not_called "swapoff"
+}
+
+@test "help lists uninstall and its options" {
+  ff help
+  [ "$status" -eq 0 ]
+  assert_out "uninstall"
+  assert_out "--dry-run"
+  assert_out "--skip-backup"
+  assert_out "--delete-data"
+  assert_out "--confirm-delete-data"
+}
+
+@test "the nightly backup behind an uninstall is skipped, not failed" {
+  command -v flock >/dev/null || skip "no flock"
+  exec 9>>"$FF_ROOT/.freeframe.lock"
+  flock -n 9
+  printf 'uninstall %s\n' "$$" >"$FF_ROOT/.freeframe.lock"
+  ff backup --quiet
+  exec 9>&-
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "The nightly backup was skipped: a freeframe uninstall is running right now."
+}
+
+# --- The way back --------------------------------------------------------
+
+@test "after an uninstall, the saved settings put back make the kept volumes this installer's again" {
+  ff uninstall --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  mkdir -p "$FF_ROOT"
+  install -m 600 "$(saved_dir)/.env.prod" "$FF_ROOT/.env.prod"
+  run bash -c 'source "$1"; source "$2"; rc=0; detect_foreign_install || rc=$?; echo "rc=$rc"' \
+    ff-run "$FF_SCRIPT" "$STUBS"
+  assert_out "rc=1"
+}

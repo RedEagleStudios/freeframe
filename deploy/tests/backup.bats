@@ -220,7 +220,7 @@ dumps() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null) || true; }
   ff backup
   exec 8>&-
   [ "$status" -eq 1 ]
-  assert_out "Another freeframe command (an update, rollback, backup, restore, restart or configure) is running right now"
+  assert_out "Another freeframe command (an update, rollback, backup, restore, restart, configure or uninstall) is running right now"
   assert_not_called pg_dump
 }
 
@@ -346,7 +346,7 @@ dumps() { (cd "$BK" && LC_ALL=C ls freeframe-*.dump 2>/dev/null) || true; }
   ff backup --quiet
   exec 8>&-
   [ "$status" -eq 1 ]
-  grep -q "Another freeframe command (an update, rollback, backup, restore, restart or configure) is running right now" "$FF_ROOT/install.log"
+  grep -q "Another freeframe command (an update, rollback, backup, restore, restart, configure or uninstall) is running right now" "$FF_ROOT/install.log"
 }
 
 @test "restore: a failed safety copy is in install.log once, not twice" {

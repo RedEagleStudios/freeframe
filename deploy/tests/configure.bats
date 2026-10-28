@@ -340,7 +340,7 @@ BEFORE() { printf '%s' "$BATS_TEST_TMPDIR/env.before"; }
   ff configure --yes --domain review.yourstudio.com
   exec 9>&-
   [ "$status" -eq 1 ]
-  assert_out "Another freeframe command (an update, rollback, backup, restore, restart or configure) is running right now, so the settings were not changed."
+  assert_out "Another freeframe command (an update, rollback, backup, restore, restart, configure or uninstall) is running right now, so the settings were not changed."
   assert_no_out "did not finish"
   assert_no_out "may be empty"
   cmp "$ENV" "$(BEFORE)"

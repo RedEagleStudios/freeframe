@@ -189,7 +189,7 @@ setup() {
   ff restart
   exec 9>&-
   [ "$status" -eq 1 ]
-  assert_out "Another freeframe command (an update, rollback, backup, restore, restart or configure) is running right now"
+  assert_out "Another freeframe command (an update, rollback, backup, restore, restart, configure or uninstall) is running right now"
   assert_not_called "dc up"
 }
 
@@ -204,7 +204,7 @@ setup() {
   ff restart
   exec 9>&-
   [ "$status" -eq 1 ]
-  assert_out "Another freeframe command (an update, rollback, backup, restore, restart or configure) is running right now, so FreeFrame was not restarted."
+  assert_out "Another freeframe command (an update, rollback, backup, restore, restart, configure or uninstall) is running right now, so FreeFrame was not restarted."
   assert_no_out "did not finish"
   assert_no_out "may be empty"
   assert_not_called "dc up"

@@ -516,7 +516,7 @@ this_server_runs() {
   ff update
   exec 9>&-
   [ "$status" -eq 1 ]
-  assert_out "Another freeframe command (an update, rollback, backup, restore, restart or configure) is running right now"
+  assert_out "Another freeframe command (an update, rollback, backup, restore, restart, configure or uninstall) is running right now"
   assert_not_called "dc "
 }
 
@@ -860,7 +860,7 @@ killed_update_state() {
   for f in $SETUP_NAMES .update-undo; do
     cmp "$BATS_TEST_TMPDIR/during/$f" "$FF_ROOT/$f" || { echo "$f was changed"; return 1; }
   done
-  assert_out "Another freeframe command (an update, rollback, backup, restore, restart or configure) is running right now, so the update did not start. Nothing was changed."
+  assert_out "Another freeframe command (an update, rollback, backup, restore, restart, configure or uninstall) is running right now, so the update did not start. Nothing was changed."
   assert_no_out "putting its setup files from before back"
   assert_not_called fetch
   assert_not_called "dc "
