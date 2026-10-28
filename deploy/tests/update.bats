@@ -1032,14 +1032,51 @@ killed_update_state() {
   assert_no_out "CPU"
 }
 
-@test "update gpu worker: the timer refresh's daemon-reload takes the GPU from the worker; the check after it gives it back" {
+@test "update gpu worker: new backup units mean a daemon-reload, which takes the GPU from the worker; the check after it gives it back" {
   printf 'services:\n  worker: {}\n' >"$STUB_REMOTE/docker-compose.gpu.yml"
   printf 'services:\n  worker: {}\n' >"$FF_ROOT/docker-compose.gpu.yml"
   env_set "$ENV" FREEFRAME_GPU nvidia
   export STUB_GPU=ready STUB_RELOAD_DROPS_GPU=1
   ff update
   [ "$status" -eq 0 ] || { echo "$output"; false; }
-  assert_order install_backup_timer "dc exec -T worker nvidia-smi -L" "up -d --no-build --no-deps --force-recreate worker"
+  assert_order install_backup_timer "systemctl daemon-reload" "dc exec -T worker nvidia-smi -L" "up -d --no-build --no-deps --force-recreate worker"
   [ -e "$STUB_DIR/worker-gpu-up" ]
   assert_out "The worker did not see the GPU at first, so it was started again; it uses the GPU now."
+}
+
+@test "update gpu worker: unchanged backup units mean no daemon-reload and no enable, so the worker keeps the GPU with no recreate" {
+  printf 'services:\n  worker: {}\n' >"$STUB_REMOTE/docker-compose.gpu.yml"
+  printf 'services:\n  worker: {}\n' >"$FF_ROOT/docker-compose.gpu.yml"
+  cp "$FF_SYSTEMD_DIR"/freeframe-backup.* "$STUB_REMOTE/deploy/systemd/"
+  env_set "$ENV" FREEFRAME_GPU nvidia
+  export STUB_GPU=ready STUB_RELOAD_DROPS_GPU=1
+  ff update
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_not_called "daemon-reload"
+  assert_not_called "systemctl enable"
+  assert_not_called "no-deps"
+  assert_eq "$(grep -c '^dc exec -T worker nvidia-smi -L$' "$CALLS")" 1
+  [ -e "$STUB_DIR/worker-gpu-up" ]
+}
+
+@test "update: a timer that is not enabled is enabled again without a reload" {
+  cp "$FF_SYSTEMD_DIR"/freeframe-backup.* "$STUB_REMOTE/deploy/systemd/"
+  export STUB_TIMER_DISABLED=1
+  ff update
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -qx "systemctl enable --now --no-reload freeframe-backup.timer" "$CALLS" || { cat "$CALLS"; false; }
+  assert_not_called "daemon-reload"
+}
+
+@test "update gpu worker: a worker that never runs (even created again) is said to be stopped, with the logs command, not the CPU" {
+  printf 'services:\n  worker: {}\n' >"$STUB_REMOTE/docker-compose.gpu.yml"
+  printf 'services:\n  worker: {}\n' >"$FF_ROOT/docker-compose.gpu.yml"
+  env_set "$ENV" FREEFRAME_GPU nvidia
+  export STUB_GPU=ready STUB_WORKER_SMI=fail STUB_WORKER_DOWN=1 FF_GPU_WORKER_WAIT=4
+  ff update
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(grep -c '^dc up -d --no-build --no-deps --force-recreate worker$' "$CALLS")" 1
+  assert_out "The worker that processes video is not running, so no video is processed until it starts. See why with: sudo freeframe logs worker"
+  assert_no_out "on the CPU for now"
+  grep -qF "GPU self-check: the worker is not running, so no video is processed until it starts" "$FF_ROOT/install.log"
 }

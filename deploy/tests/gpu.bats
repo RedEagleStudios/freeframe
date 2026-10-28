@@ -663,3 +663,28 @@ toolkit_stubs() {
 @test "_gpu_list_name: the name in nvidia-smi -L's first line" {
   assert_eq "$(_gpu_list_name $'GPU 0: NVIDIA GeForce RTX 5070 Ti (UUID: GPU-e3f1c5ac)\r\nGPU 1: NVIDIA L4 (UUID: GPU-2)')" "NVIDIA GeForce RTX 5070 Ti"
 }
+
+@test "_gpu_worker_wait: bounded by the clock, not only by its pauses (each look can take long)" {
+  local n=0
+  _gpu_worker_running() { n=$((n + 1)); sleep 2; return 1; }
+  ff_sleep() { :; }
+  FF_GPU_WORKER_WAIT=4
+  run_wait() { _gpu_worker_wait; }
+  if run_wait; then false; fi
+  # Counting only the 2 s pauses would look 3 times (0, 2, 4); the clock
+  # stops it after 2 looks (4 s).
+  assert_eq "$n" 2
+}
+
+@test "_gpu_worker_say: no log, no word about where nvidia-smi's answer is" {
+  FF_GPU_WORKER=unseen FF_GPU_NAME="NVIDIA L4" FF_LOG=""
+  run _gpu_worker_say
+  [[ $output == *"video is processed on the CPU for now."* ]]
+  [[ $output != *"What nvidia-smi said"* ]]
+  unset FF_LOG
+  run _gpu_worker_say
+  [[ $output != *"What nvidia-smi said"* ]]
+  FF_LOG=/x/install.log
+  run _gpu_worker_say
+  [[ $output == *"What nvidia-smi said is in /x/install.log."* ]]
+}

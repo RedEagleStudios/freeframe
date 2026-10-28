@@ -487,28 +487,19 @@ recreates() { grep -c '^dc up -d --no-build --no-deps --force-recreate worker$' 
   assert_no_out "CPU"
 }
 
-@test "restart gpu worker: a worker that does not see the GPU is started again once, and then does" {
-  gpu_on
-  export STUB_GPU=ready STUB_WORKER_SMI=restart
-  ff restart
-  [ "$status" -eq 0 ] || { echo "$output"; false; }
-  assert_eq "$(recreates)" 1
-  assert_eq "$(smi_asks)" 2
-  assert_out "The worker did not see the GPU at first, so it was started again; it uses the GPU now."
-  assert_no_out "on the CPU for now"
-  grep -qF "Failed to initialize NVML" "$FF_ROOT/install.log" || { cat "$FF_ROOT/install.log"; false; }
-}
-
-@test "restart gpu worker: a worker that never sees the GPU is started again once; the restart still works and says the CPU" {
+@test "restart gpu worker: a worker that does not see the GPU is not created again (restart just did that, with no reload), and the CPU is said" {
   gpu_on
   export STUB_GPU=ready STUB_WORKER_SMI=fail
   ff restart
   [ "$status" -eq 0 ] || { echo "$output"; false; }
-  assert_eq "$(recreates)" 1
-  assert_eq "$(smi_asks)" 2
+  assert_eq "$(recreates)" 0
+  assert_eq "$(smi_asks)" 1
   assert_out "FreeFrame is running again"
-  assert_out "The worker could not use the NVIDIA GPU (NVIDIA GeForce RTX 5070 Ti), even after it was started again, so video is processed on the CPU for now."
-  assert_out "FREEFRAME_GPU=nvidia is kept. To try the GPU again, run: sudo freeframe restart. If video stays on the CPU, see https://github.com/Techiebutler/freeframe/blob/main/docs/deployment.md#troubleshooting-the-installer"
+  assert_out "The worker could not use the NVIDIA GPU (NVIDIA GeForce RTX 5070 Ti), so video is processed on the CPU for now. What nvidia-smi said is in $FF_ROOT/install.log."
+  assert_out "FREEFRAME_GPU=nvidia is kept. If video stays on the CPU, see https://github.com/Techiebutler/freeframe/blob/main/docs/deployment.md#troubleshooting-the-installer"
+  # It does not send you to run the restart you just ran.
+  assert_no_out "even after it was started again"
+  assert_no_out "To try the GPU again, run: sudo freeframe restart"
   assert_has "$ENV" "FREEFRAME_GPU=nvidia"
   grep -qF "Failed to initialize NVML" "$FF_ROOT/install.log"
 }
@@ -536,8 +527,18 @@ recreates() { grep -c '^dc up -d --no-build --no-deps --force-recreate worker$' 
   export STUB_GPU=ready STUB_WORKER_SMI=nogpu
   ff restart
   [ "$status" -eq 0 ] || { echo "$output"; false; }
-  assert_eq "$(recreates)" 1
+  assert_eq "$(recreates)" 0
   assert_out "video is processed on the CPU for now"
   grep -qF "GPU self-check: the worker's nvidia-smi -L said: No devices were found (exit 0)" "$FF_ROOT/install.log" ||
     { cat "$FF_ROOT/install.log"; false; }
+}
+
+@test "restart gpu worker: a worker that is not running at all is not said to be on the CPU" {
+  gpu_on
+  export STUB_GPU=ready STUB_WORKER_SMI=fail STUB_WORKER_DOWN=1 FF_GPU_WORKER_WAIT=4
+  ff restart
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(recreates)" 0
+  assert_out "The worker that processes video is not running, so no video is processed until it starts. See why with: sudo freeframe logs worker"
+  assert_no_out "on the CPU for now"
 }

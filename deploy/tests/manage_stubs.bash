@@ -103,9 +103,10 @@ fi
 # at once, as Persistent=true does: `freeframe backup --quiet` in a process
 # of its own, as systemd starts it (without this one's lock descriptor). Its
 # output and exit status go to $STUB_DIR/timer-backup.out and .rc.
+# The real one then runs, on $FF_SYSTEMD_DIR, with systemctl stubbed.
+eval "_real_install_backup_timer() $(declare -f install_backup_timer | tail -n +2)"
 install_backup_timer() {
   _stub_log install_backup_timer
-  _stub_daemon_reload
   [[ -z ${STUB_TIMER_HANG:-} ]] || _stub_hang timer
   if [[ -n ${STUB_TIMER_RUNS_BACKUP:-} ]]; then
     local rc=0
@@ -118,11 +119,19 @@ install_backup_timer() {
     ) >"$STUB_DIR/timer-backup.out" 2>&1 || rc=$?
     printf '%s\n' "$rc" >"$STUB_DIR/timer-backup.rc"
   fi
-  [[ -z ${STUB_TIMER_FAIL:-} ]]
+  [[ -z ${STUB_TIMER_FAIL:-} ]] || return 1
+  _real_install_backup_timer
 }
 
+# daemon-reload can drop the worker's GPU (gpu_worker_stubs.bash).
+# STUB_TIMER_DISABLED: the backup timer is not enabled (or not running).
 systemctl() {
   _stub_log "systemctl $*"
+  if [[ $* == daemon-reload ]]; then _stub_daemon_reload; fi
+  if [[ $* == "is-enabled --quiet freeframe-backup.timer" || $* == "is-active --quiet freeframe-backup.timer" ]]; then
+    [[ -z ${STUB_TIMER_DISABLED:-} ]]
+    return
+  fi
   if [[ $* == "restart docker" && -e $STUB_DIR/docker-down ]]; then
     [[ -z ${STUB_DOCKER_STAYS_DOWN:-} ]] || return 1
     rm -f "$STUB_DIR/docker-down"

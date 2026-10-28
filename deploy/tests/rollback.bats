@@ -519,7 +519,7 @@ assert_state_is() {
   assert_database_untouched
 }
 
-@test "rollback gpu worker: the timer refresh's daemon-reload takes the GPU from the worker; the check after it gives it back" {
+@test "rollback gpu worker: the units are as they were, so no daemon-reload, and the worker keeps the GPU with no recreate" {
   printf 'services:\n  worker: {}\n' >"$STUB_REMOTE/docker-compose.gpu.yml"
   printf 'services:\n  worker: {}\n' >"$FF_ROOT/docker-compose.gpu.yml"
   env_set "$ENV" FREEFRAME_GPU nvidia
@@ -528,6 +528,8 @@ assert_state_is() {
   export STUB_RELOAD_DROPS_GPU=1
   ff rollback --yes
   [ "$status" -eq 0 ] || { echo "$output"; false; }
-  assert_order install_backup_timer "dc exec -T worker nvidia-smi -L" "up -d --no-build --no-deps --force-recreate worker"
+  assert_order install_backup_timer "dc exec -T worker nvidia-smi -L"
+  assert_not_called "daemon-reload"
+  assert_not_called "no-deps"
   [ -e "$STUB_DIR/worker-gpu-up" ]
 }

@@ -67,6 +67,8 @@ installed_server() {
   done
   mkdir -p "$FF_ROOT/systemd" "$FF_BIN_DIR" "$FF_SYSTEMD_DIR"
   cp "$STUB_REMOTE"/deploy/systemd/* "$FF_ROOT/systemd/"
+  # In systemd too, as install leaves them.
+  cp "$STUB_REMOTE"/deploy/systemd/* "$FF_SYSTEMD_DIR/"
   install -m 755 "$FF_SCRIPT" "$FF_BIN_DIR/freeframe"
   printf 'FreeFrame installed\n' >"$FF_ROOT/.installed"
 }

@@ -106,7 +106,7 @@ assert_root_untouched() {
     "fetch latest deploy/systemd/freeframe-backup.service" "fetch latest deploy/systemd/freeframe-backup.timer" \
     derive_env "dc pull" "dc config --services" "dc up -d" \
     "localhost:8000/health" "localhost:8000/setup/create-superadmin" \
-    "dc up -d --no-build traefik" "probe_health off 203.0.113.7" install_backup_timer
+    "dc up -d --no-build traefik" "probe_health off 203.0.113.7" backup_timer_on
   [ -f "$ENV" ]
   assert_has "$ENV" "FRONTEND_URL=http://203.0.113.7"
   assert_has "$ENV" "FREEFRAME_CHANNEL=latest"
@@ -293,8 +293,12 @@ assert_root_untouched() {
   ff_install --yes
   [ "$status" -eq 0 ] || { echo "$output"; false; }
   assert_order "localhost:8000/setup/create-superadmin" "dc up -d --no-build traefik" \
-    "probe_health off" install_backup_timer
-  [ "$(grep -c '^install_backup_timer$' "$CALLS")" -eq 1 ]
+    "probe_health off" backup_timer_on
+  [ "$(grep -c '^backup_timer_on$' "$CALLS")" -eq 1 ]
+  # The units and their one daemon-reload come before FreeFrame starts
+  # (the reload would take the GPU from a running worker).
+  assert_order backup_units_install "systemctl daemon-reload" "dc up -d --no-build"
+  [ "$(grep -c '^systemctl daemon-reload$' "$CALLS")" -eq 1 ]
   [[ $output == *"nightly"*"FreeFrame is ready"* ]] || { echo "$output"; false; }
 }
 
@@ -2650,16 +2654,32 @@ recreates() { grep -c '^dc up -d --no-build --no-deps --force-recreate worker$' 
     { cat "$FF_ROOT/install.log"; false; }
 }
 
-@test "gpu worker: the nightly backup step's daemon-reload takes the GPU from the worker; the check comes after it and gives it back" {
+@test "gpu worker: the backup units' daemon-reload comes before the start, so the worker keeps the GPU with no recreate" {
   plain_answers
   export STUB_GPU=ready STUB_RELOAD_DROPS_GPU=1
   ff_install --yes
   [ "$status" -eq 0 ] || { echo "$output"; false; }
-  assert_order install_backup_timer "dc exec -T worker nvidia-smi -L" "up -d --no-build --no-deps --force-recreate worker"
-  assert_eq "$(recreates)" 1
+  assert_order "systemctl daemon-reload" "dc up -d --no-build" backup_timer_on "dc exec -T worker nvidia-smi -L"
+  assert_eq "$(recreates)" 0
+  assert_eq "$(smi_asks)" 1
   # The worker FreeFrame is left with sees the GPU, as the closing line says.
   [ -e "$STUB_DIR/worker-gpu-up" ]
   grep -qxF " Video processing: GPU (NVIDIA GeForce RTX 5070 Ti)" <<<"$output" || { echo "$output"; false; }
+}
+
+@test "gpu worker: a worker that never runs and whose nvidia-smi fails is created again once, then said to be stopped, not on the CPU" {
+  plain_answers
+  export STUB_GPU=ready STUB_WORKER_SMI=fail STUB_WORKER_DOWN=1 FF_GPU_WORKER_WAIT=4
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(recreates)" 1
+  assert_out "The worker that processes video is not running, so no video is processed until it starts."
+  grep -qxF " Video processing: stopped: the worker that processes video is not running." <<<"$output" || { echo "$output"; false; }
+  grep -qxF "   sudo freeframe logs worker" <<<"$output" || { echo "$output"; false; }
+  assert_no_out "CPU for now"
+  assert_no_out "Video processing: GPU"
+  assert_has "$ENV" "FREEFRAME_GPU=nvidia"
+  grep -qxF " Video processing: stopped: the worker that processes video is not running." "$FF_ROOT/install.log"
 }
 
 @test "gpu worker: with the GPU off, the worker is never asked and nothing waits for it" {

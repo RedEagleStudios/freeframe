@@ -59,6 +59,7 @@ ss() {
 _ff_unit_of_pid() { printf '%s\n' "${STUB_UNIT:-}"; }
 systemctl() {
   _stub_log "systemctl $*"
+  if [[ $* == daemon-reload ]]; then _stub_daemon_reload; fi
   # Restarting Docker brings it back, unless STUB_DOCKER_STAYS_DOWN.
   if [[ $* == "restart docker" && -e $STUB_DIR/docker-down ]]; then
     [[ -z ${STUB_DOCKER_STAYS_DOWN:-} ]] || return 1
@@ -93,9 +94,16 @@ fetch() {
 
 ff_sleep() { _stub_log "sleep $1"; }
 
-install_backup_timer() {
-  _stub_log install_backup_timer
-  _stub_daemon_reload
+# The nightly backup units, put into systemd with a daemon-reload before
+# FreeFrame starts (STUB_UNITS_FAIL: that fails), and the timer started
+# after (STUB_TIMER_FAIL: that fails).
+backup_units_install() {
+  _stub_log backup_units_install
+  [[ -z ${STUB_UNITS_FAIL:-} ]] || return 1
+  systemctl daemon-reload
+}
+backup_timer_on() {
+  _stub_log backup_timer_on
   [[ -z ${STUB_TIMER_FAIL:-} ]]
 }
 

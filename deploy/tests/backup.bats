@@ -1133,7 +1133,45 @@ UNITS="${BATS_TEST_DIRNAME}/../systemd"
   cmp "$UNITS/freeframe-backup.service" "$FF_SYSTEMD_DIR/freeframe-backup.service"
   cmp "$UNITS/freeframe-backup.timer" "$FF_SYSTEMD_DIR/freeframe-backup.timer"
   assert_eq "$(stat -c %a "$FF_SYSTEMD_DIR/freeframe-backup.timer")" 644
-  assert_order "systemctl daemon-reload" "systemctl enable --now freeframe-backup.timer"
+  assert_order "systemctl daemon-reload" "systemctl enable --now --no-reload freeframe-backup.timer"
+}
+
+@test "install_backup_timer: units that did not change mean no daemon-reload and no enable" {
+  mkdir -p "$FF_ROOT/systemd" "$BATS_TEST_TMPDIR/etc"
+  cp "$UNITS"/freeframe-backup.* "$FF_ROOT/systemd/"
+  cp "$UNITS"/freeframe-backup.* "$BATS_TEST_TMPDIR/etc/"
+  export FF_SYSTEMD_DIR="$BATS_TEST_TMPDIR/etc"
+  # Enabled and running.
+  systemctl() { printf 'systemctl %s\n' "$*" >>"$CALLS"; }
+  install_backup_timer
+  if grep -E 'daemon-reload|systemctl enable' "$CALLS"; then false; fi
+  # Not enabled (or stopped): enabled and started, still without a reload.
+  : >"$CALLS"
+  systemctl() {
+    printf 'systemctl %s\n' "$*" >>"$CALLS"
+    [[ $1 != is-enabled ]]
+  }
+  install_backup_timer
+  grep -qx "systemctl enable --now --no-reload freeframe-backup.timer" "$CALLS"
+  if grep -q daemon-reload "$CALLS"; then false; fi
+  # One unit changed: copied, one daemon-reload, enabled again.
+  : >"$CALLS"
+  printf '# changed\n' >>"$FF_ROOT/systemd/freeframe-backup.timer"
+  install_backup_timer
+  cmp "$FF_ROOT/systemd/freeframe-backup.timer" "$FF_SYSTEMD_DIR/freeframe-backup.timer"
+  assert_order "systemctl daemon-reload" "systemctl enable --now --no-reload freeframe-backup.timer"
+  [ "$(grep -c 'daemon-reload' "$CALLS")" -eq 1 ]
+}
+
+@test "backup_units_install then backup_timer_on: the install's split, one reload, before the timer starts" {
+  mkdir -p "$FF_ROOT/systemd" "$BATS_TEST_TMPDIR/etc"
+  cp "$UNITS"/freeframe-backup.* "$FF_ROOT/systemd/"
+  export FF_SYSTEMD_DIR="$BATS_TEST_TMPDIR/etc"
+  systemctl() { printf 'systemctl %s\n' "$*" >>"$CALLS"; }
+  backup_units_install
+  assert_eq "$(cat "$CALLS")" "systemctl daemon-reload"
+  backup_timer_on
+  assert_eq "$(sed -n 2p "$CALLS")" "systemctl enable --now --no-reload freeframe-backup.timer"
 }
 
 @test "install_backup_timer fails when the units are missing or systemctl fails" {
