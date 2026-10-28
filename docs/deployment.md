@@ -214,9 +214,11 @@ sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Techiebutler/freefr
 
 Without the settings file the installer refuses the kept volumes (they look like a FreeFrame set up by hand) and points at the saved settings. If the volumes are gone, the same steps give an empty FreeFrame; then `sudo freeframe restore /root/freeframe-removed-<date>-<time>/freeframe-<date>-<time>.dump` puts the final backup back. A backup holds the database only, not footage kept on the server.
 
-**Deleting the data too.** `--delete-data` also deletes the volumes, for good. It asks you to type `delete`, even with `--yes`. For an unattended run, give all three: `sudo freeframe uninstall --yes --delete-data --confirm-delete-data`. Without `--yes`, `uninstall` needs a terminal to ask in; with `--yes` it asks nothing, apart from the `delete` question.
+**Deleting the data too.** `--delete-data` also deletes the volumes, for good. It asks you to type `delete`, even with `--yes`. For an unattended run, give all three: `sudo freeframe uninstall --yes --delete-data --confirm-delete-data` (`--confirm-delete-data` is refused without `--yes`, so in a terminal `delete` is always typed). Without `--yes`, `uninstall` needs a terminal to ask in; with `--yes` it asks nothing, apart from the `delete` question.
 
-If an update or a restore did not finish, `uninstall` still runs, and says first what is lost: an unfinished update's way back (`sudo freeframe rollback`), or, after an unfinished restore, that the database may be empty (the copy from before that restore is kept with the other backups). It refuses a server that runs FreeFrame set up by hand, and waits its turn behind another `freeframe` command.
+If an update or a restore did not finish, `uninstall` still runs, and says first what is lost: an unfinished update's way back (`sudo freeframe rollback`), or, after an unfinished restore, that the database may be empty (the copy from before that restore is kept with the other backups). It refuses a server that runs FreeFrame set up by hand. While another `freeframe` command is running it does not start, and says so: run it again once that one has finished.
+
+**If it stops part-way** (a volume that cannot be deleted, a full disk), run the same command again. It finds the folder the first run saved in, keeps using it and makes no new backup: the database may already be removed, and starting it again would only make an empty one. The first run's final backup stays the one to restore.
 
 ### Unattended installs (cloud-init, Ansible)
 
