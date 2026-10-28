@@ -19,6 +19,11 @@ detect_foreign_install() {
 
 docker_status() {
   _stub_log docker_status
+  # A failed NVIDIA set-up can leave Docker down ($STUB_DIR/docker-down).
+  if [[ -e $STUB_DIR/docker-down ]]; then
+    printf 'down\n'
+    return 0
+  fi
   printf '%s\n' "${STUB_DOCKER:-none}"
 }
 
@@ -51,6 +56,12 @@ ss() {
 _ff_unit_of_pid() { printf '%s\n' "${STUB_UNIT:-}"; }
 systemctl() {
   _stub_log "systemctl $*"
+  # Restarting Docker brings it back, unless STUB_DOCKER_STAYS_DOWN.
+  if [[ $* == "restart docker" && -e $STUB_DIR/docker-down ]]; then
+    [[ -z ${STUB_DOCKER_STAYS_DOWN:-} ]] || return 1
+    rm -f "$STUB_DIR/docker-down"
+    return 0
+  fi
   # STUB_SYSTEMCTL_FAIL: stopping a program fails (it keeps the port).
   [[ -z ${STUB_SYSTEMCTL_FAIL:-} ]] || return 1
   [[ -n ${STUB_SS_CLEARS:-} ]] && STUB_SS=""
@@ -166,8 +177,16 @@ detect_gpu() {
   esac
 }
 
+# STUB_GPU_DOCKER_DOWN: the failed set-up leaves Docker down, after
+# nvidia-ctk changed daemon.json (backed up first, as the real one does).
 install_nvidia_toolkit() {
   _stub_log install_nvidia_toolkit
-  [[ -z ${STUB_GPU_SETUP_FAIL:-} ]] || return 1
+  if [[ -n ${STUB_GPU_SETUP_FAIL:-} ]]; then
+    if [[ -n ${STUB_GPU_DOCKER_DOWN:-} ]]; then
+      FF_GPU_DAEMON_JSON=/etc/docker/daemon.json FF_GPU_DAEMON_BACKUP=/etc/docker/daemon.json.before-freeframe-nvidia-20261028-101010
+      : >"$STUB_DIR/docker-down"
+    fi
+    return 1
+  fi
   STUB_GPU=ready
 }

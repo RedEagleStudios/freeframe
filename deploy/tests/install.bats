@@ -2506,3 +2506,26 @@ rest_gpu() { REST_GPU=(1 "" "Grace" "grace@example.com" "long-password-1" "long-
   [[ $output == *"FreeFrame installer (--yes"*"<<detect_gpu>>"* ]] || { echo "$output"; false; }
 }
 
+@test "gpu: Docker left down by a failed toolkit set-up is restarted once more, and the install goes on on the CPU" {
+  plain_answers
+  export STUB_GPU=notoolkit STUB_GPU_SETUP_FAIL=1 STUB_GPU_DOCKER_DOWN=1
+  ff_install --yes --gpu nvidia
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_order install_nvidia_toolkit "systemctl restart docker" "dc up -d"
+  assert_has "$ENV" "FREEFRAME_GPU=off"
+  assert_out "FreeFrame is ready"
+}
+
+@test "gpu: Docker that stays down after the NVIDIA change stops the install with the undo, before any download or start" {
+  plain_answers
+  export STUB_GPU=notoolkit STUB_GPU_SETUP_FAIL=1 STUB_GPU_DOCKER_DOWN=1 STUB_DOCKER_STAYS_DOWN=1
+  ff_install --yes --gpu nvidia
+  [ "$status" -eq 1 ]
+  assert_out "Docker did not come back after the NVIDIA change"
+  assert_out "/etc/docker/daemon.json"
+  assert_out "sudo cp /etc/docker/daemon.json.before-freeframe-nvidia-20261028-101010 /etc/docker/daemon.json && sudo systemctl restart docker"
+  assert_not_called "dc pull"
+  assert_not_called "dc up"
+  assert_not_called "fetch latest"
+}
+

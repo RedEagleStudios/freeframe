@@ -1366,7 +1366,9 @@ _gpu_ready_line() {
 # list, apt install nvidia-container-toolkit), then Docker set up for it
 # (nvidia-ctk runtime configure) and restarted. When the toolkit is already
 # installed only Docker is set up. A failure after the sources list is
-# written removes it again, so a broken list never blocks apt.
+# written removes it again, so a broken list never blocks apt. Docker's
+# daemon.json is copied aside before nvidia-ctk changes it
+# (FF_GPU_DAEMON_BACKUP; empty when there was none), for _gpu_daemon_undo.
 install_nvidia_toolkit() {
   # FF_NVIDIA_KEYRING and FF_NVIDIA_LIST are for the tests.
   local key=${FF_NVIDIA_KEYRING:-/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg}
@@ -1392,8 +1394,44 @@ install_nvidia_toolkit() {
       return 1
     fi
   fi
+  # FF_DOCKER_DAEMON_JSON is for the tests.
+  local json=${FF_DOCKER_DAEMON_JSON:-/etc/docker/daemon.json}
+  FF_GPU_DAEMON_JSON=$json FF_GPU_DAEMON_BACKUP=""
+  if [[ -e $json ]]; then
+    FF_GPU_DAEMON_BACKUP="$json.before-freeframe-nvidia-$(date +%Y%m%d-%H%M%S)"
+    if ! cp -p "$json" "$FF_GPU_DAEMON_BACKUP"; then
+      FF_GPU_DAEMON_JSON="" FF_GPU_DAEMON_BACKUP=""
+      return 1
+    fi
+  fi
   nvidia-ctk runtime configure --runtime=docker || return 1
   systemctl restart docker
+}
+
+# _gpu_daemon_undo: the command that puts Docker's settings back as they
+# were before nvidia-ctk changed them, and restarts Docker.
+_gpu_daemon_undo() {
+  if [[ -n ${FF_GPU_DAEMON_BACKUP:-} ]]; then
+    printf 'sudo cp %s %s && sudo systemctl restart docker' "$FF_GPU_DAEMON_BACKUP" "$FF_GPU_DAEMON_JSON"
+  elif [[ -n ${FF_GPU_DAEMON_JSON:-} ]]; then
+    printf 'sudo rm -f %s && sudo systemctl restart docker' "$FF_GPU_DAEMON_JSON"
+  else
+    printf 'sudo systemctl restart docker'
+  fi
+}
+
+_ff_docker_ok() { [[ $(docker_status) == ok ]]; }
+
+# _gpu_docker_back AGAIN: after a toolkit set-up that failed, Docker must
+# answer before anything else runs: restarted once more when it does not,
+# and when it still does not, a stop with the way back (AGAIN is the
+# command to run afterwards). Nothing is pulled or started with Docker down.
+_gpu_docker_back() {
+  _ff_docker_ok && return 0
+  _ff_logged systemctl restart docker || true
+  _ff_wait_for "${FF_DOCKER_WAIT:-60}" 3 _ff_docker_ok && return 0
+  install_fail "Docker did not come back after the NVIDIA change: nvidia-ctk changed Docker's settings in ${FF_GPU_DAEMON_JSON:-/etc/docker/daemon.json}, and Docker does not answer since it was restarted." \
+    "put Docker's settings from before back and start it again: $(_gpu_daemon_undo). Then run $1 again; it stays on the CPU unless you choose the GPU again."
 }
 
 # _gpu_now_ready: detect again; 0 when Docker can use the GPU.
@@ -2722,6 +2760,7 @@ _install_gpu_step() {
     _install_done "installed the NVIDIA container toolkit and set Docker up for the GPU"
     return 0
   fi
+  _gpu_docker_back "sudo freeframe install"
   FF_GPU=off FF_GPU_FAILED=1 FF_GPU_FORCE_OFF=1 FF_GPU_WHY="the NVIDIA container toolkit could not be set up"
   _ff_pw "The NVIDIA container toolkit could not be set up, so FreeFrame processes video on the CPU. The reason is at the end of the log; the install goes on."
 }
@@ -5932,6 +5971,7 @@ cmd_configure() {
     if _gpu_setup; then
       say "The NVIDIA container toolkit is set up, and Docker can use the GPU."
     else
+      _gpu_docker_back "sudo freeframe configure"
       FF_GPU_FAILED=1
       warn "The NVIDIA container toolkit could not be set up, so video is still processed on the CPU. The reason is at the end of $FF_LOG."
       _cfg_set FREEFRAME_GPU off

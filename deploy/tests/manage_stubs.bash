@@ -119,6 +119,11 @@ install_backup_timer() {
 
 systemctl() {
   _stub_log "systemctl $*"
+  if [[ $* == "restart docker" && -e $STUB_DIR/docker-down ]]; then
+    [[ -z ${STUB_DOCKER_STAYS_DOWN:-} ]] || return 1
+    rm -f "$STUB_DIR/docker-down"
+    return 0
+  fi
   case "$*" in
     *NextElapseUSecRealtime*) printf '%s\n' "${STUB_TIMER_NEXT-Tue 2026-10-27 03:07:12 UTC}" ;;
     *ActiveState*) printf '%s\n' "${STUB_TIMER_STATE:-active}" ;;
@@ -296,6 +301,18 @@ detect_gpu() {
 
 install_nvidia_toolkit() {
   _stub_log install_nvidia_toolkit
-  [[ -z ${STUB_GPU_SETUP_FAIL:-} ]] || return 1
+  if [[ -n ${STUB_GPU_SETUP_FAIL:-} ]]; then
+    if [[ -n ${STUB_GPU_DOCKER_DOWN:-} ]]; then
+      FF_GPU_DAEMON_JSON=/etc/docker/daemon.json FF_GPU_DAEMON_BACKUP=/etc/docker/daemon.json.before-freeframe-nvidia-20261028-101010
+      : >"$STUB_DIR/docker-down"
+    fi
+    return 1
+  fi
   STUB_GPU=ready
+}
+
+# Docker answers unless a failed NVIDIA set-up left it down.
+docker_status() {
+  _stub_log docker_status
+  if [[ -e $STUB_DIR/docker-down ]]; then printf 'down\n'; else printf 'ok\n'; fi
 }

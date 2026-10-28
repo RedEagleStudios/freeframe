@@ -439,6 +439,7 @@ toolkit_stubs() {
   : >"$TK"
   export FF_NVIDIA_KEYRING="$BATS_TEST_TMPDIR/keyrings/nvidia-container-toolkit-keyring.gpg"
   export FF_NVIDIA_LIST="$BATS_TEST_TMPDIR/sources.list.d/nvidia-container-toolkit.list"
+  export FF_DOCKER_DAEMON_JSON="$BATS_TEST_TMPDIR/docker/daemon.json"
   mkdir -p "$(dirname "$FF_NVIDIA_LIST")"
   run_apt() {
     printf 'run_apt %s\n' "$*" >>"$TK"
@@ -539,3 +540,29 @@ toolkit_stubs() {
   run _gpu_setup
   [ "$status" -ne 0 ]
 }
+
+@test "install_nvidia_toolkit: Docker's daemon.json is backed up before nvidia-ctk changes it" {
+  toolkit_stubs
+  export FF_DOCKER_DAEMON_JSON="$BATS_TEST_TMPDIR/docker/daemon.json"
+  mkdir -p "$(dirname "$FF_DOCKER_DAEMON_JSON")"
+  printf '{"log-driver": "local"}\n' >"$FF_DOCKER_DAEMON_JSON"
+  nvidia-ctk() {
+    printf 'nvidia-ctk %s\n' "$*" >>"$TK"
+    printf '{"runtimes": {}}\n' >"$FF_DOCKER_DAEMON_JSON"
+  }
+  install_nvidia_toolkit
+  [ -n "$FF_GPU_DAEMON_BACKUP" ]
+  [[ $FF_GPU_DAEMON_BACKUP == "$FF_DOCKER_DAEMON_JSON".before-freeframe-nvidia-* ]]
+  assert_eq "$(cat "$FF_GPU_DAEMON_BACKUP")" '{"log-driver": "local"}'
+  assert_eq "$(_gpu_daemon_undo)" "sudo cp $FF_GPU_DAEMON_BACKUP $FF_DOCKER_DAEMON_JSON && sudo systemctl restart docker"
+}
+
+@test "install_nvidia_toolkit: with no daemon.json before, the undo removes the one nvidia-ctk wrote" {
+  toolkit_stubs
+  export FF_DOCKER_DAEMON_JSON="$BATS_TEST_TMPDIR/docker/daemon.json"
+  nvidia-ctk() { printf 'nvidia-ctk %s\n' "$*" >>"$TK"; }
+  install_nvidia_toolkit
+  assert_eq "$FF_GPU_DAEMON_BACKUP" ""
+  assert_eq "$(_gpu_daemon_undo)" "sudo rm -f $FF_DOCKER_DAEMON_JSON && sudo systemctl restart docker"
+}
+

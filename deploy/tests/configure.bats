@@ -566,3 +566,29 @@ gpu_file() { printf 'services:\n  worker: {}\n' >"$FF_ROOT/docker-compose.gpu.ym
   cmp "$ENV" "$(BEFORE)"
   assert_out "Video processing: GPU (NVIDIA GeForce RTX 5070 Ti)"
 }
+
+@test "configure gpu: Docker that stays down after a failed toolkit set-up stops with the undo, and nothing is saved" {
+  installed_server off bundled
+  gpu_file
+  export STUB_GPU=notoolkit STUB_GPU_SETUP_FAIL=1 STUB_GPU_DOCKER_DOWN=1 STUB_DOCKER_STAYS_DOWN=1
+  keep_copy
+  ff configure --yes --gpu nvidia
+  [ "$status" -eq 1 ]
+  assert_out "Docker did not come back after the NVIDIA change"
+  assert_out "sudo cp /etc/docker/daemon.json.before-freeframe-nvidia-20261028-101010 /etc/docker/daemon.json && sudo systemctl restart docker"
+  assert_out "sudo freeframe configure"
+  assert_not_called "dc up"
+  cmp "$ENV" "$(BEFORE)"
+}
+
+@test "configure gpu: Docker left down by a failed toolkit set-up is restarted once more, then FreeFrame comes back" {
+  installed_server off bundled
+  gpu_file
+  export STUB_GPU=notoolkit STUB_GPU_SETUP_FAIL=1 STUB_GPU_DOCKER_DOWN=1
+  ff configure --yes --gpu nvidia
+  [ "$status" -eq 1 ]
+  assert_order install_nvidia_toolkit "systemctl restart docker" "dc up -d --no-build" "localhost:8000/health"
+  assert_out "video is still processed on the CPU"
+  assert_has "$ENV" "FREEFRAME_GPU=off"
+}
+
