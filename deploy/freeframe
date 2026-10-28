@@ -2811,18 +2811,31 @@ _install_traefik_closed() {
 # _ff_pull_failure_kind OUTPUT: why `docker compose pull` failed, from what it
 # printed: missing (the release is not published, or its images are not
 # public), network (ghcr.io cannot be reached), disk (the disk is full) or
-# other. A full disk is checked first, since it can show up next to the other
-# messages. Pure: prints one word and nothing else.
+# other. Pure: prints one word and nothing else.
+#
+# The order matters. A full disk is checked first, since it can show up next
+# to the other messages. The network comes before "denied" on purpose: a
+# network failure is transient and a real "denied" shows again on the next
+# run, so when both appear, "check the network" is the advice that cannot
+# mislead for long. Docker's own permission errors ("permission denied" on
+# its socket or its storage), a missing program, or a credentials helper that
+# fails are not a missing release, so they are `other`.
 _ff_pull_failure_kind() {
   local o=${1,,}
   if [[ $o == *"no space left on device"* ]]; then
     printf 'disk'
-  elif [[ $o == *"dial tcp"* || $o == *"no such host"* || $o == *"i/o timeout"* ||
+    return 0
+  fi
+  if [[ $o == *"dial tcp"* || $o == *"no such host"* || $o == *"i/o timeout"* ||
     $o == *"connection refused"* || $o == *"tls handshake timeout"* ||
     $o == *"network is unreachable"* ]]; then
     printf 'network'
-  elif [[ $o == *"executable file not found"* ]]; then
-    # A missing helper program (a credentials helper), not a missing release.
+    return 0
+  fi
+  o=${o//permission denied/}
+  if [[ $o == *"command not found"* || $o == *"no such file"* ||
+    $o == *"executable file not found"* || $o == *"error getting credentials"* ||
+    $o == *"cannot connect to the docker daemon"* ]]; then
     printf 'other'
   elif [[ $o == *"not found"* || $o == *"manifest unknown"* || $o == *"denied"* ||
     $o == *"unauthorized"* ]]; then
@@ -2832,13 +2845,23 @@ _ff_pull_failure_kind() {
   fi
 }
 
-# _ff_pull_logged: `dc pull`, with its output (both streams) going to
-# install.log as before, and kept in FF_PULL_OUT so that a failure can be told
-# apart. The output is only ever classified, never shown.
+# _ff_pull_logged: `dc pull`, with its output (both streams) written straight
+# to install.log as it arrives, so a hard kill loses nothing. What decides
+# why it failed is the end of what this pull wrote (at most 64 KiB, read from
+# the log's size before the pull), kept in FF_PULL_OUT; it is only
+# classified, never shown. Without a log file, the output is held in memory.
 _ff_pull_logged() {
-  local rc=0
-  FF_PULL_OUT=$(dc pull 2>&1) || rc=$?
-  if [[ -n $FF_PULL_OUT ]]; then printf '%s\n' "$FF_PULL_OUT" >>"${FF_LOG:-/dev/null}"; fi
+  local rc=0 before=0
+  FF_PULL_OUT=""
+  if [[ -n ${FF_LOG:-} && -f $FF_LOG ]]; then
+    before=$(wc -c <"$FF_LOG") || before=0
+    before=${before//[[:space:]]/}
+    dc pull >>"$FF_LOG" 2>&1 || rc=$?
+    ((rc == 0)) || FF_PULL_OUT=$(tail -c "+$((before + 1))" "$FF_LOG" 2>/dev/null | tail -c 65536) || FF_PULL_OUT=""
+  else
+    FF_PULL_OUT=$(dc pull 2>&1) || rc=$?
+    if [[ -n ${FF_LOG:-} && -n $FF_PULL_OUT ]]; then printf '%s\n' "$FF_PULL_OUT" >>"$FF_LOG"; fi
+  fi
   return "$rc"
 }
 
@@ -2856,10 +2879,12 @@ _ff_pull_failure_text() {
       if [[ -z $v || $v == unknown ]]; then subj="This release of FreeFrame"; fi
       FF_PULL_MSG="$subj is not available on ghcr.io yet (the release may not be published, or its images are not public)."
       if [[ $cmd == update ]]; then
-        FF_PULL_TRY="check https://github.com/Techiebutler/freeframe/releases for a newer release, then run sudo freeframe update again later. Nothing was changed, so running it again is safe."
+        FF_PULL_TRY="check https://github.com/Techiebutler/freeframe/releases for a newer release, then run sudo freeframe update again later; $(_update_unchanged), so running it again is safe."
       else
         FF_PULL_TRY="check https://github.com/Techiebutler/freeframe/releases for a newer release; to pin a release that is published, set FREEFRAME_VERSION in $(ff_root)/.env.prod, $again"
       fi
+      # A stale login makes ghcr.io refuse an image that is public.
+      FF_PULL_TRY+=" If this server was logged in to ghcr.io with docker login, run sudo docker logout ghcr.io and try again."
       ;;
     network)
       FF_PULL_MSG="$subj could not be downloaded."

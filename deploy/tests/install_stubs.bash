@@ -129,6 +129,10 @@ dc() {
     pull*)
       [[ -n ${STUB_PULL_FAIL:-} ]] || return 0
       [[ -z ${STUB_PULL_ERR:-} ]] || printf '%s\n' "$STUB_PULL_ERR" >&2
+      # STUB_PULL_PEEK: note whether what was printed is already in the log.
+      if [[ -n ${STUB_PULL_PEEK:-} ]] && grep -qF -- "${STUB_PULL_ERR%%$'\n'*}" "${FF_LOG:-/dev/null}" 2>/dev/null; then
+        : >"$STUB_DIR/pull-live"
+      fi
       return 1
       ;;
     *) return 0 ;;

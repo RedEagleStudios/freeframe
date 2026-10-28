@@ -2157,9 +2157,21 @@ write /var/lib/docker/tmp/x: no space left on device'
   assert_eq "$output" disk
 }
 
+@test "pull failure kind: a network failure wins over a denied next to it" {
+  run _pull_kind 'Error response from daemon: Head "https://ghcr.io/v2/techiebutler/freeframe-api/manifests/1.2.3": denied
+Error response from daemon: Get "https://ghcr.io/v2/": dial tcp: lookup ghcr.io: no such host'
+  assert_eq "$output" network
+}
+
 @test "pull failure kind: anything else, an empty output, or a missing program, is other" {
   local o
-  for o in '' 'something unexpected happened' 'error getting credentials - err: exec: "docker-credential-desktop": executable file not found in $PATH'; do
+  for o in '' 'something unexpected happened' \
+    'error getting credentials - err: exec: "docker-credential-desktop": executable file not found in $PATH' \
+    'error getting credentials - err: exit status 1, out: `not found`' \
+    'docker-credential-pass: command not found' \
+    'open /root/.docker/config.json: no such file or directory' \
+    'permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock: Get "http://%2Fvar%2Frun%2Fdocker.sock/v1.47/images/json": dial unix /var/run/docker.sock: connect: permission denied' \
+    'failed to register layer: Error processing tar file(exit status 1): open /usr/lib/x: permission denied'; do
     run _pull_kind "$o"
     [ "$status" -eq 0 ]
     assert_eq "$output" other
@@ -2173,11 +2185,33 @@ write /var/lib/docker/tmp/x: no space left on device'
   [ "$status" -eq 1 ]
   assert_out "is not available on ghcr.io yet (the release may not be published, or its images are not public)."
   assert_out "check https://github.com/Techiebutler/freeframe/releases for a newer release; to pin a release that is published, set FREEFRAME_VERSION in $FF_ROOT/.env.prod, then run sudo freeframe install again."
+  assert_out "If this server was logged in to ghcr.io with docker login, run sudo docker logout ghcr.io and try again."
   assert_out "continues from here"
   assert_no_out "can reach ghcr.io"
   assert_no_out "could not be downloaded"
-  # What docker said is in the log, for whoever has to look.
+  # What docker said is in the log, for whoever has to look, and never on the screen.
+  assert_no_out "manifest unknown"
   grep -q "manifest unknown" "$FF_ROOT/install.log"
+}
+
+@test "install: what the download prints reaches install.log while it runs" {
+  plain_answers
+  export STUB_PULL_FAIL=1 STUB_PULL_ERR='Error response from daemon: manifest unknown' STUB_PULL_PEEK=1
+  ff_install --yes
+  [ "$status" -eq 1 ]
+  [ -e "$BATS_TEST_TMPDIR/pull-live" ]
+}
+
+@test "install: only the end of what the download printed decides, so old output cannot" {
+  plain_answers
+  # "manifest unknown" first, then more than 64 KiB of other lines.
+  STUB_PULL_ERR="manifest unknown
+$(head -c 70000 /dev/zero | tr '\0' x)"
+  export STUB_PULL_FAIL=1 STUB_PULL_ERR
+  ff_install --yes
+  [ "$status" -eq 1 ]
+  assert_out "from ghcr.io failed."
+  assert_no_out "is not available on ghcr.io"
 }
 
 @test "install: a download that cannot reach ghcr.io keeps the network advice" {

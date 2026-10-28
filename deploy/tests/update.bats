@@ -341,11 +341,19 @@ SCRIPT
   ff update
   [ "$status" -eq 1 ]
   assert_out "FreeFrame 1.22.0 is not available on ghcr.io yet (the release may not be published, or its images are not public)."
-  assert_out "check https://github.com/Techiebutler/freeframe/releases for a newer release, then run sudo freeframe update again later. Nothing was changed, so running it again is safe."
+  assert_out "check https://github.com/Techiebutler/freeframe/releases for a newer release, then run sudo freeframe update again later; nothing was changed, so running it again is safe."
+  assert_out "If this server was logged in to ghcr.io with docker login, run sudo docker logout ghcr.io and try again."
   assert_no_out "can reach ghcr.io"
   assert_no_out "could not be downloaded"
+  assert_no_out "manifest unknown"
   assert_not_called "dc up -d"
   cmp "$FF_ROOT/docker-compose.images.yml" "$BATS_TEST_TMPDIR/images.before"
+}
+
+@test "update: when an earlier update's files were put back first, the missing-release advice says so" {
+  run bash -c 'source "$1"; FF_PULL_OUT="manifest unknown" FF_UPDATE_PUT_BACK=1; _ff_pull_failure_text update 1.22.0; printf "%s" "$FF_PULL_TRY"' ff "$FF_SCRIPT"
+  [ "$status" -eq 0 ]
+  [[ $output == *"nothing else was changed (the setup files from before an earlier update that stopped part-way were put back first), so running it again is safe."* ]] || { echo "$output"; false; }
 }
 
 @test "update: a download that cannot reach ghcr.io keeps the network advice" {
