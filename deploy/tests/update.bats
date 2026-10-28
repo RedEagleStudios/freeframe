@@ -1005,3 +1005,41 @@ killed_update_state() {
   [ -f "$FF_ROOT/docker-compose.gpu.yml" ]
 }
 
+
+@test "update gpu worker: after the new version starts, a worker that never sees the GPU is started again once, and the update still succeeds" {
+  printf 'services:\n  worker: {}\n' >"$STUB_REMOTE/docker-compose.gpu.yml"
+  printf 'services:\n  worker: {}\n' >"$FF_ROOT/docker-compose.gpu.yml"
+  env_set "$ENV" FREEFRAME_GPU nvidia
+  export STUB_GPU=ready STUB_WORKER_SMI=fail
+  ff update
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(grep -c '^dc up -d --no-build --no-deps --force-recreate worker$' "$CALLS")" 1
+  assert_order "localhost:8000/health" "exec -T worker nvidia-smi -L" "up -d --no-build --no-deps --force-recreate worker" "exec -T worker nvidia-smi -L"
+  assert_out "video is processed on the CPU for now"
+  assert_out "FreeFrame was updated from 1.21.0 to 1.22.0."
+  assert_has "$ENV" "FREEFRAME_GPU=nvidia"
+}
+
+@test "update gpu worker: a worker that sees the GPU is not touched" {
+  printf 'services:\n  worker: {}\n' >"$STUB_REMOTE/docker-compose.gpu.yml"
+  printf 'services:\n  worker: {}\n' >"$FF_ROOT/docker-compose.gpu.yml"
+  env_set "$ENV" FREEFRAME_GPU nvidia
+  export STUB_GPU=ready
+  ff update
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(grep -c '^dc exec -T worker nvidia-smi -L$' "$CALLS")" 1
+  assert_not_called "no-deps"
+  assert_no_out "CPU"
+}
+
+@test "update gpu worker: the timer refresh's daemon-reload takes the GPU from the worker; the check after it gives it back" {
+  printf 'services:\n  worker: {}\n' >"$STUB_REMOTE/docker-compose.gpu.yml"
+  printf 'services:\n  worker: {}\n' >"$FF_ROOT/docker-compose.gpu.yml"
+  env_set "$ENV" FREEFRAME_GPU nvidia
+  export STUB_GPU=ready STUB_RELOAD_DROPS_GPU=1
+  ff update
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_order install_backup_timer "dc exec -T worker nvidia-smi -L" "up -d --no-build --no-deps --force-recreate worker"
+  [ -e "$STUB_DIR/worker-gpu-up" ]
+  assert_out "The worker did not see the GPU at first, so it was started again; it uses the GPU now."
+}

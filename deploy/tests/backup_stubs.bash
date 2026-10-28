@@ -8,6 +8,9 @@
 
 _stub_log() { printf '%s\n' "$*" >>"$CALLS"; }
 
+# shellcheck source-path=SCRIPTDIR source=gpu_worker_stubs.bash
+source "${BASH_SOURCE[0]%/*}/gpu_worker_stubs.bash"
+
 ff_is_root() { [[ -z ${STUB_NOT_ROOT:-} ]]; }
 ff_sleep() { _stub_log "sleep $1"; }
 _ff_free_mb() { printf '%s\n' "${STUB_FREE_MB:-80000}"; }
@@ -127,11 +130,24 @@ dc() {
       ;;
     *"localhost:8000/health"*) [[ -z ${STUB_API_DOWN:-} ]] ;;
     "up -d --no-build postgres") [[ -z ${STUB_PG_DOWN:-} ]] ;;
-    "up -d"*) [[ -z ${STUB_UP_FAIL:-} ]] ;;
+    "exec -T worker nvidia-smi -L") _stub_worker_smi ;;
+    "ps -q --status running worker") echo 0123456789ab ;;
+    "up -d --no-build --no-deps --force-recreate worker") _stub_worker_recreated ;;
+    "up -d"*)
+      [[ -z ${STUB_UP_FAIL:-} ]] || return 1
+      _stub_worker_started
+      ;;
     "stop "*)
       [[ -z ${STUB_STOP_HANG:-} ]] || _stub_hang stop
       [[ -z ${STUB_STOP_FAIL:-} ]]
       ;;
     *) return 0 ;;
   esac
+}
+
+# dc with a time limit: logged, then the stubbed dc.
+dc_bounded() {
+  _stub_log "dc_bounded $*"
+  shift
+  dc "$@"
 }

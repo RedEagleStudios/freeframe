@@ -1127,7 +1127,8 @@ EOF
 # Safe to run again: it replaces the units with the fetched ones. Starting a
 # Persistent=true timer that missed a run fires that run at once; update and
 # rollback call this holding the lock, and the backup then skips itself
-# (cmd_backup) instead of failing in the journal.
+# (cmd_backup) instead of failing in the journal. Its daemon-reload can take
+# the GPU away from a running worker, so _gpu_worker_check comes after it.
 install_backup_timer() {
   local root dir u
   root=$(ff_root)
@@ -1418,10 +1419,13 @@ _gpu_summary() {
   fi
 }
 
-# _gpu_ready_line: the closing message's line.
+# _gpu_ready_line: the closing message's line. With the GPU chosen, what
+# the worker said after the start (_gpu_worker_check) decides, not the plan.
 _gpu_ready_line() {
-  if [[ ${FF_GPU:-off} == nvidia ]]; then
-    printf 'Video processing: GPU (%s)' "$FF_GPU_NAME"
+  if [[ ${FF_GPU:-off} == nvidia && ${FF_GPU_WORKER:-} == unseen ]]; then
+    printf 'Video processing: CPU for now: the worker could not use the GPU%s.' "$(_gpu_worker_named)"
+  elif [[ ${FF_GPU:-off} == nvidia ]]; then
+    printf 'Video processing: GPU (%s)' "${FF_GPU_NAME:-${FF_GPU_WORKER_NAME:-NVIDIA}}"
   else
     printf 'Video processing: CPU (%s)' "${FF_GPU_WHY:-no GPU found}"
   fi
@@ -1543,6 +1547,123 @@ _gpu_start_check() {
   _gpu_cpu_reason
   warn "The NVIDIA GPU cannot be used now ($FF_GPU_WHY), so FreeFrame starts with video processing on the CPU until that is fixed."
   warn "FREEFRAME_GPU=nvidia is kept: once the GPU works again, run: sudo freeframe restart"
+}
+
+# --- After a start: does the worker see the GPU? A worker created with the
+# GPU reservation can lose it while it runs: on a host where Docker uses the
+# systemd cgroup driver, `systemctl daemon-reload` (install_backup_timer runs
+# one) takes the GPU devices away from running containers, NVIDIA's known
+# "Failed to initialize NVML" issue (on WSL2: "GPU access blocked by the
+# operating system"). A container created again has them back. The
+# transcoder falls back to the CPU on its own, so this never fails a
+# command: it runs after the last daemon-reload of the command, starts the
+# worker again once, and the messages say what is true.
+
+FF_GPU_HELP="$FF_GUIDE_URL#troubleshooting-the-installer"
+
+# _gpu_worker_log TEXT: one line of the check, into the log only, on a
+# line of its own (the health check's curl leaves no newline).
+_gpu_worker_log() {
+  local pre=""
+  [[ -n ${FF_LOG:-} ]] || return 0
+  if [[ -n $(tail -c 1 "$FF_LOG" 2>/dev/null) ]]; then pre=$'\n'; fi
+  { printf '%sGPU self-check: %s\n' "$pre" "$1" >>"$FF_LOG"; } 2>/dev/null || true
+}
+
+# _gpu_list_name TEXT: the GPU's name in the first line of nvidia-smi -L
+# ("GPU 0: NVIDIA L4 (UUID: GPU-...)" gives "NVIDIA L4").
+_gpu_list_name() {
+  local name=${1%%$'\n'*}
+  name=${name%$'\r'}
+  name=${name#GPU *: }
+  printf '%s' "${name% (UUID:*}"
+}
+
+_gpu_worker_running() { [[ -n $(dc_bounded 30 ps -q --status running worker 2>/dev/null) ]]; }
+
+# _gpu_worker_sees: ask the worker as status does (nvidia-smi -L, whose
+# first line starts with "GPU "). Its answer goes to the log; the name to
+# FF_GPU_WORKER_NAME.
+_gpu_worker_sees() {
+  local out="" rc=0 line said=""
+  out=$(dc_bounded 30 exec -T worker nvidia-smi -L 2>>"${FF_LOG:-/dev/null}") || rc=$?
+  while IFS= read -r line; do
+    line=${line%$'\r'}
+    if [[ -n $line ]]; then said+="${said:+; }$line"; fi
+  done <<<"$out"
+  _gpu_worker_log "the worker's nvidia-smi -L said: ${said:-nothing} (exit $rc)"
+  ((rc == 0)) && [[ $out == "GPU "* ]] || return 1
+  FF_GPU_WORKER_NAME=$(_gpu_list_name "$out")
+}
+
+# _gpu_worker_wait: give the worker a moment to be running (bounded:
+# FF_GPU_WORKER_WAIT seconds, 60 by default); it is asked either way.
+_gpu_worker_wait() {
+  _ff_wait_for "${FF_GPU_WORKER_WAIT:-60}" 2 _gpu_worker_running ||
+    _gpu_worker_log "the worker is not running after ${FF_GPU_WORKER_WAIT:-60} seconds; asking it anyway"
+}
+
+# _gpu_worker_check: after a start that gave the worker the GPU (the GPU
+# file in this start's compose files: FREEFRAME_GPU=nvidia, the file there
+# and not left out by _gpu_start_check). Nothing at all otherwise. Asks the
+# worker; when it does not see the GPU, creates it again once (a new
+# container gets the reservation from the compose files as they are now,
+# as freeframe restart does) and asks again. Sets FF_GPU_WORKER: seen,
+# unseen, or empty (not checked); FF_GPU_WORKER_AGAIN=1 when it was
+# created again. FREEFRAME_GPU is never changed, so a later start can use
+# the GPU.
+_gpu_worker_check() {
+  local root
+  root=$(ff_root)
+  FF_GPU_WORKER="" FF_GPU_WORKER_NAME="" FF_GPU_WORKER_AGAIN=""
+  [[ $(compose_files "$root/.env.prod") == *"-f docker-compose.gpu.yml"* ]] || return 0
+  _gpu_worker_wait
+  if _gpu_worker_sees; then
+    FF_GPU_WORKER=seen
+    _gpu_worker_log "the worker sees the GPU ($FF_GPU_WORKER_NAME)"
+    return 0
+  fi
+  _gpu_worker_log "the worker does not see the GPU; creating it again (docker compose up -d --no-build --no-deps --force-recreate worker)"
+  FF_GPU_WORKER_AGAIN=1
+  _ff_logged dc up -d --no-build --no-deps --force-recreate worker ||
+    _gpu_worker_log "the worker could not be created again"
+  _gpu_worker_wait
+  if _gpu_worker_sees; then
+    FF_GPU_WORKER=seen
+    _gpu_worker_log "created again, the worker sees the GPU ($FF_GPU_WORKER_NAME)"
+    return 0
+  fi
+  FF_GPU_WORKER=unseen
+  _gpu_worker_log "created again, the worker still does not see the GPU: video is processed on the CPU for now (FREEFRAME_GPU=nvidia is kept)"
+}
+
+# _gpu_worker_named: " (NAME)" for the messages, or nothing when the name
+# is not known.
+_gpu_worker_named() {
+  local n=${FF_GPU_WORKER_NAME:-${FF_GPU_NAME:-}}
+  if [[ -n $n && $n != NVIDIA ]]; then printf ' (%s)' "$n"; fi
+}
+
+# _gpu_worker_try: what to do when the worker could not use the GPU.
+_gpu_worker_try() {
+  printf 'FREEFRAME_GPU=nvidia is kept. To try the GPU again, run: sudo freeframe restart. If video stays on the CPU, see %s' "$FF_GPU_HELP"
+}
+
+# _gpu_worker_say: what _gpu_worker_check found, for update, rollback,
+# restore, restart and configure.
+_gpu_worker_say() {
+  case ${FF_GPU_WORKER:-} in
+    seen)
+      if [[ -n ${FF_GPU_WORKER_AGAIN:-} ]]; then
+        say "The worker did not see the GPU at first, so it was started again; it uses the GPU now."
+      fi
+      ;;
+    unseen)
+      warn "The worker could not use the NVIDIA GPU$(_gpu_worker_named), even after it was started again, so video is processed on the CPU for now. What nvidia-smi said is in ${FF_LOG:-$(ff_root)/install.log}."
+      warn "$(_gpu_worker_try)"
+      ;;
+  esac
+  return 0
 }
 
 # _gpu_setup: set the toolkit up (its output goes to the log), then wait for
@@ -3528,6 +3649,27 @@ _install_start_step() {
   FF_STATE="FreeFrame is running. Running sudo freeframe install again keeps your settings and finishes the remaining checks."
 }
 
+# _install_gpu_worker_step: with the GPU chosen, check that the worker the
+# start created can use it (_gpu_worker_check). Never fails the install.
+_install_gpu_worker_step() {
+  FF_GPU_WORKER=""
+  [[ ${FF_GPU:-off} == nvidia ]] || return 0
+  FF_STEP="checking that the worker can use the GPU"
+  _ff_p "Checking that video processing can use the GPU..."
+  _gpu_worker_check
+  case ${FF_GPU_WORKER:-} in
+    seen)
+      if [[ -n ${FF_GPU_WORKER_AGAIN:-} ]]; then
+        _ff_p "The worker did not see the GPU at first, so it was started again; it uses the GPU now."
+      fi
+      ;;
+    unseen)
+      _ff_pw "The worker could not use the NVIDIA GPU$(_gpu_worker_named), even after it was started again, so video is processed on the CPU for now. What nvidia-smi said is in the log; the install goes on."
+      ;;
+  esac
+  return 0
+}
+
 _install_verify_step() {
   local file=$1 h ok=1 http_ip
   local -a hosts=()
@@ -3618,6 +3760,10 @@ _install_summary_lines() {
   say "$rule"
   say ""
   _ff_p "$(_gpu_ready_line)"
+  if [[ ${FF_GPU:-off} == nvidia && ${FF_GPU_WORKER:-} == unseen ]]; then
+    _ff_p "FREEFRAME_GPU=nvidia is kept, so a later start can use the GPU. To try it again, run the command below; if video stays on the CPU, see $FF_GPU_HELP"
+    say "   sudo freeframe restart"
+  fi
   if [[ -n ${FF_GPU_FAILED:-} ]]; then
     _ff_p "To try setting up the GPU again, run:"
     say "   sudo freeframe configure"
@@ -3741,6 +3887,9 @@ cmd_install() {
   _uninstall_marker_cancel
   _install_verify_step "$file"
   _install_backup_timer_step
+  # Last: the timer step's systemctl daemon-reload takes the GPU away from
+  # running containers (see _gpu_worker_check).
+  _install_gpu_worker_step
 
   printf 'FreeFrame installed %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" >"$root/.installed"
   trap - ERR
@@ -4474,6 +4623,9 @@ cmd_restore() {
     install_fail "The backup has been put back, but FreeFrame did not finish starting within $(((${FF_API_WAIT:-600} + 59) / 60)) minutes." \
       "see why with: sudo freeframe logs, then run: sudo freeframe restart"
   fi
+  FF_STEP="checking that the worker can use the GPU"
+  _gpu_worker_check
+  _gpu_worker_say
   trap - ERR INT TERM HUP
   say ""
   say "The database is back as it was in $dump${when:+ (made $when)}."
@@ -5273,6 +5425,9 @@ cmd_update() {
   if ! _ff_logged install_backup_timer; then
     warn "The nightly backup timer could not be refreshed; the one set up before keeps running. The reason is at the end of $FF_LOG."
   fi
+  FF_STEP="checking that the worker can use the GPU"
+  _gpu_worker_check
+  _gpu_worker_say
   trap - ERR INT TERM HUP
   say ""
   if [[ -n $pinned ]]; then
@@ -5352,6 +5507,9 @@ _rollback_unstarted() {
     warn "The nightly backup timer could not be refreshed; the one set up before keeps running. The reason is at the end of $FF_LOG."
   fi
   _update_undo_clear
+  FF_STEP="checking that the worker can use the GPU"
+  _gpu_worker_check
+  _gpu_worker_say
   trap - ERR INT TERM HUP
   say ""
   say "FreeFrame is back on $old."
@@ -5561,6 +5719,9 @@ cmd_rollback() {
     warn "The nightly backup timer could not be refreshed; the one set up before keeps running. The reason is at the end of $FF_LOG."
   fi
   _update_undo_clear
+  FF_STEP="checking that the worker can use the GPU"
+  _gpu_worker_check
+  _gpu_worker_say
   trap - ERR INT TERM HUP
   say ""
   say "FreeFrame is back on $old, with the database as it was just before the update${when:+ ($when)}."
@@ -6219,6 +6380,8 @@ cmd_configure() {
   if ! _ff_wait_healthy "$FF_CFG_MODE" "$FF_CFG_HOST"; then
     install_fail "FreeFrame did not answer at $url after the change." "see why with: sudo freeframe logs"
   fi
+  FF_STEP="checking that the worker can use the GPU"
+  _gpu_worker_check
   if [[ -n ${FF_CFG_NEW[FRONTEND_URL]:-} && $FF_CFG_MODE != off ]]; then
     FF_STEP="waiting for the HTTPS certificate"
     say "Waiting for the HTTPS certificate from Let's Encrypt (usually under a minute)..."
@@ -6251,6 +6414,13 @@ cmd_configure() {
   if [[ -n ${FF_CFG_NEW[FREEFRAME_GPU]+x} || -n ${FF_GPU_SETUP:-} ]]; then
     FF_GPU=$(env_get "$file" FREEFRAME_GPU) FF_GPU_WHY="you chose the CPU"
     say "$(_gpu_ready_line)"
+    if [[ $FF_GPU == nvidia && ${FF_GPU_WORKER:-} == unseen ]]; then
+      say "$(_gpu_worker_try)"
+    elif [[ $FF_GPU == nvidia && -n ${FF_GPU_WORKER_AGAIN:-} ]]; then
+      _gpu_worker_say
+    fi
+  else
+    _gpu_worker_say
   fi
   _install_log_stop
 }
@@ -6300,9 +6470,7 @@ _status_gpu() {
     return 0
   fi
   if out=$(dc_bounded 30 exec -T worker nvidia-smi -L 2>/dev/null) && [[ $out == "GPU "* ]]; then
-    name=${out%%$'\n'*}
-    name=${name#GPU *: }
-    name=${name% (UUID:*}
+    name=$(_gpu_list_name "$out")
     forced=$(_status_gpu_forced_off "$file")
     if [[ -n $forced ]]; then
       say "${pre}processed on the CPU: $forced in $file keeps video off the GPU (the worker sees $name). To use the GPU, delete that line, then run: sudo freeframe restart"
@@ -6558,6 +6726,9 @@ cmd_restart() {
     _ff_manage_stop 1 "FreeFrame was restarted but did not finish starting within $(((${FF_API_WAIT:-600} + 59) / 60)) minutes." \
       "see why with: sudo freeframe logs"
   fi
+  FF_STEP="checking that the worker can use the GPU"
+  _gpu_worker_check
+  _gpu_worker_say
   url=$(env_get "$root/.env.prod" FRONTEND_URL)
   say "FreeFrame is running again: $url"
 }

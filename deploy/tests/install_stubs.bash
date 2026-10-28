@@ -8,6 +8,9 @@
 
 _stub_log() { printf '%s\n' "$*" >>"$CALLS"; }
 
+# shellcheck source-path=SCRIPTDIR source=gpu_worker_stubs.bash
+source "${BASH_SOURCE[0]%/*}/gpu_worker_stubs.bash"
+
 ff_is_root() { [[ -z ${STUB_NOT_ROOT:-} ]]; }
 machine_arch() { printf '%s\n' "${STUB_ARCH:-x86_64}"; }
 _ff_kernel() { printf '%s\n' "${STUB_KERNEL:-Linux}"; }
@@ -92,6 +95,7 @@ ff_sleep() { _stub_log "sleep $1"; }
 
 install_backup_timer() {
   _stub_log install_backup_timer
+  _stub_daemon_reload
   [[ -z ${STUB_TIMER_FAIL:-} ]]
 }
 
@@ -127,6 +131,11 @@ dc() {
       printf '%s\n%s' "${STUB_ADMIN_BODY:-$body}" "${STUB_ADMIN_CODE:-201}"
       ;;
     "up -d --no-build traefik") [[ -z ${STUB_TRAEFIK_FAIL:-} ]] ;;
+    # The worker, and what it sees of the GPU (gpu_worker_stubs.bash).
+    "up -d --no-build --no-deps --force-recreate worker") _stub_worker_recreated ;;
+    "up -d --no-build "*) _stub_worker_started ;;
+    "exec -T worker nvidia-smi -L") _stub_worker_smi ;;
+    "ps -q --status running worker") [[ -n ${STUB_WORKER_DOWN:-} ]] || echo 0123456789ab ;;
     *"localhost:8000/health"*) [[ -z ${STUB_API_DOWN:-} ]] ;;
     # Our own containers from an earlier attempt (STUB_OURS_RUNNING).
     # `stop traefik` stops it, unless STUB_TRAEFIK_STUCK.
@@ -195,3 +204,9 @@ install_nvidia_toolkit() {
 # STUB_OTHER_CONTAINERS: how many containers that are not FreeFrame's run.
 _gpu_other_containers() { printf '%s' "${STUB_OTHER_CONTAINERS:-0}"; }
 
+# dc with a time limit: logged, then the stubbed dc.
+dc_bounded() {
+  _stub_log "dc_bounded $*"
+  shift
+  dc "$@"
+}

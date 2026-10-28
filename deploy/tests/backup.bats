@@ -1159,3 +1159,28 @@ UNITS="${BATS_TEST_DIRNAME}/../systemd"
   assert_eq "$(_ff_stamp_date freeframe-20261026-030412.dump)" "2026-10-26 03:04:12"
   assert_eq "$(_ff_stamp_date something.dump)" ""
 }
+
+# ---------------------------------------------------------------- the worker's GPU, after a restore
+
+@test "restore gpu worker: after FreeFrame starts again, a worker that never sees the GPU is started again once; the restore still succeeds" {
+  old_backup 20261020-030000
+  printf 'FREEFRAME_GPU=nvidia\n' >>"$ENV"
+  printf 'services:\n  worker: {}\n' >"$FF_ROOT/docker-compose.gpu.yml"
+  export STUB_WORKER_SMI=fail
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_order "dc exec -T postgres pg_restore" "localhost:8000/health" "exec -T worker nvidia-smi -L" \
+    "up -d --no-build --no-deps --force-recreate worker" "exec -T worker nvidia-smi -L"
+  [ "$(grep -c '^dc up -d --no-build --no-deps --force-recreate worker$' "$CALLS")" -eq 1 ]
+  assert_out "The database is back as it was"
+  assert_out "The worker could not use the NVIDIA GPU, even after it was started again, so video is processed on the CPU for now."
+}
+
+@test "restore gpu worker: with the GPU off, the worker is not asked" {
+  old_backup 20261020-030000
+  export STUB_WORKER_SMI=fail
+  ff restore --yes "$BK/freeframe-20261020-030000.dump"
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_not_called "nvidia-smi"
+  assert_not_called "no-deps"
+}

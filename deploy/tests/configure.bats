@@ -604,3 +604,52 @@ gpu_file() { printf 'services:\n  worker: {}\n' >"$FF_ROOT/docker-compose.gpu.ym
   assert_has "$ENV" "FREEFRAME_GPU=nvidia"
 }
 
+
+# ---------------------------------------------------------------- the worker's GPU, after the restart
+
+@test "configure gpu worker: the GPU turned on, but the worker never sees it: started again once, and the closing line says the CPU" {
+  installed_server off bundled
+  gpu_file
+  export STUB_GPU=ready STUB_WORKER_SMI=fail
+  ff configure --yes --gpu nvidia
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(grep -c '^dc up -d --no-build --no-deps --force-recreate worker$' "$CALLS")" 1
+  assert_order "dc up -d --no-build --force-recreate" "localhost:8000/health" "exec -T worker nvidia-smi -L"
+  grep -qxF "Video processing: CPU for now: the worker could not use the GPU (NVIDIA GeForce RTX 5070 Ti)." <<<"$output" ||
+    { echo "$output"; false; }
+  assert_out "FREEFRAME_GPU=nvidia is kept. To try the GPU again, run: sudo freeframe restart."
+  assert_no_out "Video processing: GPU"
+  assert_has "$ENV" "FREEFRAME_GPU=nvidia"
+}
+
+@test "configure gpu worker: the GPU turned on and seen after one more start says the GPU" {
+  installed_server off bundled
+  gpu_file
+  export STUB_GPU=ready STUB_WORKER_SMI=restart
+  ff configure --yes --gpu nvidia
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(grep -c '^dc up -d --no-build --no-deps --force-recreate worker$' "$CALLS")" 1
+  grep -qxF "Video processing: GPU (NVIDIA GeForce RTX 5070 Ti)" <<<"$output" || { echo "$output"; false; }
+}
+
+@test "configure gpu worker: another change with the GPU on checks the worker too, and warns when it does not see it" {
+  installed_server sslip bundled
+  gpu_file
+  env_set "$ENV" FREEFRAME_GPU nvidia
+  export STUB_GPU=ready STUB_WORKER_SMI=fail
+  ff configure --yes --domain review.yourstudio.com
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(grep -c '^dc up -d --no-build --no-deps --force-recreate worker$' "$CALLS")" 1
+  assert_out "video is processed on the CPU for now"
+}
+
+@test "configure gpu worker: --gpu off asks the worker nothing" {
+  installed_server off bundled
+  env_set "$ENV" FREEFRAME_GPU nvidia
+  gpu_file
+  export STUB_GPU=ready STUB_WORKER_SMI=fail
+  ff configure --yes --gpu off
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_not_called "nvidia-smi"
+  assert_not_called "no-deps"
+}

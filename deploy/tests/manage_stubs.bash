@@ -10,6 +10,9 @@
 
 _stub_log() { printf '%s\n' "$*" >>"$CALLS"; }
 
+# shellcheck source-path=SCRIPTDIR source=gpu_worker_stubs.bash
+source "${BASH_SOURCE[0]%/*}/gpu_worker_stubs.bash"
+
 ff_is_root() { [[ -z ${STUB_NOT_ROOT:-} ]]; }
 ff_sleep() { _stub_log "sleep $1"; }
 _ff_free_mb() { printf '%s\n' "${STUB_FREE_MB:-80000}"; }
@@ -102,6 +105,7 @@ fi
 # output and exit status go to $STUB_DIR/timer-backup.out and .rc.
 install_backup_timer() {
   _stub_log install_backup_timer
+  _stub_daemon_reload
   [[ -z ${STUB_TIMER_HANG:-} ]] || _stub_hang timer
   if [[ -n ${STUB_TIMER_RUNS_BACKUP:-} ]]; then
     local rc=0
@@ -232,16 +236,14 @@ dc() {
       fi
       return 1
       ;;
-    # What the worker container sees of the GPU (STUB_WORKER_GPU: its
-    # nvidia-smi -L line; empty: nvidia-smi fails in it).
-    "exec -T worker nvidia-smi -L")
-      [[ -n ${STUB_WORKER_GPU:-} ]] || return 1
-      printf '%s\n' "$STUB_WORKER_GPU"
-      ;;
+    # What the worker container sees of the GPU (gpu_worker_stubs.bash).
+    "exec -T worker nvidia-smi -L") _stub_worker_smi ;;
+    "up -d --no-build --no-deps --force-recreate worker") _stub_worker_recreated ;;
     "up -d"*)
       # The compose files this start used.
       _stub_log "files $(compose_files "$FF_ROOT/.env.prod")"
-      [[ -z ${STUB_UP_FAIL:-} ]]
+      [[ -z ${STUB_UP_FAIL:-} ]] || return 1
+      _stub_worker_started
       ;;
     "logs "*) printf 'api-1  | started\n' ;;
     *) return 0 ;;

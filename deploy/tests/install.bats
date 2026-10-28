@@ -2587,3 +2587,123 @@ rest_gpu() { REST_GPU=(1 "" "Grace" "grace@example.com" "long-password-1" "long-
   grep -qxF "GPU check: state none, nvidia-smi: no answer; video on the CPU" "$FF_ROOT/install.log" || { cat "$FF_ROOT/install.log"; false; }
 }
 
+
+# ---------------------------------------------------------------- the worker's GPU, after the start
+
+# smi_asks / recreates: how often the worker was asked about the GPU, and
+# created again on its own.
+smi_asks() { grep -c '^dc exec -T worker nvidia-smi -L$' "$CALLS" || true; }
+recreates() { grep -c '^dc up -d --no-build --no-deps --force-recreate worker$' "$CALLS" || true; }
+
+@test "gpu worker: a worker that sees the GPU at the first ask is asked once and not started again" {
+  plain_answers
+  export STUB_GPU=ready STUB_WORKER_SMI=pass
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(smi_asks)" 1
+  assert_eq "$(recreates)" 0
+  grep -qx "dc_bounded 30 exec -T worker nvidia-smi -L" "$CALLS" || { cat "$CALLS"; false; }
+  # After FreeFrame is started, with a wait for the worker first.
+  assert_order "dc up -d --no-build traefik" "ps -q --status running worker" "exec -T worker nvidia-smi -L"
+  grep -qxF " Video processing: GPU (NVIDIA GeForce RTX 5070 Ti)" <<<"$output" || { echo "$output"; false; }
+  grep -qxF "GPU self-check: the worker sees the GPU (NVIDIA GeForce RTX 5070 Ti)" "$FF_ROOT/install.log" ||
+    { cat "$FF_ROOT/install.log"; false; }
+  assert_no_out "started again"
+}
+
+@test "gpu worker: a worker that does not see the GPU is started again once, and then does" {
+  plain_answers
+  export STUB_GPU=ready STUB_WORKER_SMI=restart
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(recreates)" 1
+  assert_eq "$(smi_asks)" 2
+  assert_order "exec -T worker nvidia-smi -L" "up -d --no-build --no-deps --force-recreate worker" \
+    "ps -q --status running worker" "exec -T worker nvidia-smi -L"
+  assert_out "The worker did not see the GPU at first, so it was started again; it uses the GPU now."
+  grep -qxF " Video processing: GPU (NVIDIA GeForce RTX 5070 Ti)" <<<"$output" || { echo "$output"; false; }
+  # What nvidia-smi said is in the log, on one line.
+  grep -qxF "GPU self-check: the worker's nvidia-smi -L said: Failed to initialize NVML: GPU access blocked by the operating system; Failed to properly shut down NVML: GPU access blocked by the operating system (exit 255)" "$FF_ROOT/install.log" ||
+    { cat "$FF_ROOT/install.log"; false; }
+  assert_has "$ENV" "FREEFRAME_GPU=nvidia"
+}
+
+@test "gpu worker: a worker that never sees the GPU is started again once, the install goes on, and every line says the CPU" {
+  plain_answers
+  export STUB_GPU=ready STUB_WORKER_SMI=fail
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(recreates)" 1
+  assert_eq "$(smi_asks)" 2
+  assert_out "FreeFrame is ready: http://203.0.113.7"
+  assert_out "The worker could not use the NVIDIA GPU (NVIDIA GeForce RTX 5070 Ti), even after it was started again, so video is processed on the CPU for now."
+  grep -qxF " Video processing: CPU for now: the worker could not use the GPU (NVIDIA GeForce RTX 5070 Ti)." <<<"$output" ||
+    { echo "$output"; false; }
+  assert_no_out "Video processing: GPU"
+  assert_out "docs/deployment.md#troubleshooting-the-installer"
+  grep -qxF "   sudo freeframe restart" <<<"$output" || { echo "$output"; false; }
+  # The setting stays, so a later start can pick the GPU up.
+  assert_has "$ENV" "FREEFRAME_GPU=nvidia"
+  # The log has nvidia-smi's answer and the same closing line.
+  grep -qF "Failed to initialize NVML: GPU access blocked by the operating system" "$FF_ROOT/install.log"
+  grep -qxF " Video processing: CPU for now: the worker could not use the GPU (NVIDIA GeForce RTX 5070 Ti)." "$FF_ROOT/install.log" ||
+    { cat "$FF_ROOT/install.log"; false; }
+}
+
+@test "gpu worker: the nightly backup step's daemon-reload takes the GPU from the worker; the check comes after it and gives it back" {
+  plain_answers
+  export STUB_GPU=ready STUB_RELOAD_DROPS_GPU=1
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_order install_backup_timer "dc exec -T worker nvidia-smi -L" "up -d --no-build --no-deps --force-recreate worker"
+  assert_eq "$(recreates)" 1
+  # The worker FreeFrame is left with sees the GPU, as the closing line says.
+  [ -e "$STUB_DIR/worker-gpu-up" ]
+  grep -qxF " Video processing: GPU (NVIDIA GeForce RTX 5070 Ti)" <<<"$output" || { echo "$output"; false; }
+}
+
+@test "gpu worker: with the GPU off, the worker is never asked and nothing waits for it" {
+  local s
+  for s in none notoolkit nodriver; do
+    rm -rf "$FF_ROOT" && mkdir -p "$FF_ROOT"
+    : >"$CALLS"
+    plain_answers
+    export STUB_GPU=$s STUB_WORKER_SMI=fail
+    ff_install --yes
+    [ "$status" -eq 0 ] || { echo "$s: $output"; false; }
+    assert_not_called "nvidia-smi"
+    assert_not_called "ps -q --status running worker"
+    assert_not_called "force-recreate"
+    if grep -q '^GPU self-check' "$FF_ROOT/install.log"; then cat "$FF_ROOT/install.log"; false; fi
+  done
+}
+
+@test "gpu worker: chosen with --gpu off on a ready GPU, nothing is checked either" {
+  plain_answers
+  export STUB_GPU=ready STUB_WORKER_SMI=fail
+  ff_install --yes --gpu off
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_not_called "nvidia-smi"
+  grep -qxF " Video processing: CPU (chosen with --gpu off)" <<<"$output" || { echo "$output"; false; }
+}
+
+@test "gpu worker: a worker that is slow to start is waited for, within a limit, and asked anyway" {
+  plain_answers
+  export STUB_GPU=ready STUB_WORKER_SMI=pass STUB_WORKER_DOWN=1 FF_GPU_WORKER_WAIT=6
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  # 6 seconds, in steps of 2: four looks, three waits.
+  assert_eq "$(grep -c '^dc_bounded 30 ps -q --status running worker$' "$CALLS")" 4
+  assert_eq "$(smi_asks)" 1
+  grep -qxF " Video processing: GPU (NVIDIA GeForce RTX 5070 Ti)" <<<"$output" || { echo "$output"; false; }
+}
+
+@test "gpu worker: the toolkit set up by the install, then the worker checked" {
+  plain_answers
+  export STUB_GPU=notoolkit STUB_WORKER_SMI=fail
+  ff_install --yes --gpu nvidia
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_order install_nvidia_toolkit "exec -T worker nvidia-smi -L"
+  grep -qxF " Video processing: CPU for now: the worker could not use the GPU (NVIDIA GeForce RTX 5070 Ti)." <<<"$output" ||
+    { echo "$output"; false; }
+}

@@ -470,3 +470,74 @@ gpu_on() {
   assert_out "processed on the CPU: TRANSCODER_BACKEND=cpu in $ENV keeps video off the GPU"
 }
 
+
+# ---------------------------------------------------------------- the worker's GPU, after a start
+
+smi_asks() { grep -c '^dc exec -T worker nvidia-smi -L$' "$CALLS" || true; }
+recreates() { grep -c '^dc up -d --no-build --no-deps --force-recreate worker$' "$CALLS" || true; }
+
+@test "restart gpu worker: a worker that sees the GPU is asked once and left alone" {
+  gpu_on
+  export STUB_GPU=ready STUB_WORKER_SMI=pass
+  ff restart
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(smi_asks)" 1
+  assert_eq "$(recreates)" 0
+  assert_order "dc up -d --no-build --force-recreate" "localhost:8000/health" "ps -q --status running worker" "exec -T worker nvidia-smi -L"
+  assert_no_out "CPU"
+}
+
+@test "restart gpu worker: a worker that does not see the GPU is started again once, and then does" {
+  gpu_on
+  export STUB_GPU=ready STUB_WORKER_SMI=restart
+  ff restart
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(recreates)" 1
+  assert_eq "$(smi_asks)" 2
+  assert_out "The worker did not see the GPU at first, so it was started again; it uses the GPU now."
+  assert_no_out "on the CPU for now"
+  grep -qF "Failed to initialize NVML" "$FF_ROOT/install.log" || { cat "$FF_ROOT/install.log"; false; }
+}
+
+@test "restart gpu worker: a worker that never sees the GPU is started again once; the restart still works and says the CPU" {
+  gpu_on
+  export STUB_GPU=ready STUB_WORKER_SMI=fail
+  ff restart
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(recreates)" 1
+  assert_eq "$(smi_asks)" 2
+  assert_out "FreeFrame is running again"
+  assert_out "The worker could not use the NVIDIA GPU (NVIDIA GeForce RTX 5070 Ti), even after it was started again, so video is processed on the CPU for now."
+  assert_out "FREEFRAME_GPU=nvidia is kept. To try the GPU again, run: sudo freeframe restart. If video stays on the CPU, see https://github.com/Techiebutler/freeframe/blob/main/docs/deployment.md#troubleshooting-the-installer"
+  assert_has "$ENV" "FREEFRAME_GPU=nvidia"
+  grep -qF "Failed to initialize NVML" "$FF_ROOT/install.log"
+}
+
+@test "restart gpu worker: with the GPU off, or left out for this start, nothing is asked" {
+  export STUB_GPU=ready STUB_WORKER_SMI=fail
+  ff restart
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_not_called "nvidia-smi"
+  assert_not_called "ps -q --status running worker"
+  assert_not_called "no-deps"
+  # The GPU chosen, but it broke: the start leaves the GPU file out, so
+  # the worker is on the CPU and the start check said so already.
+  gpu_on
+  : >"$CALLS"
+  export STUB_GPU=nodriver
+  ff restart
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_not_called "nvidia-smi"
+  assert_not_called "no-deps"
+}
+
+@test "restart gpu worker: an answer that lists no GPU counts as not seeing it" {
+  gpu_on
+  export STUB_GPU=ready STUB_WORKER_SMI=nogpu
+  ff restart
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(recreates)" 1
+  assert_out "video is processed on the CPU for now"
+  grep -qF "GPU self-check: the worker's nvidia-smi -L said: No devices were found (exit 0)" "$FF_ROOT/install.log" ||
+    { cat "$FF_ROOT/install.log"; false; }
+}

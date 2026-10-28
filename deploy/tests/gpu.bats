@@ -649,3 +649,17 @@ toolkit_stubs() {
   assert_eq "$FF_GPU_SMI_LINE" ""
 }
 
+
+@test "_gpu_worker_log: each line of the worker check starts a line of its own in the log" {
+  export FF_LOG="$BATS_TEST_TMPDIR/install.log"
+  printf '{"status":"ok"}' >"$FF_LOG"
+  _gpu_worker_log "the worker sees the GPU (NVIDIA L4)"
+  _gpu_worker_log "second"
+  assert_eq "$(cat "$FF_LOG")" "$(printf '%s\n' '{"status":"ok"}' 'GPU self-check: the worker sees the GPU (NVIDIA L4)' 'GPU self-check: second')"
+  # No log: nothing, and no failure.
+  FF_LOG="" _gpu_worker_log "nowhere"
+}
+
+@test "_gpu_list_name: the name in nvidia-smi -L's first line" {
+  assert_eq "$(_gpu_list_name $'GPU 0: NVIDIA GeForce RTX 5070 Ti (UUID: GPU-e3f1c5ac)\r\nGPU 1: NVIDIA L4 (UUID: GPU-2)')" "NVIDIA GeForce RTX 5070 Ti"
+}

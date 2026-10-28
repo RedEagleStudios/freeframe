@@ -490,3 +490,44 @@ assert_state_is() {
   [[ $(compose_files "$ENV") != *gpu* ]]
   assert_files_from_before
 }
+
+@test "rollback gpu worker: the old version's worker is checked for the GPU after the start, and started again once" {
+  printf 'services:\n  worker: {}\n' >"$STUB_REMOTE/docker-compose.gpu.yml"
+  printf 'services:\n  worker: {}\n' >"$FF_ROOT/docker-compose.gpu.yml"
+  env_set "$ENV" FREEFRAME_GPU nvidia
+  export STUB_GPU=ready
+  failed_update
+  export STUB_WORKER_SMI=restart
+  ff rollback --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(grep -c '^dc up -d --no-build --no-deps --force-recreate worker$' "$CALLS")" 1
+  assert_out "The worker did not see the GPU at first, so it was started again; it uses the GPU now."
+  assert_out "FreeFrame is back on 1.21.0"
+}
+
+@test "rollback gpu worker: a never-started update's rollback checks the worker too" {
+  printf 'services:\n  worker: {}\n' >"$STUB_REMOTE/docker-compose.gpu.yml"
+  printf 'services:\n  worker: {}\n' >"$FF_ROOT/docker-compose.gpu.yml"
+  env_set "$ENV" FREEFRAME_GPU nvidia
+  export STUB_GPU=ready
+  unstarted_update
+  export STUB_WORKER_SMI=fail
+  ff rollback --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(grep -c '^dc up -d --no-build --no-deps --force-recreate worker$' "$CALLS")" 1
+  assert_out "video is processed on the CPU for now"
+  assert_database_untouched
+}
+
+@test "rollback gpu worker: the timer refresh's daemon-reload takes the GPU from the worker; the check after it gives it back" {
+  printf 'services:\n  worker: {}\n' >"$STUB_REMOTE/docker-compose.gpu.yml"
+  printf 'services:\n  worker: {}\n' >"$FF_ROOT/docker-compose.gpu.yml"
+  env_set "$ENV" FREEFRAME_GPU nvidia
+  export STUB_GPU=ready
+  failed_update
+  export STUB_RELOAD_DROPS_GPU=1
+  ff rollback --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_order install_backup_timer "dc exec -T worker nvidia-smi -L" "up -d --no-build --no-deps --force-recreate worker"
+  [ -e "$STUB_DIR/worker-gpu-up" ]
+}
