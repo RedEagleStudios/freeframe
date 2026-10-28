@@ -609,3 +609,33 @@ toolkit_stubs() {
   assert_eq "$(_gpu_other_containers)" 0
 }
 
+@test "install_nvidia_toolkit: an admin's own NVIDIA sources list comes back when the install fails" {
+  toolkit_stubs
+  printf 'deb [arch=amd64] https://mirror.example/nvidia /\n' >"$FF_NVIDIA_LIST"
+  APT_FAIL="install nvidia-container-toolkit"
+  run install_nvidia_toolkit
+  [ "$status" -ne 0 ]
+  assert_eq "$(cat "$FF_NVIDIA_LIST")" "deb [arch=amd64] https://mirror.example/nvidia /"
+}
+
+@test "install_nvidia_toolkit: an admin's own NVIDIA sources list is never deleted when the download fails" {
+  toolkit_stubs
+  printf 'deb [arch=amd64] https://mirror.example/nvidia /\n' >"$FF_NVIDIA_LIST"
+  LIST_BODY='<html>rate limited</html>'
+  run install_nvidia_toolkit
+  [ "$status" -ne 0 ]
+  assert_eq "$(cat "$FF_NVIDIA_LIST")" "deb [arch=amd64] https://mirror.example/nvidia /"
+}
+
+@test "install_nvidia_toolkit: an admin's own NVIDIA sources list is kept aside when NVIDIA's replaces it" {
+  toolkit_stubs
+  printf 'deb [arch=amd64] https://mirror.example/nvidia /\n' >"$FF_NVIDIA_LIST"
+  install_nvidia_toolkit
+  [[ $(cat "$FF_NVIDIA_LIST") == "deb [signed-by="* ]]
+  local kept
+  kept=$(ls "$BATS_TEST_TMPDIR"/nvidia-container-toolkit.list.before-freeframe-*)
+  assert_eq "$(cat "$kept")" "deb [arch=amd64] https://mirror.example/nvidia /"
+  # Not inside sources.list.d, where apt would read or warn about it.
+  [ -z "$(ls "$(dirname "$FF_NVIDIA_LIST")" | grep -v '^nvidia-container-toolkit.list$')" ]
+}
+

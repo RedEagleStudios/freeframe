@@ -1405,13 +1405,14 @@ _gpu_ready_line() {
 # list, apt install nvidia-container-toolkit), then Docker set up for it
 # (nvidia-ctk runtime configure) and restarted. When the toolkit is already
 # installed only Docker is set up. A failure after the sources list is
-# written removes it again, so a broken list never blocks apt. Docker's
+# written puts the list back as it was (removed, or someone's own list from
+# before), so a broken list never blocks apt and no one's file is lost. Docker's
 # daemon.json is copied aside before nvidia-ctk changes it
 # (FF_GPU_DAEMON_BACKUP; empty when there was none), for _gpu_daemon_undo.
 install_nvidia_toolkit() {
   # FF_NVIDIA_KEYRING and FF_NVIDIA_LIST are for the tests.
   local key=${FF_NVIDIA_KEYRING:-/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg}
-  local list=${FF_NVIDIA_LIST:-/etc/apt/sources.list.d/nvidia-container-toolkit.list} tmp
+  local list=${FF_NVIDIA_LIST:-/etc/apt/sources.list.d/nvidia-container-toolkit.list} tmp saved=""
   if ! command -v nvidia-ctk >/dev/null 2>&1; then
     run_apt update || return 1
     # NVIDIA's guide names gnupg2, a transitional name for gnupg.
@@ -1421,15 +1422,28 @@ install_nvidia_toolkit() {
       install -m 0755 -d "$(dirname "$key")" &&
       gpg --batch --yes --dearmor -o "$key" "$tmp/gpgkey" && chmod a+r "$key" &&
       curl -fsSL --retry 3 "$FF_NVIDIA_REPO/stable/deb/nvidia-container-toolkit.list" -o "$tmp/list" &&
-      grep -q '^deb https://' "$tmp/list" &&
-      sed "s#deb https://#deb [signed-by=$key] https://#g" "$tmp/list" >"$list"; }; then
+      grep -q '^deb https://' "$tmp/list"; }; then
       rm -rf "$tmp"
-      rm -f "$list"
+      return 1
+    fi
+    # A list that is already there is someone's own: kept aside (outside
+    # sources.list.d, where apt would read it), and put back on failure.
+    if [[ -e $list ]]; then
+      saved="$(dirname "$(dirname "$list")")/${list##*/}.before-freeframe-$(date +%Y%m%d-%H%M%S)"
+      if ! cp -p "$list" "$saved"; then
+        rm -rf "$tmp"
+        return 1
+      fi
+      printf 'The NVIDIA sources list from before is kept at %s\n' "$saved"
+    fi
+    if ! sed "s#deb https://#deb [signed-by=$key] https://#g" "$tmp/list" >"$list"; then
+      rm -rf "$tmp"
+      _gpu_list_undo "$list" "$saved"
       return 1
     fi
     rm -rf "$tmp"
     if ! { run_apt update && run_apt install nvidia-container-toolkit; }; then
-      rm -f "$list"
+      _gpu_list_undo "$list" "$saved"
       return 1
     fi
   fi
@@ -1445,6 +1459,12 @@ install_nvidia_toolkit() {
   fi
   nvidia-ctk runtime configure --runtime=docker || return 1
   systemctl restart docker
+}
+
+# _gpu_list_undo LIST SAVED: after a failed set-up, the sources list as it
+# was: SAVED put back, or the list this run wrote removed.
+_gpu_list_undo() {
+  if [[ -n $2 ]]; then mv -f "$2" "$1"; else rm -f "$1"; fi
 }
 
 # _gpu_daemon_undo: the command that puts Docker's settings back as they
