@@ -485,6 +485,159 @@ assert_removed() {
   [ -f "$(saved_dir)/.env.prod" ]
 }
 
+# new_final DIR NAME...: the one dump in DIR that is none of NAMEs (and not a
+# backup from setup).
+new_final() {
+  local d=$1 f n out=""
+  shift
+  for f in "$d"/freeframe-*.dump; do
+    n=${f##*/}
+    case " $* freeframe-20261026-030000.dump freeframe-20261027-030000.dump " in
+      *" $n "*) ;;
+      *) out+="$n " ;;
+    esac
+  done
+  out=${out% }
+  [[ -n $out && $out != *" "* ]] || { echo "new dumps in $d: '$out'"; return 1; }
+  printf '%s' "$out"
+}
+
+# plant_marker: an uninstall's marker naming a real saved folder.
+plant_marker() {
+  local d="$FF_ROOT_HOME/freeframe-removed-20261020-101010"
+  mkdir -p -m 700 "$d"
+  printf 'saved=%s\nfinal=\n' "$d" >"$FF_ROOT/.uninstall-saved"
+  chmod 600 "$FF_ROOT/.uninstall-saved"
+}
+
+@test "uninstall rerun after a stop at dc down: the database is still there, so it is backed up, and the restore line names that backup" {
+  STUB_DOWN_FAIL=1 ff uninstall --yes
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  local d first new
+  d=$(saved_dir)
+  first=$(sed -n 's/^final=//p' "$FF_ROOT/.uninstall-saved")
+  [ -f "$d/$first" ]
+  # A nightly backup ran in between.
+  printf 'PGDMP nightly\n' >"$BK/freeframe-20261028-030000.dump"
+  cp "$ENV" "$BK/freeframe-20261028-030000.env.prod"
+  : >"$CALLS"
+  ff uninstall --yes --delete-data --confirm-delete-data
+  [ "$status" -eq 0 ] || { echo "$output"; cat "$CALLS"; false; }
+  grep -q 'pg_dump' "$CALLS"
+  [ "$(saved_dir)" = "$d" ]
+  new=$(new_final "$d" "$first" freeframe-20261028-030000.dump)
+  assert_out "sudo freeframe restore '$d/$new'"
+  [ -f "$d/$first" ]
+  [ -f "$d/freeframe-20261028-030000.dump" ]
+  assert_order "pg_dump" "docker volume rm"
+  assert_out "a final backup of the database, made before anything is removed"
+  assert_removed
+}
+
+@test "uninstall rerun with the saved folder deleted and the database still there: a new folder and a new final backup" {
+  STUB_DOWN_FAIL=1 ff uninstall --yes
+  [ "$status" -eq 1 ]
+  local d nd new
+  d=$(saved_dir)
+  rm -rf "$d"
+  : >"$CALLS"
+  ff uninstall --yes --delete-data --confirm-delete-data
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "is no longer there"
+  grep -q 'pg_dump' "$CALLS"
+  nd=$(saved_dir)
+  # A fresh folder: the backups that went with the deleted one are not in it.
+  [ ! -e "$nd/freeframe-20261026-030000.dump" ]
+  new=$(new_final "$nd")
+  assert_out "sudo freeframe restore '$nd/$new'"
+  assert_removed
+}
+
+@test "uninstall rerun after a first run with --skip-backup: the database is backed up now" {
+  STUB_DOWN_FAIL=1 ff uninstall --yes --skip-backup
+  [ "$status" -eq 1 ]
+  grep -qx 'final=' "$FF_ROOT/.uninstall-saved"
+  local d new
+  d=$(saved_dir)
+  : >"$CALLS"
+  ff uninstall --yes --delete-data --confirm-delete-data
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -q 'pg_dump' "$CALLS"
+  new=$(new_final "$d")
+  assert_out "sudo freeframe restore '$d/$new'"
+}
+
+@test "uninstall rerun with --skip-backup --delete-data: the question says no final backup exists and names the newest backup" {
+  STUB_DOWN_FAIL=1 ff uninstall --yes --skip-backup
+  [ "$status" -eq 1 ]
+  answers "remove" "no backup" "delete"
+  ff uninstall --skip-backup --delete-data
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_not_called "pg_dump"
+  assert_out "no final backup of the database exists: the newest backup is freeframe-20261027-030000.dump"
+  assert_out "the earlier uninstall made no final backup"
+  assert_no_out "is then the only copy"
+  assert_out "sudo freeframe restore '$(saved_dir)/freeframe-20261027-030000.dump'"
+}
+
+@test "uninstall rerun: a final backup that was deleted is said to be gone, not never made" {
+  STUB_VOLRM_FAIL=freeframe_miniodata ff uninstall --yes --delete-data --confirm-delete-data
+  [ "$status" -eq 1 ]
+  local d final
+  d=$(saved_dir)
+  final=$(sed -n 's/^final=//p' "$FF_ROOT/.uninstall-saved")
+  rm -f "$d/$final"
+  ff uninstall --dry-run --delete-data
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "($final) is no longer there"
+  assert_no_out "made none"
+  assert_no_out "made no final backup"
+}
+
+@test "uninstall rerun: a marker naming /etc is not trusted: nothing is moved into it or changed in it" {
+  STUB_DOWN_FAIL=1 ff uninstall --yes
+  [ "$status" -eq 1 ]
+  local mode
+  mode=$(stat -c %a /etc/passwd 2>/dev/null || stat -f %Lp /etc/passwd)
+  printf 'saved=/etc\nfinal=passwd\n' >"$FF_ROOT/.uninstall-saved"
+  ff uninstall --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  [ "$(stat -c %a /etc/passwd 2>/dev/null || stat -f %Lp /etc/passwd)" = "$mode" ]
+  [ ! -e /etc/.env.prod ]
+  [ -z "$(find /etc -maxdepth 1 -name 'freeframe-*' 2>/dev/null)" ]
+  assert_no_out "settings in /etc"
+  assert_no_out "Kept in /etc"
+  assert_no_out "'/etc/"
+  [ "$(find "$FF_ROOT_HOME" -mindepth 1 -maxdepth 1 -name 'freeframe-removed-*' | wc -l | tr -d ' ')" = 2 ]
+}
+
+@test "uninstall rerun: a marker naming a folder inside the FreeFrame folder is not trusted" {
+  STUB_DOWN_FAIL=1 ff uninstall --yes
+  [ "$status" -eq 1 ]
+  local planted="$FF_ROOT/freeframe-removed-20261028-000000"
+  mkdir -p "$planted"
+  printf 'saved=%s\nfinal=\n' "$planted" >"$FF_ROOT/.uninstall-saved"
+  ff uninstall --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_no_out "in $planted"
+  assert_no_out "restore '$planted"
+  [ "$(find "$FF_ROOT_HOME" -mindepth 1 -maxdepth 1 -name 'freeframe-removed-*' | wc -l | tr -d ' ')" = 2 ]
+  assert_removed
+}
+
+@test "uninstall: with nothing installed, a folder it may not remove is never offered to rm -rf" {
+  rm -f "$ENV" "$FF_ROOT/.installed"
+  rm -rf "$BK"
+  # Nothing of FreeFrame's in Docker, so only the path itself can stop the hint.
+  : >"$STUB_DIR/dk/containers"
+  : >"$STUB_DIR/dk/volumes"
+  ff uninstall --yes
+  assert_out "sudo rm -rf '$FF_ROOT'"
+  FF_ROOT="$FF_ROOT/." ff uninstall --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_no_out "rm -rf '$FF_ROOT/.'"
+}
+
 @test "uninstall: an empty database is never saved as the final backup" {
   STUB_DB_EMPTY=1 ff uninstall --yes
   [ "$status" -eq 1 ] || { echo "$output"; false; }
