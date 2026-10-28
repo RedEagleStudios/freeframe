@@ -639,3 +639,13 @@ toolkit_stubs() {
   [ -z "$(ls "$(dirname "$FF_NVIDIA_LIST")" | grep -v '^nvidia-container-toolkit.list$')" ]
 }
 
+@test "gpu detect: keeps nvidia-smi's own line for the log" {
+  wsl_smi "NVIDIA GeForce RTX 5070 Ti" 610.47
+  detect_gpu
+  assert_eq "$FF_GPU_SMI_LINE" "NVIDIA GeForce RTX 5070 Ti, 610.47"
+  detect_gpu_none() { :; }
+  rm -rf "$FF_SYS_ROOT/usr"
+  detect_gpu
+  assert_eq "$FF_GPU_SMI_LINE" ""
+}
+

@@ -166,10 +166,11 @@ detect_gpu() {
   _stub_log detect_gpu
   # STUB_GPU_MARK: show on the screen where the detection ran.
   [[ -z ${STUB_GPU_MARK:-} ]] || printf '<<detect_gpu>>\n' >&2
-  FF_GPU_VENDOR=none FF_GPU_NAME="" FF_GPU_DRIVER="" FF_GPU_STATE=none FF_GPU_WSL=${STUB_GPU_WSL:-}
+  FF_GPU_VENDOR=none FF_GPU_NAME="" FF_GPU_DRIVER="" FF_GPU_STATE=none FF_GPU_WSL=${STUB_GPU_WSL:-} FF_GPU_SMI_LINE=""
   case ${STUB_GPU:-none} in
     ready | notoolkit | noruntime)
       FF_GPU_VENDOR=nvidia FF_GPU_NAME="NVIDIA GeForce RTX 5070 Ti" FF_GPU_DRIVER=610.47 FF_GPU_STATE=$STUB_GPU
+      FF_GPU_SMI_LINE="NVIDIA GeForce RTX 5070 Ti, 610.47"
       ;;
     nodriver) FF_GPU_VENDOR=nvidia FF_GPU_NAME=NVIDIA FF_GPU_STATE=nodriver ;;
     intel) FF_GPU_VENDOR=intel FF_GPU_NAME=Intel FF_GPU_STATE=unsupported ;;

@@ -2558,3 +2558,23 @@ rest_gpu() { REST_GPU=(1 "" "Grace" "grace@example.com" "long-password-1" "long-
   assert_no_out "other container"
 }
 
+@test "gpu: the detection result reaches install.log once it starts, and not the screen" {
+  plain_answers
+  export STUB_GPU=notoolkit
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -qxF "GPU check: state notoolkit (NVIDIA GeForce RTX 5070 Ti, driver 610.47), nvidia-smi: NVIDIA GeForce RTX 5070 Ti, 610.47; video on the CPU" "$FF_ROOT/install.log" ||
+    { cat "$FF_ROOT/install.log"; false; }
+  assert_no_out "GPU check: state"
+  # Once, after the log's header.
+  [ "$(grep -c '^GPU check:' "$FF_ROOT/install.log")" -eq 1 ]
+  [[ $(sed -n '/===== freeframe install/,$p' "$FF_ROOT/install.log") == *"GPU check: state notoolkit"* ]]
+}
+
+@test "gpu: with no GPU, the log says so too" {
+  plain_answers
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -qxF "GPU check: state none, nvidia-smi: no answer; video on the CPU" "$FF_ROOT/install.log" || { cat "$FF_ROOT/install.log"; false; }
+}
+

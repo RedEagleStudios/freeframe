@@ -1224,7 +1224,7 @@ _gpu_others_words() {
 # shellcheck disable=SC2034
 detect_gpu() {
   local pci render smi out line nvidia=""
-  FF_GPU_VENDOR=none FF_GPU_NAME="" FF_GPU_DRIVER="" FF_GPU_STATE=none FF_GPU_WSL=""
+  FF_GPU_VENDOR=none FF_GPU_NAME="" FF_GPU_DRIVER="" FF_GPU_STATE=none FF_GPU_WSL="" FF_GPU_SMI_LINE=""
   if _gpu_is_wsl; then FF_GPU_WSL=1; fi
   pci=$(_gpu_pci_vendors) || pci=""
   render=$(_gpu_render_vendors) || render=""
@@ -1235,7 +1235,7 @@ detect_gpu() {
     line=${out%%$'\n'*}
     line=${line%$'\r'}
     if [[ $line == *", "* && -n ${line%, *} && ${line##*, } =~ ^[0-9][0-9.]*$ ]]; then
-      FF_GPU_VENDOR=nvidia FF_GPU_NAME=${line%, *} FF_GPU_DRIVER=${line##*, }
+      FF_GPU_VENDOR=nvidia FF_GPU_NAME=${line%, *} FF_GPU_DRIVER=${line##*, } FF_GPU_SMI_LINE=$line
       if ! _gpu_has_toolkit; then
         FF_GPU_STATE=notoolkit
       elif [[ " $(_gpu_docker_runtimes) " == *" nvidia "* ]]; then
@@ -2802,6 +2802,25 @@ _install_gpu_check() {
   if [[ -n ${FF_GPU_ASK:-}${FF_GPU_SETUP:-} ]]; then FF_GPU_OTHERS=$(_gpu_other_containers); fi
 }
 
+# _install_gpu_log: what the GPU check found and decided, into install.log
+# only (the check runs before the log starts). It holds no secret.
+_install_gpu_log() {
+  local line="GPU check: state ${FF_GPU_STATE:-none}" what
+  if _gpu_usable; then line+=" ($FF_GPU_NAME, driver $FF_GPU_DRIVER)"; fi
+  line+=", nvidia-smi: ${FF_GPU_SMI_LINE:-no answer}"
+  if [[ -n ${FF_GPU_ASK:-} ]]; then
+    what="asked at the Video processing step"
+  elif [[ ${FF_GPU:-off} == nvidia && -n ${FF_GPU_SETUP:-} ]]; then
+    what="video on the GPU, once the NVIDIA container toolkit is set up"
+  elif [[ ${FF_GPU:-off} == nvidia ]]; then
+    what="video on the GPU"
+  else
+    what="video on the CPU"
+  fi
+  [[ -n ${FF_LOG:-} ]] && printf '%s; %s\n' "$line" "$what" >>"$FF_LOG"
+  return 0
+}
+
 # _install_ask_gpu: the Video processing step, asked only for an NVIDIA GPU
 # whose driver works when Docker cannot use it yet (FF_GPU_ASK).
 _install_ask_gpu() {
@@ -3668,6 +3687,7 @@ cmd_install() {
     _install_welcome
   fi
   _install_log_start
+  _install_gpu_log
   FF_STATE="Nothing has been installed yet; the installer has only written its log."
   trap _install_on_error ERR
   install_preflight
