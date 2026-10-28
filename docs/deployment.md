@@ -57,7 +57,7 @@ What the installer does, in order:
 
 1. Checks the system, the memory and disk, that nothing else is using ports 80 and 443, and that the server can reach the internet.
 2. Asks you the questions below, and shows a summary to confirm.
-3. Installs Docker from Docker's own repository if the server has none. If the server has less than 4 GB of memory and no swap (spare memory on disk), it adds a 2 GB swap file. If the `ufw` firewall is on, it allows web traffic and SSH.
+3. Installs Docker from Docker's own repository if the server has none. If you chose to use the server's NVIDIA GPU, it sets up NVIDIA's container toolkit (see [Video processing on a GPU](#video-processing-on-a-gpu)). If the server has less than 4 GB of memory and no swap (spare memory on disk), it adds a 2 GB swap file. If the `ufw` firewall is on, it allows web traffic and SSH.
 4. Waits for your domain's DNS to point at the server, if you gave a domain.
 5. Downloads FreeFrame (about 2 GB, a few minutes), starts it, and creates your admin account before opening it to the outside.
 6. Waits for the HTTPS certificate and turns on the nightly backup.
@@ -87,7 +87,22 @@ The questions come as numbered steps (`Step 1 of 4`, and so on). Where there are
 
 **4. Your admin account.** Your name, your email address, and a password of 8 to 72 characters. If you press Enter instead of choosing a password, the installer makes a strong one for you, **shows it once on the screen at the end, and saves it nowhere**. Write it down before you close the window.
 
-Then the installer shows what it is about to do and asks `Install now? [Y/n]`.
+**5. Video processing** (only on a server with an NVIDIA GPU that Docker cannot use yet). See [Video processing on a GPU](#video-processing-on-a-gpu) below. Press Enter to use the GPU.
+
+Then the installer shows what it is about to do, including whether video is processed on the GPU or the CPU, and asks `Install now? [Y/n]`.
+
+### Video processing on a GPU
+
+FreeFrame prepares every uploaded video for review in the browser (it transcodes it). The server check at the start says what it found, on a line such as `GPU: NVIDIA GeForce RTX 5070 Ti (driver 610.47)`, `GPU: Intel (not used with the published images)` or `GPU: none found`, and the summary, the closing message and `sudo freeframe status` say whether video is processed on the GPU or the CPU.
+
+- **An NVIDIA GPU whose driver works** (`nvidia-smi` answers). Docker also needs NVIDIA's container toolkit to give the GPU to a container. If it is already set up, the installer uses the GPU without asking. If not, it asks `Use the NVIDIA GPU for video processing? [Y/n]`. On yes, after you confirm the install, it installs `nvidia-container-toolkit` from NVIDIA's own apt repository, sets Docker up for it (`nvidia-ctk runtime configure --runtime=docker`) and restarts Docker. FreeFrame then runs with `docker-compose.gpu.yml`, which gives the transcoding worker the GPU; when a GPU attempt fails, the worker falls back to the CPU on its own. If the toolkit cannot be set up, the installer says so, keeps the CPU and finishes the install.
+- **An NVIDIA GPU without a working driver.** The installer never installs or changes drivers. It says so, suggests how to install one (on Ubuntu `sudo ubuntu-drivers install`, then a reboot; on WSL2 the NVIDIA driver for Windows), and installs FreeFrame on the CPU. Once the driver works, turn the GPU on with `sudo freeframe configure`.
+- **An Intel or AMD GPU.** The published images use NVIDIA GPUs only, so FreeFrame processes video on the CPU. Intel (VAAPI) needs images you build yourself; see [Hardware-Accelerated Transcoding](#hardware-accelerated-transcoding-optional).
+- **No GPU.** Video is processed on the CPU, with no question.
+
+The choice is saved as `FREEFRAME_GPU=nvidia` or `off` in `/opt/freeframe/.env.prod`, and running the installer again keeps it. To change it later, run `sudo freeframe configure` (or `sudo freeframe configure --yes --gpu nvidia`, or `--gpu off`). Turning the GPU on there may set the toolkit up, which restarts Docker: every container on the server stops for a moment, and FreeFrame is started again after. Unattended installs use the GPU only when Docker can already use it, or when you add `--gpu nvidia` (`FREEFRAME_GPU=nvidia`), which also sets the toolkit up.
+
+WSL2 works: there the driver is the Windows one, and `nvidia-smi` lives in `/usr/lib/wsl/lib`.
 
 ### The DNS step
 
@@ -139,10 +154,10 @@ After the install, the `freeframe` command is on the server. All commands need `
 
 | Command | What it does |
 |---|---|
-| `sudo freeframe status` | Shows the version, whether everything is running, disk space, backups, and whether a newer release is out. |
+| `sudo freeframe status` | Shows the version, whether everything is running, where video is processed (GPU or CPU; with the GPU on, it asks the worker whether it sees the GPU), disk space, backups, and whether a newer release is out. |
 | `sudo freeframe update` | Backs up the database, then moves to the newest release on your channel (it updates the `freeframe` command first). |
 | `sudo freeframe rollback` | After an update that did not come up: goes back to the version from before, with the database as it was just before the update. |
-| `sudo freeframe configure` | Changes the answers you gave: web address, email, storage. With `--yes`, give only the new answers as options. |
+| `sudo freeframe configure` | Changes the answers you gave: web address, email, storage, and whether video is processed on the GPU. With `--yes`, give only the new answers as options. |
 | `sudo freeframe backup` | Saves a copy of the database to `/opt/freeframe/backups` now (this also runs every night at 3:00; the newest 7 are kept). |
 | `sudo freeframe restore` | Lists the backups. `sudo freeframe restore FILE` puts one back (replaces the current database, after saving a copy of it). |
 | `sudo freeframe logs` | Shows FreeFrame's recent messages and follows new ones (Ctrl-C stops). `sudo freeframe logs api` shows one part only. |
@@ -190,6 +205,7 @@ For a script with nobody at the keyboard, give every answer ahead of time. This 
 | `FREEFRAME_SMTP_HOST`, `_PORT`, `_USER`, `_PASSWORD`, `_FROM` | Your mail server. Leave them all out for no email. |
 | `FREEFRAME_ADMIN_NAME`, `_EMAIL`, `_PASSWORD` | The admin account. The email is required. |
 | `FREEFRAME_CHANNEL` | `latest` or `stable` (or a release tag that includes the installer). |
+| `FREEFRAME_GPU` | `nvidia` to process video on the server's NVIDIA GPU, setting up NVIDIA's container toolkit when Docker cannot use the GPU yet (the driver must already work), or `off` for the CPU. Left out, the GPU is used only when Docker can already use it. See [Video processing on a GPU](#video-processing-on-a-gpu). |
 | `FREEFRAME_YES` | `1` to run without asking anything. |
 
 Example, as cloud-init runs it (as root, so no `sudo`):
@@ -231,6 +247,9 @@ Everything the installer does is written to **`/opt/freeframe/install.log`**. Ev
 | "The DNS records for ... do not point at this server" | The A record is missing or has not spread yet. Add the records the installer printed, wait, and run the command again. |
 | Browser warns about the certificate | The certificate has not arrived yet. Check the DNS records and that ports 80 and 443 are open, then run `sudo freeframe restart`. `sudo freeframe status` shows the certificate. |
 | "Could not download the freeframe command" | The server cannot reach `raw.githubusercontent.com`, or the channel has no installer yet. |
+| "GPU: NVIDIA (no working driver)" | The server has an NVIDIA card but `nvidia-smi` does not answer. Install the driver (on Ubuntu `sudo ubuntu-drivers install`), reboot, then run `sudo freeframe configure`. FreeFrame works on the CPU meanwhile. |
+| "The NVIDIA container toolkit could not be set up" | The install finished on the CPU. The reason is at the end of `install.log`, often that the server cannot reach `nvidia.github.io`. Try again with `sudo freeframe configure`. |
+| `status` says the worker does not see the GPU | The line names the reason and the command that fixes it. |
 | The command printed nothing, or only a `curl:` error | If the command printed nothing, check that this server can reach raw.githubusercontent.com (curl printed the reason). With `bash -c "$(curl ...)"`, a failed download leaves nothing to run, so the installer cannot say so itself. |
 
 Still stuck? Open an issue at <https://github.com/Techiebutler/freeframe/issues> and attach the end of `/opt/freeframe/install.log`. The log is private to the administrator, and it does not hold the admin password the installer makes for you.
@@ -329,7 +348,7 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose
 
 `docker-compose.images.yml` only adds the image names to `docker-compose.prod.yml`. Its default version is the release the file belongs to, so the compose files and the images always match. Set `FREEFRAME_VERSION` in `.env.prod` (for example `1.22.0`, no leading `v`) to pin another version. Use the same `-f` flags for every later command, and add `-f docker-compose.https.yml` or `-f docker-compose.storage.yml` as you need them (both are downloaded the same way).
 
-The published web image is built for the domain root. For a sub-path deployment, a hardware-accelerated transcoder, or your own code changes, build from source.
+The published web image is built for the domain root. For a sub-path deployment, Intel (VAAPI) transcoding, or your own code changes, build from source. An NVIDIA GPU works with the published images: see [Hardware-Accelerated Transcoding](#hardware-accelerated-transcoding-optional).
 
 ### Build from source
 
@@ -691,19 +710,58 @@ Video transcoding is CPU-intensive. Adjust `TRANSCODING_CONCURRENCY` based on yo
 
 FreeFrame can use an NVIDIA (NVENC) or Intel (VAAPI) GPU to transcode faster, and
 automatically falls back to software (CPU) transcoding if no GPU is present or a
-hardware attempt fails at runtime. This is entirely opt-in — the default build and
+hardware attempt fails at runtime. This is entirely opt-in: the default build and
 default runtime behavior are unchanged.
 
-To enable it:
-1. Build the API image with `--build-arg ENABLE_HWACCEL=true` (Intel/VAAPI only —
-   NVENC needs no extra packages in the image, just the host driver).
-2. Give the `worker` service access to the GPU: pass through `/dev/dri` for VAAPI,
-   or install `nvidia-container-toolkit` and add a GPU reservation for NVENC.
-3. Set `TRANSCODER_PIPELINE` to `NVIDIA`, `Intel`, or leave it as `Auto` to detect
-   automatically.
+The [installer](#video-processing-on-a-gpu) finds an NVIDIA GPU, offers to use it and
+does the steps below for you. By hand:
 
-> Compose-file examples for GPU device passthrough aren't included yet — that's a
-> known follow-up.
+**NVIDIA, with the published images.** The published API image needs nothing more:
+its ffmpeg has NVENC, which uses the host's driver.
+
+1. Install the NVIDIA driver on the host and check that `nvidia-smi` answers. On
+   WSL2, install the NVIDIA driver for Windows; nothing is installed inside WSL.
+2. Install the NVIDIA Container Toolkit and set Docker up for it, as NVIDIA's
+   [install guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+   describes. On Ubuntu and Debian:
+
+   ```bash
+   curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | \
+     sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+   curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+     sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+     sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+   sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+   sudo nvidia-ctk runtime configure --runtime=docker
+   sudo systemctl restart docker
+   ```
+
+   Restarting Docker stops every container on the host for a moment.
+3. Add `-f docker-compose.gpu.yml` to the `-f` files you already use, for every
+   command. It gives only the `worker` service (the transcoding queue) one NVIDIA GPU,
+   with the `video` driver capability NVENC needs, and sets `TRANSCODER_PIPELINE` to
+   `NVIDIA` unless `.env.prod` sets it:
+
+   ```bash
+   docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.images.yml \
+     -f docker-compose.gpu.yml up -d
+   ```
+
+4. Check that the worker sees the GPU:
+
+   ```bash
+   docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.images.yml \
+     -f docker-compose.gpu.yml exec worker nvidia-smi -L
+   ```
+
+To go back to the CPU, leave `-f docker-compose.gpu.yml` out and run `up -d` again.
+
+**Intel (VAAPI).** This needs an image you build yourself:
+
+1. Build the API image with `--build-arg ENABLE_HWACCEL=true` (see
+   [Build from source](#build-from-source)).
+2. Pass `/dev/dri` through to the `worker` service.
+3. Set `TRANSCODER_PIPELINE` to `Intel`, or leave it as `Auto` to detect it.
 
 If you build the `2160p` rung, a GPU is worth it: a 4K encode takes about four times
 the CPU of a 1080p one. A master that is already H.264 8-bit 4:2:0 can skip the
@@ -973,7 +1031,7 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml ps
 
 With `docker-compose.images.yml`, a version that has no published image prints `failed to resolve reference ghcr.io/techiebutler/freeframe-api:<version>: ... not found`, followed by an error about the build context (the build section of `docker-compose.prod.yml` needs the source tree, which you do not have). Read the pair as "that version is not published". Check `FREEFRAME_VERSION` in `.env.prod` (digits and dots only, no leading `v`) and that the compose files you downloaded belong to the first release after v1.21.0 or a later one. A new release's images can take a little while to appear after the release itself.
 
-You must build yourself when you deploy under a sub-path (`NEXT_PUBLIC_BASE_PATH`), use hardware-accelerated transcoding, or run local changes. Clone the repository and run `docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build` without `docker-compose.images.yml`. Adding `--build` to a command that does include the images file also builds from source, but it needs the source tree next to the compose file.
+You must build yourself when you deploy under a sub-path (`NEXT_PUBLIC_BASE_PATH`), use Intel (VAAPI) transcoding, or run local changes. NVIDIA (NVENC) transcoding works with the published images and `docker-compose.gpu.yml`; see [Hardware-Accelerated Transcoding](#hardware-accelerated-transcoding-optional). Clone the repository and run `docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build` without `docker-compose.images.yml`. Adding `--build` to a command that does include the images file also builds from source, but it needs the source tree next to the compose file.
 
 ### Database migration failures
 
