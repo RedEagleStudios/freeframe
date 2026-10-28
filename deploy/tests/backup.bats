@@ -1163,6 +1163,56 @@ UNITS="${BATS_TEST_DIRNAME}/../systemd"
   [ "$(grep -c 'daemon-reload' "$CALLS")" -eq 1 ]
 }
 
+@test "backup_units_install: units on disk that systemd has not loaded (an earlier reload failed) are reloaded; an old systemd or an error is no" {
+  mkdir -p "$FF_ROOT/systemd" "$BATS_TEST_TMPDIR/etc"
+  cp "$UNITS"/freeframe-backup.* "$FF_ROOT/systemd/"
+  cp "$UNITS"/freeframe-backup.* "$BATS_TEST_TMPDIR/etc/"
+  export FF_SYSTEMD_DIR="$BATS_TEST_TMPDIR/etc"
+  # The files are the same, but the timer's definition in systemd is old.
+  systemctl() {
+    printf 'systemctl %s\n' "$*" >>"$CALLS"
+    if [[ $1 == show ]]; then printf 'yes\nno\n'; fi
+    return 0
+  }
+  backup_units_install
+  grep -qx "systemctl show -p NeedDaemonReload --value freeframe-backup.timer freeframe-backup.service" "$CALLS"
+  [ "$(grep -c '^systemctl daemon-reload$' "$CALLS")" -eq 1 ]
+  [ "$FF_UNITS_CHANGED" = 1 ]
+  # The service's, the second line, counts as well.
+  : >"$CALLS"
+  systemctl() {
+    printf 'systemctl %s\n' "$*" >>"$CALLS"
+    if [[ $1 == show ]]; then printf 'no\nyes\n'; fi
+    return 0
+  }
+  backup_units_install
+  [ "$(grep -c '^systemctl daemon-reload$' "$CALLS")" -eq 1 ]
+  # Loaded as on disk: no reload.
+  : >"$CALLS"
+  systemctl() {
+    printf 'systemctl %s\n' "$*" >>"$CALLS"
+    if [[ $1 == show ]]; then printf 'no\nno\n'; fi
+    return 0
+  }
+  backup_units_install
+  if grep -q daemon-reload "$CALLS"; then false; fi
+  # A systemd that does not know the property prints nothing; one that
+  # fails is an error: neither reloads, and neither fails.
+  : >"$CALLS"
+  systemctl() {
+    printf 'systemctl %s\n' "$*" >>"$CALLS"
+    if [[ $1 == show ]]; then printf '\n\n'; fi
+    return 0
+  }
+  backup_units_install
+  systemctl() {
+    printf 'systemctl %s\n' "$*" >>"$CALLS"
+    [[ $1 != show ]]
+  }
+  backup_units_install
+  if grep -q daemon-reload "$CALLS"; then false; fi
+}
+
 @test "backup_units_install then backup_timer_on: the install's split, one reload, before the timer starts" {
   mkdir -p "$FF_ROOT/systemd" "$BATS_TEST_TMPDIR/etc"
   cp "$UNITS"/freeframe-backup.* "$FF_ROOT/systemd/"

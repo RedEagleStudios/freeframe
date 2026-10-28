@@ -533,3 +533,27 @@ assert_state_is() {
   assert_not_called "no-deps"
   [ -e "$STUB_DIR/worker-gpu-up" ]
 }
+
+@test "rollback gpu worker: a unit the update changed is put back with one daemon-reload, the timer enabled without one, and the worker given the GPU back" {
+  printf 'services:\n  worker: {}\n' >"$STUB_REMOTE/docker-compose.gpu.yml"
+  printf 'services:\n  worker: {}\n' >"$FF_ROOT/docker-compose.gpu.yml"
+  env_set "$ENV" FREEFRAME_GPU nvidia
+  export STUB_GPU=ready
+  failed_update
+  # The update had put the new release's units into systemd.
+  cp "$STUB_REMOTE"/deploy/systemd/freeframe-backup.* "$FF_SYSTEMD_DIR/"
+  if cmp -s "$BATS_TEST_TMPDIR/before/freeframe-backup.service" "$FF_SYSTEMD_DIR/freeframe-backup.service"; then false; fi
+  export STUB_RELOAD_DROPS_GPU=1
+  ff rollback --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  # The old units are back in systemd.
+  cmp "$BATS_TEST_TMPDIR/before/freeframe-backup.service" "$FF_SYSTEMD_DIR/freeframe-backup.service"
+  [ "$(grep -c '^systemctl daemon-reload$' "$CALLS")" -eq 1 ]
+  grep -qx "systemctl enable --now --no-reload freeframe-backup.timer" "$CALLS"
+  if grep -qx "systemctl enable --now freeframe-backup.timer" "$CALLS"; then false; fi
+  # The reload took the GPU; the check after it gave it back.
+  assert_order "systemctl daemon-reload" "dc exec -T worker nvidia-smi -L" "up -d --no-build --no-deps --force-recreate worker"
+  [ "$(grep -c '^dc up -d --no-build --no-deps --force-recreate worker$' "$CALLS")" -eq 1 ]
+  [ -e "$STUB_DIR/worker-gpu-up" ]
+  assert_out "The worker did not see the GPU at first, so it was started again; it uses the GPU now."
+}

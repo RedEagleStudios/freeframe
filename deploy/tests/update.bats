@@ -1080,3 +1080,12 @@ killed_update_state() {
   assert_no_out "on the CPU for now"
   grep -qF "GPU self-check: the worker is not running, so no video is processed until it starts" "$FF_ROOT/install.log"
 }
+
+@test "update: units on disk that systemd has not loaded yet are reloaded once, though cmp sees no change" {
+  cp "$FF_SYSTEMD_DIR"/freeframe-backup.* "$STUB_REMOTE/deploy/systemd/"
+  export STUB_NEED_RELOAD=1
+  ff update
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  [ "$(grep -c '^systemctl daemon-reload$' "$CALLS")" -eq 1 ]
+  grep -qx "systemctl enable --now --no-reload freeframe-backup.timer" "$CALLS"
+}

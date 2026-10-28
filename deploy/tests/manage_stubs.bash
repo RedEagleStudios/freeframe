@@ -128,6 +128,11 @@ install_backup_timer() {
 systemctl() {
   _stub_log "systemctl $*"
   if [[ $* == daemon-reload ]]; then _stub_daemon_reload; fi
+  # STUB_NEED_RELOAD: systemd has not loaded the unit files on disk yet.
+  if [[ $* == "show -p NeedDaemonReload --value "* ]]; then
+    if [[ -n ${STUB_NEED_RELOAD:-} ]]; then printf 'no\nyes\n'; else printf 'no\nno\n'; fi
+    return 0
+  fi
   if [[ $* == "is-enabled --quiet freeframe-backup.timer" || $* == "is-active --quiet freeframe-backup.timer" ]]; then
     [[ -z ${STUB_TIMER_DISABLED:-} ]]
     return

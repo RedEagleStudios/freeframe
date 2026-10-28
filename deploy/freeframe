@@ -1139,8 +1139,19 @@ EOF
 # the timer after (backup_timer_on); update and rollback reload only when
 # the new release changed a unit. _gpu_worker_check stays the backstop.
 
+# _backup_units_stale: 0 when systemd still holds an older definition of a
+# unit than the file on disk (NeedDaemonReload=yes): a daemon-reload that
+# failed after the files were copied, which cmp no longer sees. A systemd
+# that cannot say, or an error, counts as no.
+_backup_units_stale() {
+  local out
+  out=$(systemctl show -p NeedDaemonReload --value freeframe-backup.timer freeframe-backup.service 2>/dev/null) || return 1
+  [[ $'\n'$out$'\n' == *$'\n'yes$'\n'* ]]
+}
+
 # backup_units_install: copy each unit that is missing or different, then
-# daemon-reload, only when one was copied (FF_UNITS_CHANGED=1).
+# daemon-reload, only when one was copied or systemd has not loaded the
+# files on disk yet (FF_UNITS_CHANGED=1).
 backup_units_install() {
   local root dir u
   root=$(ff_root)
@@ -1156,6 +1167,7 @@ backup_units_install() {
       FF_UNITS_CHANGED=1
     fi
   done
+  if [[ -z $FF_UNITS_CHANGED ]] && _backup_units_stale; then FF_UNITS_CHANGED=1; fi
   if [[ -n $FF_UNITS_CHANGED ]]; then
     systemctl daemon-reload || return 1
   fi
