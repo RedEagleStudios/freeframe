@@ -668,7 +668,10 @@ assert_nothing_more_removed() {
   assert_out "The setup files in $FF_ROOT are gone, so FreeFrame's database cannot be backed up"
   assert_out "freeframe_pgdata"
   assert_out "is still there"
-  assert_out "sudo freeframe uninstall --skip-backup"
+  # With --delete-data, the hint says plainly what --skip-backup then does.
+  assert_out "sudo freeframe uninstall --skip-backup --delete-data"
+  assert_out "deletes the database's volume too, with no final backup of it"
+  assert_no_out "stays in its volume unless --delete-data"
   assert_no_out "took the database away"
   assert_no_out "already deleted"
   # Stopped up front: no plan, and no try at starting the database.
@@ -682,6 +685,7 @@ assert_nothing_more_removed() {
   ff uninstall --yes
   [ "$status" -eq 1 ] || { echo "$output"; false; }
   assert_out "cannot be backed up"
+  assert_out "the database stays in its volume unless --delete-data is given too"
   assert_no_out "This removes FreeFrame from this server:"
   assert_not_called "dc up"
   assert_nothing_more_removed
@@ -708,6 +712,12 @@ assert_nothing_more_removed() {
   ff uninstall --dry-run --delete-data
   [ "$status" -eq 0 ] || { echo "$output"; false; }
   assert_out "cannot be backed up"
+  assert_out "So the uninstall stops before removing anything more, unless --skip-backup is given."
+  # The plan and the closing command agree with what the real run does.
+  assert_out "no final backup can be made: the setup files that start the database are gone"
+  assert_no_out "if the database still has data"
+  assert_out "To remove FreeFrame without a final backup, run: sudo freeframe uninstall --delete-data --skip-backup"
+  assert_no_out "To remove FreeFrame, run: sudo freeframe uninstall --delete-data"
   assert_no_out "took the database away"
   assert_no_out "already deleted"
   assert_nothing_more_removed
@@ -751,6 +761,70 @@ assert_nothing_more_removed() {
   assert_out "FreeFrame's database is empty (it has no tables), so no final backup was made of it; this run goes on without one."
   assert_not_called "pg_dump"
   assert_removed
+}
+
+@test "uninstall: a first run with a setup file missing stops and changes nothing" {
+  rm -f "$FF_ROOT/docker-compose.prod.yml"
+  ff uninstall --yes --delete-data --confirm-delete-data
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  assert_out "cannot be backed up"
+  assert_out "nothing was removed"
+  assert_not_called "dc up"
+  assert_nothing_changed
+}
+
+@test "uninstall rerun: only docker-compose.images.yml missing also stops" {
+  STUB_DOWN_FAIL=1 ff uninstall --yes --skip-backup
+  [ "$status" -eq 1 ]
+  rm -f "$FF_ROOT/docker-compose.images.yml"
+  : >"$CALLS"
+  ff uninstall --yes --delete-data --confirm-delete-data
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  assert_out "cannot be backed up"
+  assert_nothing_more_removed
+}
+
+@test "uninstall --skip-backup --delete-data with only a rollback's copy: the question and the summary name the same dump" {
+  rm -f "$BK"/freeframe-*
+  printf 'PGDMP x\n' >"$BK/freeframe-20261027-030000-before-rollback.dump"
+  answers "remove" "no backup" "delete"
+  ff uninstall --skip-backup --delete-data
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_no_out "exists at all"
+  assert_out "is then the only copy of the database"
+  assert_out "freeframe-20261027-030000-before-rollback.dump"
+  assert_out "sudo freeframe restore '$(saved_dir)/freeframe-20261027-030000-before-rollback.dump'"
+}
+
+@test "uninstall: a backup named by hand is never taken for the newest" {
+  printf 'PGDMP hand\n' >"$BK/freeframe-copy.dump"
+  answers "remove" "no backup" "delete"
+  ff uninstall --skip-backup --delete-data
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "the newest copy of the database is the backup freeframe-20261027-030000.dump"
+  assert_out "sudo freeframe restore '$(saved_dir)/freeframe-20261027-030000.dump'"
+  assert_no_out "restore '$(saved_dir)/freeframe-copy.dump'"
+  # status and restore pick the newest the same way.
+  mkdir -p "$BATS_TEST_TMPDIR/bk"
+  printf 'PGDMP\n' >"$BATS_TEST_TMPDIR/bk/freeframe-20261027-030000.dump"
+  printf 'PGDMP\n' >"$BATS_TEST_TMPDIR/bk/freeframe-copy.dump"
+  printf 'PGDMP\n' >"$BATS_TEST_TMPDIR/bk/freeframe-20991231-030000-before-rollback.dump"
+  run bash -c 'source "$1"; _ff_backup_newest "$2"' x "$FF_SCRIPT" "$BATS_TEST_TMPDIR/bk"
+  assert_eq "$output" "$BATS_TEST_TMPDIR/bk/freeframe-20261027-030000.dump"
+}
+
+@test "uninstall rerun: the same final backup in two places is still one copy" {
+  STUB_DOWN_FAIL=1 ff uninstall --yes
+  [ "$status" -eq 1 ]
+  local d final
+  d=$(saved_dir)
+  final=$(sed -n 's/^final=//p' "$FF_ROOT/.uninstall-saved")
+  rm -f "$d"/freeframe-2026102[67]-030000.*
+  cp "$d/$final" "$BK/$final"
+  answers "remove" "no backup" "delete"
+  ff uninstall --skip-backup --delete-data
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "($final) is then the only copy of the database"
 }
 
 @test "a start that fails keeps an unfinished uninstall's marker" {

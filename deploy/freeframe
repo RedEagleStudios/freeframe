@@ -3806,18 +3806,46 @@ _ff_backup_dumps() {
   done
 }
 
-# _ff_backup_newest DIR: the newest ordinary backup in DIR (not a rollback's
-# copy of the database it replaced, freeframe-<stamp>-before-rollback.dump,
-# which holds a newer release's database), or the newest of any kind when
-# there is no ordinary one. Nothing when DIR has no backups.
-_ff_backup_newest() {
-  local f any="" ord=""
-  while IFS= read -r f; do
-    any=$f
-    [[ $f == *-before-rollback.dump ]] || ord=$f
-  done < <(_ff_backup_dumps "$1")
-  printf '%s' "${ord:-$any}"
+# _ff_backup_pick DIR...: the newest backup across DIRs, by the stamp in its
+# name (freeframe-<YYYYmmdd-HHMMSS>.dump, compared byte by byte), never a
+# rollback's copy of the database it replaced
+# (freeframe-<stamp>-before-rollback.dump, which holds a newer release's
+# database) while an ordinary one is there. A name without a stamp (a copy
+# named by hand) is never picked. Nothing when there is none.
+_ff_backup_pick() {
+  local d f n ord="" rb="" re='^freeframe-[0-9]{8}-[0-9]{6}(-before-rollback)?\.dump$'
+  local LC_ALL=C
+  for d in "$@"; do
+    [[ -n $d ]] || continue
+    while IFS= read -r f; do
+      n=${f##*/}
+      [[ $n =~ $re ]] || continue
+      if [[ -n ${BASH_REMATCH[1]} ]]; then
+        if [[ -z $rb || $n > ${rb##*/} ]]; then rb=$f; fi
+      elif [[ -z $ord || $n > ${ord##*/} ]]; then
+        ord=$f
+      fi
+    done < <(_ff_backup_dumps "$d")
+  done
+  printf '%s' "${ord:-$rb}"
 }
+
+# _ff_backup_count DIR...: how many different backups (by name, as
+# _ff_backup_pick reads them) there are across DIRs.
+_ff_backup_count() {
+  local d f re='^freeframe-[0-9]{8}-[0-9]{6}(-before-rollback)?\.dump$'
+  local -A seen=()
+  for d in "$@"; do
+    [[ -n $d ]] || continue
+    while IFS= read -r f; do
+      if [[ ${f##*/} =~ $re ]]; then seen[${f##*/}]=1; fi
+    done < <(_ff_backup_dumps "$d")
+  done
+  printf '%s' "${#seen[@]}"
+}
+
+# _ff_backup_newest DIR: the newest backup in DIR (_ff_backup_pick).
+_ff_backup_newest() { _ff_backup_pick "$1"; }
 
 # _ff_is_pg_dump FILE: 0 when FILE is a pg_dump custom-format archive (it
 # starts with PGDMP), which is what freeframe backup writes.
@@ -6741,13 +6769,20 @@ _uninstall_setup_gone_msg() {
 # _uninstall_check_backup: a backup that cannot be made stops the run here,
 # before anything (more) is removed; only --skip-backup on this run goes on.
 _uninstall_check_backup() {
-  local flags=""
   _uninstall_backup_made || return 0
   [[ -n ${FF_U_SETUP_GONE:-} ]] || return 0
-  [[ -z ${FF_DELETE_DATA:-} ]] || flags=" --delete-data"
   _uninstall_none_words
-  _ff_stop 1 "$(_uninstall_setup_gone_msg) So the uninstall stopped, and $FF_U_NONE." \
-    "to remove FreeFrame without a final backup, run: sudo freeframe uninstall --skip-backup$flags (the database stays in its volume unless --delete-data is given too)"
+  _ff_stop 1 "$(_uninstall_setup_gone_msg) So the uninstall stopped, and $FF_U_NONE." "$(_uninstall_skip_hint)"
+}
+
+# _uninstall_skip_hint: the command that goes on without a final backup,
+# with this run's --delete-data, and what that means for the database.
+_uninstall_skip_hint() {
+  if [[ -n ${FF_DELETE_DATA:-} ]]; then
+    printf '%s' "to remove FreeFrame without a final backup, run: sudo freeframe uninstall --skip-backup --delete-data. That deletes the database's volume too, with no final backup of it."
+  else
+    printf '%s' "to remove FreeFrame without a final backup, run: sudo freeframe uninstall --skip-backup (the database stays in its volume unless --delete-data is given too)"
+  fi
 }
 # _uninstall_marker_cancel: FreeFrame was started again, so an uninstall
 # that stopped part-way is not unfinished any more: its marker goes, with
@@ -6763,34 +6798,23 @@ _uninstall_marker_cancel() {
   return 0
 }
 
-# _uninstall_newest_dump: the newest ordinary backup in $FF_ROOT/backups and
-# in the earlier uninstall's folder (nothing when there is none).
+# _uninstall_newest_dump: the backup that is newest by _ff_backup_pick's
+# rule in $FF_ROOT/backups and in the earlier uninstall's folder: what the
+# summary names to restore once they are in one folder.
 _uninstall_newest_dump() {
-  local f best="" n
-  while IFS= read -r f; do
-    n=${f##*/}
-    [[ $n != *-before-rollback.dump ]] || continue
-    if [[ -z $best || $n > ${best##*/} ]]; then best=$f; fi
-  done < <(_ff_backup_dumps "$(ff_root)/backups"; if [[ -n ${FF_U_PREV_OK:-} ]]; then _ff_backup_dumps "$FF_U_PREV_SAVED"; fi)
-  printf '%s' "$best"
+  _ff_backup_pick "$(ff_root)/backups" "${FF_U_PREV_OK:+$FF_U_PREV_SAVED}"
 }
-
 # _uninstall_backup_made: 0 when this run makes a final backup (as far as
 # can be told before it tries).
 _uninstall_backup_made() { [[ -z ${FF_SKIP_BACKUP:-} && -z ${FF_U_DB_GONE:-} ]]; }
 
 # _uninstall_db_copy: what copy of the database is left once its volume is
 # deleted, as it really is.
-# _uninstall_dump_count: how many ordinary backups there are, in
-# $FF_ROOT/backups and in the earlier uninstall's folder.
+# _uninstall_dump_count: how many backups there are, in $FF_ROOT/backups and
+# in the earlier uninstall's folder (one name counted once).
 _uninstall_dump_count() {
-  local f n=0
-  while IFS= read -r f; do
-    if [[ $f != *-before-rollback.dump ]]; then n=$((n + 1)); fi
-  done < <(_ff_backup_dumps "$(ff_root)/backups"; if [[ -n ${FF_U_PREV_OK:-} ]]; then _ff_backup_dumps "$FF_U_PREV_SAVED"; fi)
-  printf '%s' "$n"
+  _ff_backup_count "$(ff_root)/backups" "${FF_U_PREV_OK:+$FF_U_PREV_SAVED}"
 }
-
 _uninstall_db_copy() {
   local newest name when what
   if _uninstall_backup_made; then
@@ -6806,6 +6830,8 @@ _uninstall_db_copy() {
   when=$(_ff_stamp_date "$name")
   if [[ $name == "${FF_U_PREV_FINAL:-}" ]]; then
     what="the final backup the earlier uninstall made ($name)"
+  elif [[ $name == *-before-rollback.dump ]]; then
+    what="the backup $name${when:+ (made $when)}, the database from just before a rollback, from the newer release"
   else
     what="the backup $name${when:+ (made $when)}"
   fi
@@ -7028,6 +7054,9 @@ _uninstall_plan() {
     say "      no new backup: the earlier uninstall already deleted the database's volume"
   elif [[ -n ${FF_SKIP_BACKUP:-} ]]; then
     say "      no final backup (--skip-backup)"
+  elif [[ -n ${FF_U_SETUP_GONE:-} ]]; then
+    say "      no final backup can be made: the setup files that start the database are gone"
+    say "      (so the uninstall stops here; --skip-backup goes on without one)"
   else
     if [[ -n $FF_U_LAST ]]; then last_size=$(_ff_human_size "$(_ff_size_bytes "$FF_U_LAST")"); fi
     say "      a final backup of the database, made before anything is removed${FF_U_RESUME:+, if the database still has data}${last_size:+ (the last one was $last_size)}"
@@ -7095,7 +7124,8 @@ _uninstall_ask() {
 # when it is not running. Stops with nothing removed when it fails.
 _uninstall_backup() {
   local started=""
-  local try="fix what the message above says, then run $FF_RERUN again. To remove FreeFrame without a final backup instead, run: sudo freeframe uninstall --skip-backup (the database stays in its Docker volume unless --delete-data is given too)"
+  local try
+  try="fix what the message above says, then run $FF_RERUN again. Or, $(_uninstall_skip_hint)"
   if [[ -n ${FF_U_DB_GONE:-} ]]; then
     if [[ -n ${FF_U_PREV_FINAL:-} ]]; then
       say "No new backup: the earlier uninstall already deleted the database's volume. Its final backup ($FF_U_PREV_FINAL) is kept in $FF_U_PREV_SAVED."
@@ -7444,7 +7474,11 @@ cmd_uninstall() {
       say "$FF_BUSY; until it has finished, sudo freeframe uninstall would not start."
     fi
     say ""
-    say "To remove FreeFrame, run: sudo freeframe uninstall$flags"
+    if [[ -n ${FF_U_SETUP_GONE:-} ]] && _uninstall_backup_made; then
+      say "To remove FreeFrame without a final backup, run: sudo freeframe uninstall$flags --skip-backup"
+    else
+      say "To remove FreeFrame, run: sudo freeframe uninstall$flags"
+    fi
     return 0
   fi
 
