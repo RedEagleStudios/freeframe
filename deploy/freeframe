@@ -308,11 +308,18 @@ _ff_freeframe_services() {
 #     script has no settings file yet: our project is also called freeframe,
 #     so installing would silently take over that database volume, or
 #   - a git checkout in $FF_ROOT itself.
+# FF_FOREIGN_WHY says which: git, container, clone-volume, or own-volume
+# when nothing but a freeframe_pgdata volume without the settings file was
+# found (which is also what an uninstall that kept the data leaves).
 detect_foreign_install() {
-  local root ps vols line proj wd svc image rest name
+  local root ps vols line proj wd svc image rest name own=0
   local -A ours=() services=()
   root=$(ff_root)
-  [[ -d $root/.git ]] && return 0
+  FF_FOREIGN_WHY=""
+  if [[ -d $root/.git ]]; then
+    FF_FOREIGN_WHY=git
+    return 0
+  fi
   command -v docker >/dev/null 2>&1 || return 1
   local tab=$'\t'
   if ! ps=$(docker ps -a --format "{{.Label \"com.docker.compose.project\"}}${tab}{{.Label \"com.docker.compose.project.working_dir\"}}${tab}{{.Label \"com.docker.compose.service\"}}${tab}{{.Image}}" 2>/dev/null) ||
@@ -334,7 +341,10 @@ detect_foreign_install() {
       ours[$proj]=1
       continue
     fi
-    [[ ${image,,} == *freeframe* ]] && return 0
+    if [[ ${image,,} == *freeframe* ]]; then
+      FF_FOREIGN_WHY=container
+      return 0
+    fi
     [[ -n $proj ]] && services[$proj]+=" $svc"
   done <<<"$ps"
   while IFS= read -r line; do
@@ -345,9 +355,16 @@ detect_foreign_install() {
     [[ $name == *_pgdata ]] || continue
     proj=${proj:-${name%_pgdata}}
     [[ -n ${ours[$proj]:-} ]] && continue
-    _ff_freeframe_services "${services[$proj]:-}" && return 0
-    [[ $proj == freeframe && ! -e $root/.env.prod ]] && return 0
+    if _ff_freeframe_services "${services[$proj]:-}"; then
+      FF_FOREIGN_WHY="clone-volume"
+      return 0
+    fi
+    if [[ $proj == freeframe && ! -e $root/.env.prod ]]; then own=1; fi
   done <<<"$vols"
+  if ((own)); then
+    FF_FOREIGN_WHY="own-volume"
+    return 0
+  fi
   return 1
 }
 
@@ -2044,10 +2061,11 @@ _install_check_foreign() {
   detect_foreign_install || rc=$?
   case $rc in
     0)
-      # FreeFrame's volumes without the settings file are also what an
-      # uninstall that kept the data leaves: point at the settings it saved.
+      # FreeFrame's volumes without the settings file, and nothing else, are
+      # also what an uninstall that kept the data leaves: point at the
+      # settings it saved. A git checkout or a clone's container never is.
       saved=$(_uninstall_saved_settings)
-      if [[ -n $saved && ! -e $(ff_root)/.env.prod ]]; then
+      if [[ ${FF_FOREIGN_WHY:-} == own-volume && -n $saved && ! -e $(ff_root)/.env.prod ]]; then
         _ff_stop 3 "This server has FreeFrame's data (its Docker volumes) but not this installer's settings file, so nothing was changed." \
           "if a freeframe uninstall kept that data, put the settings it saved back, then run the install command again: sudo mkdir -p $(_ff_q "$(ff_root)") && sudo install -m 600 $(_ff_q "$saved") $(_ff_q "$(ff_root)/.env.prod"). If the data belongs to a FreeFrame set up by hand instead, the installer will not touch it: keep updating that one with the manual steps in the guide: $FF_GUIDE_URL"
       fi
@@ -3858,6 +3876,16 @@ _ff_lock() {
   # Written through a descriptor of its own: closing it keeps the lock,
   # which belongs to FF_LOCK_FD's.
   printf '%s %s\n' "${1:-freeframe}" "$$" >"$root/.freeframe.lock" 2>/dev/null || true
+}
+
+# _ff_unlock: let go of the lock. Only uninstall does, just before it removes
+# the folder that holds the lock file; every other command keeps it until
+# it exits.
+_ff_unlock() {
+  [[ ${FF_LOCK_FD:-} =~ ^[0-9]+$ ]] || return 0
+  flock -u "$FF_LOCK_FD" 2>/dev/null || true
+  exec {FF_LOCK_FD}>&-
+  FF_LOCK_FD=""
 }
 
 # _ff_lock_holder: the name of the command that holds the lock, when the
@@ -6599,13 +6627,92 @@ _uninstall_saved_settings() {
   printf '%s' "$f"
 }
 
+# The marker ($FF_ROOT/.uninstall-saved, mode 600), written as soon as the
+# final backup and the settings are saved: the folder they are in and the
+# final backup's name. A run that finds it finishes an uninstall that
+# stopped part-way: it reuses that folder and makes no new backup (the
+# database may already be removed, and starting it again would only make an
+# empty one). It goes with .env.prod.
+_uninstall_marker_file() { printf '%s/.uninstall-saved' "$(ff_root)"; }
+
+# _uninstall_resume: FF_U_RESUME (a marker is there), FF_U_PREV_SAVED and
+# FF_U_PREV_FINAL (its folder and final backup's name) and FF_U_PREV_OK (the
+# folder is still there).
+_uninstall_resume() {
+  local f line
+  f=$(_uninstall_marker_file)
+  FF_U_RESUME="" FF_U_PREV_SAVED="" FF_U_PREV_FINAL="" FF_U_PREV_OK=""
+  [[ -f $f ]] || return 0
+  FF_U_RESUME=1
+  while IFS= read -r line || [[ -n $line ]]; do
+    case $line in
+      saved=*) FF_U_PREV_SAVED=${line#saved=} ;;
+      final=*) FF_U_PREV_FINAL=${line#final=} ;;
+    esac
+  done <"$f"
+  # The final backup is a name in that folder, never a path elsewhere.
+  if [[ $FF_U_PREV_FINAL == */* || ! -f $FF_U_PREV_SAVED/$FF_U_PREV_FINAL ]]; then FF_U_PREV_FINAL=""; fi
+  if [[ $FF_U_PREV_SAVED == /* && -d $FF_U_PREV_SAVED ]]; then FF_U_PREV_OK=1; fi
+  return 0
+}
+
+_uninstall_marker_set() {
+  local f
+  f=$(_uninstall_marker_file)
+  (umask 077 && printf 'saved=%s\nfinal=%s\n' "$1" "$2" >"$f.tmp") && chmod 600 "$f.tmp" && mv -f "$f.tmp" "$f"
+}
+
+# _ff_real PATH: PATH with symbolic links, . and .. resolved, also when its
+# last parts do not exist yet.
+_ff_real() {
+  local p=$1 rest="" out
+  while [[ ! -d $p ]]; do
+    rest="/${p##*/}$rest"
+    p=$(dirname -- "$p")
+  done
+  p=$(cd -P -- "$p" && pwd -P) || return 1
+  [[ $p != / ]] || p=""
+  out="$p$rest"
+  printf '%s' "${out:-/}"
+}
+
+# _uninstall_root_ok ROOT: 0 for a folder uninstall may remove: an absolute
+# path that is not /, not /. or //, and not its own parent once resolved.
+_uninstall_root_ok() {
+  local root=$1 real parent
+  case $root in
+    "" | / | /. | // | *"/.."* | [!/]*) return 1 ;;
+  esac
+  real=$(_ff_real "$root") || return 1
+  parent=$(_ff_real "$(dirname -- "$root")") || return 1
+  [[ $real != / && $real != "$parent" ]]
+}
+
+# _uninstall_check_paths ROOT HOME: refused before anything changes when
+# ROOT is not a folder to remove, or HOME (where the backups go) is in it.
+_uninstall_check_paths() {
+  local root=$1 home=$2 rr rh
+  if ! _uninstall_root_ok "$root"; then
+    _ff_stop 1 "'$root' is not a folder freeframe uninstall can remove, so nothing was changed." \
+      "leave FF_ROOT unset (FreeFrame lives in /opt/freeframe), or set it to the folder FreeFrame was installed in."
+  fi
+  rr=$(_ff_real "$root")
+  rh=$(_ff_real "$home")
+  if [[ $rh == "$rr" || $rh == "$rr"/* ]]; then
+    _ff_stop 1 "The folder the backups would be saved in ($home) is inside $root, which is removed, so nothing was changed." \
+      "leave FF_ROOT_HOME unset (the backups go to /root), or set it to a folder outside $root."
+  fi
+}
+
 # _uninstall_survey ROOT: what is there to remove and keep: FF_U_CONTAINERS,
 # FF_U_NETWORKS and FF_U_VOLUMES (compose project freeframe), FF_U_DUMPS (the
 # backups in ROOT/backups), FF_U_LAST (the newest), FF_U_STORAGE and
-# FF_U_BUCKET. Stops when Docker does not answer.
+# FF_U_BUCKET, and FF_U_HAD_UNITS (the nightly backup is there). Stops when
+# Docker does not answer.
 _uninstall_survey() {
   local root=$1 file=$1/.env.prod
-  FF_U_CONTAINERS=() FF_U_NETWORKS=() FF_U_VOLUMES=() FF_U_DUMPS=()
+  FF_U_CONTAINERS=() FF_U_NETWORKS=() FF_U_VOLUMES=() FF_U_DUMPS=() FF_U_HAD_UNITS=""
+  if _uninstall_has_units; then FF_U_HAD_UNITS=1; fi
   if command -v docker >/dev/null 2>&1; then
     if ! _uninstall_read FF_U_CONTAINERS container || ! _uninstall_read FF_U_NETWORKS network ||
       ! _uninstall_read FF_U_VOLUMES volume; then
@@ -6649,6 +6756,12 @@ _uninstall_nothing() {
     say "$root is still here and holds backups ($root/backups), so it was left as it is."
     return 0
   fi
+  # Never offer to delete a FreeFrame set up by hand (a clone in the folder,
+  # or one this cannot rule out).
+  if [[ -d $root/.git ]]; then return 0; fi
+  local rc=0
+  detect_foreign_install >/dev/null 2>&1 || rc=$?
+  ((rc == 1)) || return 0
   if [[ -d $root ]]; then left+=("$root"); fi
   if [[ -e $bin ]]; then left+=("$bin"); fi
   ((${#left[@]})) || return 0
@@ -6662,9 +6775,21 @@ _uninstall_nothing() {
 # uninstall (it is a way out of both), but what is lost is said first.
 _uninstall_notes() {
   local root=$1 undo
+  if [[ -n ${FF_U_RESUME:-} ]]; then
+    if [[ -n ${FF_U_PREV_OK:-} ]]; then
+      say "An earlier freeframe uninstall stopped part-way, after it saved the backups and a copy of the settings in $FF_U_PREV_SAVED. This run finishes it there and makes no new backup: the database may already be removed, and starting it again would only make an empty one."
+    else
+      say "An earlier freeframe uninstall stopped part-way, after it saved the backups and a copy of the settings in ${FF_U_PREV_SAVED:-a folder}, which is no longer there. This run finishes it and makes no backup: the database may already be removed. Anything still in $root/backups and a copy of the settings go to a new folder."
+    fi
+    say ""
+  fi
   if [[ -f $(_restore_undo_file) ]]; then
     undo=$(_restore_undo_path)
-    say "A restore of the database did not finish, so the database may be empty: the final backup is a copy of it as it is now."
+    if [[ -n ${FF_U_RESUME:-}${FF_SKIP_BACKUP:-} ]]; then
+      say "A restore of the database did not finish, so the database may be empty."
+    else
+      say "A restore of the database did not finish, so the database may be empty. An empty database is not backed up: the uninstall then stops before removing anything, and --skip-backup goes on without a final backup."
+    fi
     if [[ -n $undo && ${undo%/*} == "$root/backups" ]]; then
       say "The copy of the database from before that restore (${undo##*/}) is kept with the other backups."
     elif [[ -n $undo ]]; then
@@ -6674,7 +6799,7 @@ _uninstall_notes() {
   fi
   if _update_undo_read; then
     say "An update did not finish. Uninstalling removes its way back to ${FF_UNDO_VERSION:-the version from before} (sudo freeframe rollback): the setup files saved before the update go with $root."
-    if [[ $FF_UNDO_PHASE == started ]]; then
+    if [[ $FF_UNDO_PHASE == started && -z ${FF_U_RESUME:-}${FF_SKIP_BACKUP:-} ]]; then
       say "The final backup is of the database as the update left it."
     fi
     if [[ -f $FF_UNDO_BACKUP && ${FF_UNDO_BACKUP%/*} == "$root/backups" ]]; then
@@ -6704,15 +6829,26 @@ _uninstall_plan() {
     if [[ -z ${FF_CONFIRM_DELETE_DATA:-} ]]; then say "    (you are asked to type delete first)"; fi
   fi
   say "It keeps:"
-  say "  - in $home/freeframe-removed-<date>-<time>/, readable by root only:"
-  if [[ -n ${FF_SKIP_BACKUP:-} ]]; then
-    say "      no final backup (--skip-backup)"
+  if [[ -n ${FF_U_PREV_OK:-} ]]; then
+    say "  - in $FF_U_PREV_SAVED/ (saved by the earlier uninstall), readable by root only:"
+    if [[ -n $FF_U_PREV_FINAL ]]; then
+      say "      the final backup that uninstall made: $FF_U_PREV_FINAL"
+    else
+      say "      no final backup: that uninstall made none"
+    fi
   else
-    if [[ -n $FF_U_LAST ]]; then last_size=$(_ff_human_size "$(_ff_size_bytes "$FF_U_LAST")"); fi
-    say "      a final backup of the database, made before anything is removed${last_size:+ (the last one was $last_size)}"
+    say "  - in $home/freeframe-removed-<date>-<time>/, readable by root only:"
+    if [[ -n ${FF_U_RESUME:-} ]]; then
+      say "      no final backup: the database may already be removed"
+    elif [[ -n ${FF_SKIP_BACKUP:-} ]]; then
+      say "      no final backup (--skip-backup)"
+    else
+      if [[ -n $FF_U_LAST ]]; then last_size=$(_ff_human_size "$(_ff_size_bytes "$FF_U_LAST")"); fi
+      say "      a final backup of the database, made before anything is removed${last_size:+ (the last one was $last_size)}"
+    fi
   fi
   n=${#FF_U_DUMPS[@]}
-  if ((n)); then say "      the $(_ff_plural "$n" backup backups) already in $root/backups"; fi
+  if ((n)); then say "      the $(_ff_plural "$n" backup backups) in $root/backups"; fi
   say "      a copy of the settings file (.env.prod) and install.log"
   if [[ -z ${FF_DELETE_DATA:-} ]] && ((${#FF_U_VOLUMES[@]})); then
     say "  - FreeFrame's data, in its Docker volumes:"
@@ -6775,6 +6911,15 @@ _uninstall_ask() {
 _uninstall_backup() {
   local started=""
   local try="fix what the message above says, then run $FF_RERUN again. To remove FreeFrame without a final backup instead, run: sudo freeframe uninstall --skip-backup (the database stays in its Docker volume unless --delete-data is given too)"
+  if [[ -n ${FF_U_RESUME:-} ]]; then
+    if [[ -n ${FF_U_PREV_OK:-} && -n $FF_U_PREV_FINAL ]]; then
+      say "No new backup: the final backup the earlier uninstall made ($FF_U_PREV_FINAL) is kept in $FF_U_PREV_SAVED."
+    else
+      say "No backup was made: the earlier uninstall stopped part-way, so the database may already be removed."
+    fi
+    _ff_log_lines "uninstall: finishing an earlier uninstall; no new backup"
+    return 0
+  fi
   if [[ -n ${FF_SKIP_BACKUP:-} ]]; then
     say "No final backup was made (--skip-backup)."
     _ff_log_lines "uninstall: no final backup (--skip-backup)"
@@ -6790,10 +6935,19 @@ _uninstall_backup() {
     started=1
   fi
   say "Saving a final backup of the database..."
+  # An empty database (a restore that failed part-way) is never saved as
+  # the final backup: the backups from before are the ones that count.
+  FF_BACKUP_IF_DATA=1 FF_BACKUP_EMPTY=""
   if ! backup_create keep; then
+    FF_BACKUP_IF_DATA=""
     if [[ -n $started ]]; then _ff_logged dc stop postgres || true; fi
+    if [[ -n $FF_BACKUP_EMPTY ]]; then
+      _ff_manage_stop 1 "FreeFrame's database is empty (it has no tables), so no final backup was made of it, and nothing was removed." \
+        "if a restore did not finish, finish it first (sudo freeframe restore). To remove FreeFrame without a final backup instead, run: sudo freeframe uninstall --skip-backup (the backups already here are kept)"
+    fi
     _ff_manage_stop 1 "The final backup could not be made, so nothing was removed." "$try"
   fi
+  FF_BACKUP_IF_DATA=""
   FF_U_FINAL=$FF_BACKUP_MADE
   say "Saved: ${FF_BACKUP_MADE##*/} ($(_ff_human_size "$(_ff_size_bytes "$FF_BACKUP_MADE")"))"
 }
@@ -6805,38 +6959,50 @@ _uninstall_save() {
   local root=$1 home stamp saved n=1 f
   home=$(_uninstall_home)
   FF_STEP="saving the backups and the settings"
-  stamp=$(_ff_stamp)
-  saved="$home/freeframe-removed-$stamp"
-  while [[ -e $saved ]]; do
-    saved="$home/freeframe-removed-$stamp-$n"
-    n=$((n + 1))
-  done
-  if ! { mkdir -p -- "$home" && mkdir -m 700 -- "$saved"; }; then
-    install_fail "The folder $saved for the backups and the settings could not be made, so nothing was removed." \
-      "check that the disk holding $home is not full or read-only, then run $FF_RERUN again."
+  if [[ -n ${FF_U_PREV_OK:-} ]]; then
+    saved=$FF_U_PREV_SAVED
+    if [[ -n $FF_U_PREV_FINAL ]]; then FF_U_FINAL="$saved/$FF_U_PREV_FINAL"; fi
+  else
+    stamp=$(_ff_stamp)
+    saved="$home/freeframe-removed-$stamp"
+    while [[ -e $saved ]]; do
+      saved="$home/freeframe-removed-$stamp-$n"
+      n=$((n + 1))
+    done
+    if ! { mkdir -p -- "$home" && mkdir -m 700 -- "$saved"; }; then
+      install_fail "The folder $saved for the backups and the settings could not be made, so $FF_U_NONE." \
+        "check that the disk holding $home is not full or read-only, then run $FF_RERUN again."
+    fi
   fi
   FF_U_SAVED=$saved
-  FF_STATE="Nothing has been removed yet. The backups moved so far are in $saved; any others are still in $root/backups. Running $FF_RERUN again is safe."
+  FF_STATE="$FF_U_NONE_YET. The backups moved so far are in $saved; any others are still in $root/backups. Running $FF_RERUN again is safe."
   for f in "$root/backups"/* "$root/backups"/.[!.]*; do
     [[ -e $f || -L $f ]] || continue
     if ! mv -f -- "$f" "$saved/"; then
-      install_fail "The backups could not all be moved to $saved, so nothing was removed." \
+      install_fail "The backups could not all be moved to $saved, so $FF_U_NONE." \
         "check that the disk holding $home is not full, then run $FF_RERUN again."
     fi
   done
   if [[ -n ${FF_U_FINAL:-} ]]; then FF_U_FINAL="$saved/${FF_U_FINAL##*/}"; fi
-  if [[ -f $root/.env.prod ]] && ! { (umask 077 && cp -- "$root/.env.prod" "$saved/.env.prod") && chmod 600 "$saved/.env.prod"; }; then
-    install_fail "The settings could not be copied to $saved, so nothing was removed." \
+  if [[ -f $root/.env.prod && ! -f $saved/.env.prod ]] &&
+    ! { (umask 077 && cp -- "$root/.env.prod" "$saved/.env.prod") && chmod 600 "$saved/.env.prod"; }; then
+    install_fail "The settings could not be copied to $saved, so $FF_U_NONE." \
       "check that the disk holding $home is not full, then run $FF_RERUN again."
   fi
-  if [[ -f $root/install.log ]] && mv -f -- "$root/install.log" "$saved/install.log"; then
-    FF_LOG="$saved/install.log"
+  if [[ -f $root/install.log && $FF_LOG == "$root/install.log" ]]; then
+    if mv -f -- "$root/install.log" "$saved/install.log"; then FF_LOG="$saved/install.log"; fi
+  elif [[ -f $root/install.log ]] && cat -- "$root/install.log" >>"$saved/install.log"; then
+    rm -f -- "$root/install.log" || true
   fi
   for f in "$saved"/* "$saved"/.[!.]*; do
     if [[ -f $f ]]; then chmod 600 -- "$f" || true; fi
   done
+  if ! _uninstall_marker_set "$saved" "${FF_U_FINAL##*/}"; then
+    install_fail "Where the backups were saved ($saved) could not be noted in $root, so $FF_U_NONE." \
+      "check that the disk is not full, then run $FF_RERUN again."
+  fi
   say "Saved the backups and a copy of the settings in $saved"
-  FF_STATE="Nothing has been removed yet; the backups and a copy of the settings are in $saved. Running $FF_RERUN again is safe."
+  FF_STATE="$FF_U_NONE_YET; the backups and a copy of the settings are in $saved. Running $FF_RERUN again is safe."
 }
 
 # _uninstall_containers: compose down, with the same files as every other
@@ -6846,7 +7012,7 @@ _uninstall_containers() {
   FF_STEP="removing FreeFrame's containers"
   say "Removing FreeFrame's containers and network..."
   if _ff_logged dc config -q; then
-    if _ff_logged dc down --remove-orphans; then return 0; fi
+    if _ff_logged dc_bounded "${FF_DOWN_WAIT:-300}" down --remove-orphans; then return 0; fi
   elif _uninstall_read ids container &&
     { ((${#ids[@]} == 0)) || _ff_logged docker rm -f "${ids[@]}"; } &&
     _uninstall_read ids network &&
@@ -6898,23 +7064,25 @@ _uninstall_timer() {
 
 # _uninstall_root ROOT: everything in ROOT, the settings file last, so that
 # an uninstall stopped part-way still finds it and can be run again.
+# The lock file goes last of all, once the lock has been let go.
 _uninstall_root() {
   local root=$1 f
   local -a items=()
-  case $root in
-    / | "" | *"/.."* | [!/]*) install_fail "'$root' is not a folder freeframe uninstall removes." "remove it yourself." ;;
-  esac
+  if ! _uninstall_root_ok "$root"; then
+    install_fail "'$root' is not a folder freeframe uninstall removes." "remove it yourself."
+  fi
   FF_STEP="removing $root"
   say "Removing $root..."
   for f in "$root"/* "$root"/.[!.]* "$root"/..?*; do
     [[ -e $f || -L $f ]] || continue
     case ${f##*/} in
-      .env.prod | .installed) ;;
+      .env.prod | .installed | .uninstall-saved | .freeframe.lock) ;;
       *) items+=("$f") ;;
     esac
   done
   if ! { { ((${#items[@]} == 0)) || rm -rf -- "${items[@]}"; } &&
-    rm -f -- "$root/.installed" && rm -f -- "$root/.env.prod" && rm -rf -- "$root"; }; then
+    rm -f -- "$root/.installed" && rm -f -- "$root/.env.prod" "$(_uninstall_marker_file)" &&
+    _ff_unlock && rm -rf -- "$root"; }; then
     install_fail "$root could not be removed completely." \
       "check the disk, then run $FF_RERUN again (with $root/.env.prod gone, remove what is left with: sudo rm -rf $(_ff_q "$root"))."
   fi
@@ -6938,8 +7106,12 @@ _uninstall_summary() {
   local root=$1 bootstrap=$2 saved=$FF_U_SAVED v dump label n
   local -a back=() others=()
   say ""
+  local -a removed=("its containers and network")
   say "FreeFrame has been removed from this server."
-  say "Removed: its containers and network, the nightly backup, $root and the freeframe command."
+  if [[ -n ${FF_U_RESUME:-} ]]; then say "This finished an uninstall that had stopped part-way."; fi
+  if [[ -n ${FF_U_HAD_UNITS:-} ]]; then removed+=("the nightly backup"); fi
+  removed+=("$root" "the freeframe command")
+  say "Removed: $(_ff_and_list "${removed[@]}")."
   if ((${#FF_U_DELETED[@]})); then
     say "Deleted for good: the Docker volumes $(_ff_and_list "${FF_U_DELETED[@]}")."
   fi
@@ -7025,6 +7197,10 @@ cmd_uninstall() {
   if [[ -n ${FF_CONFIRM_DELETE_DATA:-} && -z ${FF_DELETE_DATA:-} ]]; then
     _ff_bad_usage "--confirm-delete-data goes with --delete-data, which was not given, so nothing was changed."
   fi
+  # In a terminal, delete is always typed; the option is for unattended runs.
+  if [[ -n ${FF_CONFIRM_DELETE_DATA:-} && -z ${FF_YES:-} ]]; then
+    _ff_bad_usage "--confirm-delete-data is for unattended runs and goes with --yes (sudo freeframe uninstall --yes --delete-data --confirm-delete-data), so nothing was changed. In a terminal, leave it out and type delete when asked."
+  fi
   _ff_need_root uninstall
   answers=$(_ff_given_answers)
   if [[ -n $answers ]]; then
@@ -7037,7 +7213,9 @@ cmd_uninstall() {
     _uninstall_nothing "$root" "$bin"
     return 0
   fi
+  _uninstall_check_paths "$root" "$home"
   _uninstall_check_foreign
+  _uninstall_resume
   url=$(env_get "$file" FRONTEND_URL)
   host=$(_ff_url_host "$url")
   _uninstall_survey "$root"
@@ -7078,7 +7256,7 @@ cmd_uninstall() {
       ask answer "To remove FreeFrame, type the word remove" "" || _uninstall_cancel
     fi
     _uninstall_typed_ok "$answer" "$host" || _uninstall_cancel
-    if [[ -n ${FF_SKIP_BACKUP:-} ]]; then
+    if [[ -n ${FF_SKIP_BACKUP:-} && -z ${FF_U_RESUME:-} ]]; then
       say "No final backup of the database is made (--skip-backup); the backups already here are still kept."
       _uninstall_ask "To go ahead without one, type: no backup" "no backup"
     fi
@@ -7102,16 +7280,36 @@ cmd_uninstall() {
     say "While this uninstall was getting ready, FreeFrame was removed, so nothing was changed."
     return 0
   fi
+  # Read again under the lock: another uninstall may have got further.
+  _uninstall_resume
   FF_ACTOR="the uninstall"
   FF_STOPPED=()
   FF_ADMIN_CREATED="" FF_PW_GENERATED=""
   FF_RERUN="sudo freeframe uninstall$flags"
-  FF_STATE="Nothing has been removed."
+  if [[ -n $FF_U_RESUME ]]; then
+    FF_U_NONE="nothing more was removed (an earlier uninstall had already removed part of FreeFrame)"
+    FF_U_NONE_YET="An earlier uninstall already removed part of FreeFrame; this run has removed nothing more yet"
+  else
+    FF_U_NONE="nothing was removed"
+    FF_U_NONE_YET="Nothing has been removed yet"
+  fi
+  FF_STATE="$FF_U_NONE_YET."
   FF_STATE_PREFIX="" FF_RECORD_NEW="" FF_DROP_STARTED="" FF_UPDATE_PHASE=""
   # Read now: it names the channel kept in the settings, which go away.
   bootstrap=$(_ff_bootstrap_cmd)
   bootstrap=${bootstrap% }
-  _ff_log_open uninstall
+  if [[ -n $FF_U_PREV_OK ]]; then
+    # The log goes on where the earlier run left it.
+    FF_LOG="$FF_U_PREV_SAVED/install.log"
+    if (umask 077 && printf '\n===== freeframe uninstall (finishing), %s =====\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" >>"$FF_LOG"); then
+      chmod 600 "$FF_LOG" || true
+    else
+      FF_LOG=""
+      _ff_log_open uninstall
+    fi
+  else
+    _ff_log_open uninstall
+  fi
   _ff_cmd_traps
   _uninstall_backup
   _uninstall_save "$root"
@@ -7183,7 +7381,7 @@ Options: --domain --https --acme-email --storage --s3-endpoint --s3-bucket
               certificates). Asks you to type delete, even with --yes
   --confirm-delete-data
               (uninstall) with --yes --delete-data: delete without asking,
-              for unattended runs
+              for unattended runs (refused without --yes)
 
 Passwords and keys (--admin-password, --smtp-password, --s3-secret-key) are
 better given as FREEFRAME_ADMIN_PASSWORD, FREEFRAME_SMTP_PASSWORD and

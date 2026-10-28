@@ -59,10 +59,15 @@ docker() {
       shift 2
       _dk_drop "$(_dk networks)" 1 "$@"
       ;;
+    # STUB_VOLRM_FAIL="NAME...": those volumes cannot be removed; the others
+    # are, and the call fails, as docker volume rm does.
     "volume rm "*)
-      [[ -z ${STUB_VOLRM_FAIL:-} ]] || return 1
       shift 2
-      _dk_drop "$(_dk volumes)" 1 "$@"
+      local v rc=0
+      for v in "$@"; do
+        if [[ " ${STUB_VOLRM_FAIL:-} " == *" $v "* ]]; then rc=1; else _dk_drop "$(_dk volumes)" 1 "$v"; fi
+      done
+      return "$rc"
       ;;
   esac
   return 0
@@ -70,6 +75,12 @@ docker() {
 
 eval "_manage_dc() $(declare -f dc | tail -n +2)"
 dc() {
+  # docker compose fails on every command when a -f file is missing.
+  if [[ ! -f $FF_ROOT/docker-compose.prod.yml || ! -f $FF_ROOT/docker-compose.images.yml ]]; then
+    _stub_log "dc $*"
+    echo "open $FF_ROOT/docker-compose.prod.yml: no such file or directory" >&2
+    return 1
+  fi
   case "$*" in
     "config -q")
       _stub_log "dc $*"
@@ -80,7 +91,7 @@ dc() {
       [[ -z ${STUB_DOWN_FAIL:-} ]] || return 1
       _dk_drop "$(_dk containers)" 2 freeframe
       _dk_drop "$(_dk networks)" 3 freeframe
-      if [[ $* == *--volumes* ]]; then _dk_drop "$(_dk volumes)" 2 freeframe; fi
+      if [[ " $* " == *" --volumes "* || " $* " == *" -v "* ]]; then _dk_drop "$(_dk volumes)" 2 freeframe; fi
       ;;
     # STUB_PG_STOPPED: the database is not running until it is started.
     "exec -T postgres pg_isready "*)
@@ -90,9 +101,21 @@ dc() {
       fi
       _manage_dc "$@"
       ;;
+    # Starting the database without its volume makes a new, empty one, as
+    # compose does.
     "up -d --no-build postgres")
       : >"$STUB_DIR/pg-up"
+      if ! grep -q '^freeframe_pgdata|' "$(_dk volumes)"; then
+        printf 'freeframe_pgdata|freeframe\n' >>"$(_dk volumes)"
+        : >"$STUB_DIR/db-empty"
+      fi
       _manage_dc "$@"
+      ;;
+    # STUB_DB_EMPTY (or a database made afresh): no tables.
+    "exec -T postgres psql -U "*" -d postgres "*) _manage_dc "$@" ;;
+    "exec -T postgres psql "*)
+      _stub_log "dc $*"
+      if [[ -n ${STUB_DB_EMPTY:-} || -e $STUB_DIR/db-empty ]]; then echo 0; else echo 42; fi
       ;;
     *) _manage_dc "$@" ;;
   esac
@@ -102,6 +125,12 @@ dc() {
 # fails, as rm does when one path cannot be removed.
 rm() {
   _stub_log "rm $*"
+  # Whether the lock is held when its file goes: a second open of the file
+  # can take it only when nobody holds it.
+  if [[ $* == *"$FF_ROOT/.freeframe.lock"* || $* == *"-- $FF_ROOT" ]] && [[ -e $FF_ROOT/.freeframe.lock ]] &&
+    command -v flock >/dev/null 2>&1; then
+    if (flock -n 7) 7>>"$FF_ROOT/.freeframe.lock"; then _stub_log "rm-lock: free"; else _stub_log "rm-lock: held"; fi
+  fi
   if [[ -n ${STUB_RM_FAIL:-} && $* == *"$STUB_RM_FAIL"* ]]; then
     local a
     local -a keep=()
