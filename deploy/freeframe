@@ -358,7 +358,7 @@ detect_foreign_install() {
 _ff_answer_names() {
   printf '%s\n' DOMAIN HTTPS ACME_EMAIL STORAGE S3_ENDPOINT S3_BUCKET S3_ACCESS_KEY \
     S3_SECRET_KEY S3_REGION SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASSWORD SMTP_FROM \
-    ADMIN_NAME ADMIN_EMAIL ADMIN_PASSWORD CHANNEL
+    ADMIN_NAME ADMIN_EMAIL ADMIN_PASSWORD CHANNEL GPU
 }
 
 _ff_bad_usage() {
@@ -834,6 +834,11 @@ EOF
   env_set_if_missing "$file" FREEFRAME_HTTPS "$mode" || return 1
   env_set_if_missing "$file" FREEFRAME_STORAGE "$storage" || return 1
   env_set_if_missing "$file" FREEFRAME_CHANNEL "$channel" || return 1
+  # Only once install has decided it (_gpu_decide): an update adds nothing,
+  # so a server set up before this setting existed stays on the CPU.
+  case ${FF_GPU:-} in
+    nvidia | off) env_set_if_missing "$file" FREEFRAME_GPU "$FF_GPU" || return 1 ;;
+  esac
 
   for pair in "${workers[@]}"; do
     env_set_if_missing "$file" "${pair%%=*}" "${pair#*=}" || return 1
@@ -1097,6 +1102,311 @@ install_backup_timer() {
   done
   systemctl daemon-reload || return 1
   systemctl enable --now freeframe-backup.timer
+}
+
+# ------------------------------------------------------------
+# GPU: whether video is processed on the GPU or the CPU
+#
+# detect_gpu reads the server through the small _gpu_* wrappers below and
+# sets FF_GPU_VENDOR (nvidia, intel, amd or none), FF_GPU_NAME, FF_GPU_DRIVER,
+# FF_GPU_STATE and FF_GPU_WSL. For NVIDIA the state is nodriver (a card, but
+# nvidia-smi does not answer), notoolkit (no NVIDIA container toolkit),
+# noruntime (the toolkit, but Docker has no nvidia runtime yet) or ready;
+# Intel and AMD are unsupported (the published images use NVIDIA only); none
+# is none. It changes nothing. FF_SYS_ROOT (test-only) is put in front of
+# every /sys, /proc, /dev and /usr/lib/wsl path.
+#
+# Only NVIDIA is set up: the published API image already has an ffmpeg with
+# NVENC, which needs the host's driver, the NVIDIA container toolkit and a
+# GPU reservation on the worker (docker-compose.gpu.yml). Drivers are never
+# installed or changed here; a missing driver gets a suggestion.
+# ------------------------------------------------------------
+
+FF_NVIDIA_REPO=https://nvidia.github.io/libnvidia-container
+FF_GPU_GUIDE="$FF_GUIDE_URL#hardware-accelerated-transcoding-optional"
+
+_ff_sys() { printf '%s%s' "${FF_SYS_ROOT:-}" "$1"; }
+
+# _gpu_pci_vendors: the vendor id (0x10de) of each PCI display device.
+_gpu_pci_vendors() {
+  local d class
+  for d in "$(_ff_sys /sys/bus/pci/devices)"/*; do
+    [[ -r $d/class && -r $d/vendor ]] || continue
+    class=$(<"$d/class")
+    [[ $class == 0x03* ]] || continue
+    printf '%s\n' "$(<"$d/vendor")"
+  done
+}
+
+# _gpu_render_vendors: the vendor id of each /dev/dri/renderD* device.
+_gpu_render_vendors() {
+  local n v
+  for n in "$(_ff_sys /dev/dri)"/renderD*; do
+    [[ -e $n ]] || continue
+    v=$(_ff_sys "/sys/class/drm/${n##*/}/device/vendor")
+    [[ -r $v ]] && printf '%s\n' "$(<"$v")"
+  done
+  return 0
+}
+
+_gpu_has_proc() { [[ -e $(_ff_sys /proc/driver/nvidia) ]]; }
+
+# _gpu_is_wsl: WSL2, where the Windows driver is shared with Linux through
+# /dev/dxg and /usr/lib/wsl/lib, and there is no /proc/driver/nvidia.
+_gpu_is_wsl() { [[ -e $(_ff_sys /dev/dxg) || -d $(_ff_sys /usr/lib/wsl/lib) ]]; }
+
+# _gpu_smi: the nvidia-smi to ask: on the PATH, or WSL2's own.
+_gpu_smi() {
+  local p
+  if p=$(command -v nvidia-smi 2>/dev/null); then
+    printf '%s' "$p"
+    return 0
+  fi
+  p=$(_ff_sys /usr/lib/wsl/lib/nvidia-smi)
+  [[ -x $p ]] || return 1
+  printf '%s' "$p"
+}
+
+# _gpu_query SMI: "NAME, DRIVER" for each GPU. Bounded: a wedged driver can
+# leave nvidia-smi hanging.
+_gpu_query() {
+  timeout "${FF_GPU_SMI_TIMEOUT:-20}" "$1" --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null
+}
+
+_gpu_has_toolkit() { command -v nvidia-ctk >/dev/null 2>&1 || command -v nvidia-container-toolkit >/dev/null 2>&1; }
+
+# _gpu_docker_runtimes: the runtimes Docker has, "io.containerd.runc.v2 nvidia
+# runc " (nothing when Docker does not answer).
+_gpu_docker_runtimes() {
+  command -v docker >/dev/null 2>&1 || return 0
+  # shellcheck disable=SC2016 # a Go template, not a shell expansion
+  timeout 20 docker info --format '{{range $k, $v := .Runtimes}}{{$k}} {{end}}' 2>/dev/null || true
+}
+
+# FF_GPU_VENDOR is for the tests and anyone reading the result; the script
+# itself goes by FF_GPU_STATE.
+# shellcheck disable=SC2034
+detect_gpu() {
+  local pci render smi out line nvidia=""
+  FF_GPU_VENDOR=none FF_GPU_NAME="" FF_GPU_DRIVER="" FF_GPU_STATE=none FF_GPU_WSL=""
+  if _gpu_is_wsl; then FF_GPU_WSL=1; fi
+  pci=$(_gpu_pci_vendors) || pci=""
+  render=$(_gpu_render_vendors) || render=""
+  pci=${pci,,} render=${render,,}
+  if [[ $'\n'$pci$'\n'$render$'\n' == *$'\n0x10de\n'* ]] || _gpu_has_proc; then nvidia=1; fi
+  if smi=$(_gpu_smi); then
+    out=$(_gpu_query "$smi") || out=""
+    line=${out%%$'\n'*}
+    line=${line%$'\r'}
+    if [[ $line == *", "* && -n ${line%, *} && ${line##*, } =~ ^[0-9][0-9.]*$ ]]; then
+      FF_GPU_VENDOR=nvidia FF_GPU_NAME=${line%, *} FF_GPU_DRIVER=${line##*, }
+      if ! _gpu_has_toolkit; then
+        FF_GPU_STATE=notoolkit
+      elif [[ " $(_gpu_docker_runtimes) " == *" nvidia "* ]]; then
+        FF_GPU_STATE=ready
+      else
+        FF_GPU_STATE=noruntime
+      fi
+      return 0
+    fi
+    # The WSL2 nvidia-smi is there with every Windows driver, so it says
+    # nothing about a card on its own.
+    if [[ $smi != "$(_ff_sys /usr/lib/wsl/lib/nvidia-smi)" ]]; then nvidia=1; fi
+  fi
+  if [[ -n $nvidia ]]; then
+    FF_GPU_VENDOR=nvidia FF_GPU_NAME=NVIDIA FF_GPU_STATE=nodriver
+  elif [[ $'\n'$render$'\n'$pci$'\n' == *$'\n0x8086\n'* ]]; then
+    FF_GPU_VENDOR=intel FF_GPU_NAME=Intel FF_GPU_STATE=unsupported
+  elif [[ $'\n'$render$'\n'$pci$'\n' == *$'\n0x1002\n'* ]]; then
+    FF_GPU_VENDOR=amd FF_GPU_NAME=AMD FF_GPU_STATE=unsupported
+  fi
+  return 0
+}
+
+# _gpu_usable: 0 when detect_gpu found an NVIDIA GPU whose driver works.
+_gpu_usable() { [[ ${FF_GPU_STATE:-} == ready || ${FF_GPU_STATE:-} == notoolkit || ${FF_GPU_STATE:-} == noruntime ]]; }
+
+# _gpu_line: the result, as the server check shows it.
+_gpu_line() {
+  case ${FF_GPU_STATE:-none} in
+    ready | notoolkit | noruntime) printf 'GPU: %s (driver %s)' "$FF_GPU_NAME" "$FF_GPU_DRIVER" ;;
+    nodriver) printf 'GPU: NVIDIA (no working driver)' ;;
+    unsupported) printf 'GPU: %s (not used with the published images)' "$FF_GPU_NAME" ;;
+    *) printf 'GPU: none found' ;;
+  esac
+}
+
+# _gpu_driver_hint AGAIN: what to do about an NVIDIA card without a working
+# driver, ending with AGAIN (the command to run afterwards). The command to
+# type has a line of its own. Drivers are never installed here.
+_gpu_driver_hint() {
+  local again=$1
+  if [[ -n ${FF_GPU_WSL:-} ]]; then
+    printf 'install or update the NVIDIA driver on Windows (WSL uses the Windows driver), run wsl --shutdown in Windows, then start WSL and %s.' "$again"
+  elif [[ $(_ff_os_field ID) == debian ]]; then
+    printf 'install the NVIDIA driver as Debian describes at https://wiki.debian.org/NvidiaGraphicsDrivers, reboot, then %s.' "$again"
+  else
+    printf 'install the NVIDIA driver, reboot, then %s:\nsudo ubuntu-drivers install' "$again"
+  fi
+}
+
+# _gpu_unsupported_text: why an Intel or AMD GPU is not used.
+_gpu_unsupported_text() {
+  printf 'This server has an %s GPU. The published FreeFrame images use only NVIDIA GPUs, so video is processed on the CPU. To use this GPU, build the images yourself as the guide explains: %s' \
+    "$FF_GPU_NAME" "$FF_GPU_GUIDE"
+}
+
+# _gpu_decide FILE: after detect_gpu, whether this install processes video
+# on the GPU. Sets FF_GPU (nvidia or off), FF_GPU_SETUP (1: the toolkit is to
+# be set up first), FF_GPU_ASK (1: the Video processing question decides),
+# FF_GPU_NOTE (a note for the server check), FF_GPU_WHY (why the CPU, for
+# the summary) and FF_GPU_FORCE_OFF (1: FILE says nvidia, which this server
+# cannot do). FILE's FREEFRAME_GPU wins (a re-run keeps its answer); then
+# --gpu (FREEFRAME_GPU); then: a ready GPU is used, a working one without
+# the toolkit is asked about (unattended: the CPU, with a note).
+_gpu_decide() {
+  local file=$1 saved given=${FF_GPU:-}
+  FF_GPU_SETUP="" FF_GPU_ASK="" FF_GPU_NOTE="" FF_GPU_WHY="" FF_GPU_FORCE_OFF=""
+  case $given in
+    "" | auto | nvidia | off) ;;
+    *) _ff_answer_error "FREEFRAME_GPU (--gpu) must be nvidia or off; it is '$given'." "use --gpu nvidia to process video on an NVIDIA GPU, or --gpu off for the CPU." ;;
+  esac
+  saved=$(env_get "$file" FREEFRAME_GPU)
+  FF_GPU=off
+  case ${saved:-$given} in
+    off)
+      if [[ -n $saved ]]; then FF_GPU_WHY="as in the existing settings"; else FF_GPU_WHY="chosen with --gpu off"; fi
+      return 0
+      ;;
+    nvidia)
+      if _gpu_usable; then
+        FF_GPU=nvidia
+        [[ $FF_GPU_STATE == ready ]] || FF_GPU_SETUP=1
+        return 0
+      fi
+      _gpu_cpu_reason
+      if [[ -n $saved ]]; then
+        FF_GPU_FORCE_OFF=1
+        FF_GPU_NOTE="The settings in $file say FREEFRAME_GPU=nvidia, but $(_gpu_no_nvidia_text), so it is set to off and video is processed on the CPU."
+      else
+        FF_GPU_NOTE="--gpu nvidia was given, but $(_gpu_no_nvidia_text), so video is processed on the CPU."
+      fi
+      if [[ $FF_GPU_STATE == nodriver ]]; then
+        FF_GPU_NOTE+=" To use the GPU, $(_gpu_driver_hint "run the installer again")"
+      fi
+      return 0
+      ;;
+  esac
+  case $FF_GPU_STATE in
+    ready) FF_GPU=nvidia ;;
+    notoolkit | noruntime)
+      if _ff_interactive; then
+        FF_GPU_ASK=1
+      else
+        FF_GPU_WHY="the NVIDIA container toolkit is not set up"
+        FF_GPU_NOTE="This server has an NVIDIA GPU ($FF_GPU_NAME), but the NVIDIA container toolkit that lets Docker use it is not set up, so video is processed on the CPU. To set it up and use the GPU, add --gpu nvidia to the install command, or later run:
+sudo freeframe configure"
+      fi
+      ;;
+    nodriver)
+      _gpu_cpu_reason
+      FF_GPU_NOTE="This server has an NVIDIA GPU, but its driver does not answer (nvidia-smi), so video is processed on the CPU. To use the GPU, $(_gpu_driver_hint "run the installer again")"
+      ;;
+    unsupported)
+      _gpu_cpu_reason
+      FF_GPU_NOTE=$(_gpu_unsupported_text)
+      ;;
+    *) _gpu_cpu_reason ;;
+  esac
+}
+
+# _gpu_no_nvidia_text: "this server has no NVIDIA GPU", or that its driver
+# does not work.
+_gpu_no_nvidia_text() {
+  if [[ ${FF_GPU_STATE:-} == nodriver ]]; then
+    printf "this server's NVIDIA GPU has no working driver"
+  else
+    printf 'this server has no NVIDIA GPU'
+  fi
+}
+
+# _gpu_cpu_reason: FF_GPU_WHY from the detection.
+_gpu_cpu_reason() {
+  case ${FF_GPU_STATE:-none} in
+    nodriver) FF_GPU_WHY="the NVIDIA driver is not working" ;;
+    unsupported) FF_GPU_WHY="the $FF_GPU_NAME GPU is not used with the published images" ;;
+    notoolkit | noruntime) FF_GPU_WHY="the NVIDIA container toolkit is not set up" ;;
+    *) FF_GPU_WHY="no GPU found" ;;
+  esac
+}
+
+# _gpu_summary: the summary's Video row.
+_gpu_summary() {
+  if [[ ${FF_GPU:-off} == nvidia ]]; then
+    printf 'processed on the GPU (%s), with the CPU as a fallback' "$FF_GPU_NAME"
+    if [[ -n ${FF_GPU_SETUP:-} ]]; then
+      printf "; the NVIDIA container toolkit is set up first, from NVIDIA's repository, and Docker is restarted once"
+    fi
+  else
+    printf 'processed on the CPU (%s)' "${FF_GPU_WHY:-no GPU found}"
+  fi
+}
+
+# _gpu_ready_line: the closing message's line.
+_gpu_ready_line() {
+  if [[ ${FF_GPU:-off} == nvidia ]]; then
+    printf 'Video processing: GPU (%s)' "$FF_GPU_NAME"
+  else
+    printf 'Video processing: CPU (%s)' "${FF_GPU_WHY:-no GPU found}"
+  fi
+}
+
+# install_nvidia_toolkit: the NVIDIA container toolkit from NVIDIA's apt
+# repository, as NVIDIA's install guide does it (the keyring, the sources
+# list, apt install nvidia-container-toolkit), then Docker set up for it
+# (nvidia-ctk runtime configure) and restarted. When the toolkit is already
+# installed only Docker is set up. A failure after the sources list is
+# written removes it again, so a broken list never blocks apt.
+install_nvidia_toolkit() {
+  # FF_NVIDIA_KEYRING and FF_NVIDIA_LIST are for the tests.
+  local key=${FF_NVIDIA_KEYRING:-/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg}
+  local list=${FF_NVIDIA_LIST:-/etc/apt/sources.list.d/nvidia-container-toolkit.list} tmp
+  if ! command -v nvidia-ctk >/dev/null 2>&1; then
+    run_apt update || return 1
+    # NVIDIA's guide names gnupg2, a transitional name for gnupg.
+    run_apt install --no-install-recommends ca-certificates curl gnupg || return 1
+    tmp=$(mktemp -d) || return 1
+    if ! { curl -fsSL --retry 3 "$FF_NVIDIA_REPO/gpgkey" -o "$tmp/gpgkey" &&
+      install -m 0755 -d "$(dirname "$key")" &&
+      gpg --batch --yes --dearmor -o "$key" "$tmp/gpgkey" && chmod a+r "$key" &&
+      curl -fsSL --retry 3 "$FF_NVIDIA_REPO/stable/deb/nvidia-container-toolkit.list" -o "$tmp/list" &&
+      grep -q '^deb https://' "$tmp/list" &&
+      sed "s#deb https://#deb [signed-by=$key] https://#g" "$tmp/list" >"$list"; }; then
+      rm -rf "$tmp"
+      rm -f "$list"
+      return 1
+    fi
+    rm -rf "$tmp"
+    if ! { run_apt update && run_apt install nvidia-container-toolkit; }; then
+      rm -f "$list"
+      return 1
+    fi
+  fi
+  nvidia-ctk runtime configure --runtime=docker || return 1
+  systemctl restart docker
+}
+
+# _gpu_now_ready: detect again; 0 when Docker can use the GPU.
+_gpu_now_ready() {
+  detect_gpu
+  [[ $FF_GPU_STATE == ready ]]
+}
+
+# _gpu_setup: set the toolkit up (its output goes to the log), then wait for
+# Docker to come back with the nvidia runtime. 0 when the GPU is ready.
+_gpu_setup() {
+  _ff_logged install_nvidia_toolkit || return 1
+  _ff_wait_for "${FF_DOCKER_WAIT:-60}" 3 _gpu_now_ready
 }
 
 # fetch REF PATH DEST: download PATH from the repository at REF (a branch or
@@ -1751,6 +2061,9 @@ install_preflight() {
   local cores ram free path last="" docker_free=""
   FF_STEP="checking the server"
   FF_NOTES=()
+  # Detected before the welcome (_install_gpu_check), shown here.
+  FF_CHECK_GPU=$(_gpu_line)
+  if [[ -n ${FF_GPU_NOTE:-} ]]; then FF_NOTES+=("$FF_GPU_NOTE"); fi
   _ff_open " Checking this server ..."
   cores=${FF_CORES:-$(_ff_cores)}
   ram=${FF_RAM_MB:-$(_ff_ram_mb)}
@@ -1822,7 +2135,8 @@ _install_os_name() {
 }
 
 # _install_check_done: finish the server check line with what was found,
-# then the notes (low memory or disk space) under it.
+# then the GPU line, then the notes (low memory or disk space, the GPU)
+# under it.
 _install_check_done() {
   local ok note width=${FF_WIDTH:-0}
   ok=$(_ff_style 32 ok)
@@ -1837,6 +2151,7 @@ _install_check_done() {
     printf ' %s\n' "$ok"
     _ff_lines "   (" "    " "" "$FF_CHECK_FOUND)"
   fi
+  if [[ -n ${FF_CHECK_GPU:-} ]]; then _ff_lines "   " "     " "" "$FF_CHECK_GPU"; fi
   for note in ${FF_NOTES[@]+"${FF_NOTES[@]}"}; do
     _ff_lines "   Note: " "         " "" "$note" >&2
   done
@@ -1932,6 +2247,7 @@ _install_count_steps() {
   fi
   if [[ -z $(env_get "$file" MAIL_PROVIDER) && -z ${FF_SMTP_HOST:-} ]]; then n=$((n + 1)); fi
   if [[ -z ${FF_ADMIN_NAME:-} || -z ${FF_ADMIN_EMAIL:-} || -z ${FF_ADMIN_PASSWORD:-} ]]; then n=$((n + 1)); fi
+  if [[ -n ${FF_GPU_ASK:-} ]]; then n=$((n + 1)); fi
   FF_QTOTAL=$n
 }
 
@@ -1968,6 +2284,7 @@ _install_welcome() {
     2) count="Two short questions" ;;
     3) count="Three short questions" ;;
     4) count="Four short questions" ;;
+    5) count="Five short questions" ;;
     *) count="$n short questions" ;;
   esac
   _install_banner
@@ -2361,6 +2678,55 @@ _install_ask_admin() {
   FF_PW_GENERATED=1
 }
 
+# _install_gpu_check FILE: detect the GPU and decide (_gpu_decide), before
+# the welcome, so the Video processing question is counted. Changes nothing.
+_install_gpu_check() {
+  detect_gpu
+  _gpu_decide "$1"
+}
+
+# _install_ask_gpu: the Video processing step, asked only for an NVIDIA GPU
+# whose driver works when Docker cannot use it yet (FF_GPU_ASK).
+_install_ask_gpu() {
+  local answer=""
+  [[ -n ${FF_GPU_ASK:-} ]] || return 0
+  _install_step "Video processing"
+  _ff_p "This server has an NVIDIA GPU: $FF_GPU_NAME (driver $FF_GPU_DRIVER). FreeFrame can use it to prepare uploaded videos for review, much faster than the processor (CPU) can."
+  say ""
+  _ff_p "Docker needs the NVIDIA container toolkit for that. The installer sets it up from NVIDIA's own repository and restarts Docker once; the driver is left as it is. Without it, video is processed on the CPU."
+  say ""
+  while :; do
+    ask answer " Use the NVIDIA GPU for video processing? [Y/n]" "" || _ff_input_ended
+    case ${answer,,} in
+      "" | y | yes)
+        FF_GPU=nvidia FF_GPU_SETUP=1
+        return 0
+        ;;
+      n | no)
+        FF_GPU=off FF_GPU_WHY="you chose the CPU"
+        return 0
+        ;;
+    esac
+    _ff_hint 3 "Type y or n, or press Enter for yes."
+  done
+}
+
+# _install_gpu_step: set up the NVIDIA container toolkit when the GPU was
+# chosen and Docker cannot use it yet. Never fails the install: when it
+# does not work, video is processed on the CPU (FREEFRAME_GPU=off).
+_install_gpu_step() {
+  [[ ${FF_GPU:-off} == nvidia && -n ${FF_GPU_SETUP:-} ]] || return 0
+  FF_STEP="setting up the NVIDIA container toolkit"
+  _ff_p "Setting up the NVIDIA container toolkit, so Docker can use the GPU, and restarting Docker (a minute or two)..."
+  if _gpu_setup; then
+    FF_GPU_SETUP=""
+    _install_done "installed the NVIDIA container toolkit and set Docker up for the GPU"
+    return 0
+  fi
+  FF_GPU=off FF_GPU_FAILED=1 FF_GPU_FORCE_OFF=1 FF_GPU_WHY="the NVIDIA container toolkit could not be set up"
+  _ff_pw "The NVIDIA container toolkit could not be set up, so FreeFrame processes video on the CPU. The reason is at the end of the log; the install goes on."
+}
+
 # _install_footage_hours: roughly how many hours of 1080p footage fit in the
 # free space Docker's volumes will use (about 20 GB an hour, counting the
 # original and the review copies FreeFrame makes).
@@ -2413,6 +2779,7 @@ _install_show_summary() {
   else
     _install_row "Admin" "$FF_ADMIN_NAME <$FF_ADMIN_EMAIL>"
   fi
+  _install_row "Video" "$(_gpu_summary)"
   # Interactive runs showed the note when email was skipped.
   if [[ -z ${FF_SMTP_FROM_FILE:-} && -z ${FF_SMTP_HOST:-} ]] && ! _ff_interactive; then
     say ""
@@ -2434,6 +2801,7 @@ _install_questions() {
   fi
   _install_ask_smtp "$file"
   _install_ask_admin
+  _install_ask_gpu
   _install_show_summary "$file"
   if _ff_interactive && ! confirm " Install now?" Y; then
     _ff_stop 1 "Install cancelled. Nothing was installed." "run the install command again when you are ready."
@@ -2762,6 +3130,13 @@ _install_settings_step() {
   elif ! derive_env "$file"; then
     install_fail "The settings could not be written." "fix what the message above says, then run sudo freeframe install again."
   fi
+  # Settings that ask for a GPU this server cannot use (or whose toolkit
+  # could not be set up) would stop the worker from starting.
+  if [[ -n ${FF_GPU_FORCE_OFF:-} && $(env_get "$file" FREEFRAME_GPU) != off ]]; then
+    if ! { env_backup "$file" >/dev/null && env_set "$file" FREEFRAME_GPU off; }; then
+      install_fail "FREEFRAME_GPU could not be set to off in $file." "check that the disk is not full, then run sudo freeframe install again."
+    fi
+  fi
   # Also when nothing had to be added: a file copied in with wider
   # permissions still holds the passwords.
   chmod 600 "$file" || install_fail "Cannot make $file private (chmod 600 failed)." "check the disk, then run sudo freeframe install again."
@@ -3061,6 +3436,12 @@ _install_summary_lines() {
     fi
   fi
   say "$rule"
+  say ""
+  _ff_p "$(_gpu_ready_line)"
+  if [[ -n ${FF_GPU_FAILED:-} ]]; then
+    _ff_p "To try setting up the GPU again, run:"
+    say "   sudo freeframe configure"
+  fi
   if [[ -n ${FF_CERT_PENDING:-} ]]; then
     say ""
     _ff_p "The HTTPS certificate for $FF_CERT_PENDING has not arrived yet, so browsers show a warning until it does. Check that the DNS records point at $FF_IP and that ports 80 and 443 are open to the internet, then run:"
@@ -3128,6 +3509,7 @@ cmd_install() {
   FF_ADDR_FROM_FILE="" FF_SMTP_FROM_FILE="" FF_ADMIN_EXISTED="" FF_CERT_PENDING="" FF_FELL_BACK=""
   FF_ADMIN_CREATED="" FF_PW_GENERATED="" FF_RERUN="the install command"
   FF_DONE=()
+  FF_GPU_FAILED=""
 
   # Refusals first: nothing is written before these pass.
   _install_check_system
@@ -3147,6 +3529,7 @@ cmd_install() {
   fi
 
   _ff_screen_setup
+  _install_gpu_check "$file"
   if _ff_interactive; then
     _install_count_steps "$file"
     _install_welcome
@@ -3162,6 +3545,7 @@ cmd_install() {
   # From here on the server is changed.
   _install_self
   _install_docker_step
+  _install_gpu_step
   _install_swap_step
   _install_ufw_step
   _install_dns_step
@@ -5308,12 +5692,94 @@ _cfg_storage() {
   _cfg_s3_set "$endpoint" "$bucket" "$access" "$secret" "$region"
 }
 
+# _cfg_gpu_on: --gpu nvidia, or yes to the GPU: refused (exit 2, nothing
+# changed) without an NVIDIA GPU whose driver works; the toolkit is set up
+# (FF_GPU_SETUP) when Docker cannot use it yet.
+_cfg_gpu_on() {
+  local cur try
+  cur=$(env_get "$FF_CFG_FILE" FREEFRAME_GPU)
+  if ! _gpu_usable; then
+    case $FF_GPU_STATE in
+      nodriver) try=$(_gpu_driver_hint "run sudo freeframe configure --yes --gpu nvidia again") ;;
+      unsupported) try="the published images use only NVIDIA GPUs. To use this one, build the images yourself as the guide explains: $FF_GPU_GUIDE" ;;
+      *) try="FreeFrame can use an NVIDIA GPU only; this server keeps processing video on the CPU." ;;
+    esac
+    _ff_stop 2 "--gpu nvidia was given, but $(_gpu_no_nvidia_text). Nothing was changed." "$try"
+  fi
+  [[ $FF_GPU_STATE == ready ]] || FF_GPU_SETUP=1
+  [[ $cur == nvidia ]] || _cfg_set FREEFRAME_GPU nvidia
+}
+
+# _cfg_gpu: whether video is processed on the GPU or the CPU (section 4):
+# the GPU is detected first; --gpu nvidia|off, or the question when there
+# is a choice to make.
+_cfg_gpu() {
+  local cur given=${FF_GPU:-} line
+  cur=$(env_get "$FF_CFG_FILE" FREEFRAME_GPU)
+  FF_GPU_SETUP=""
+  case $given in
+    "" | auto | nvidia | off) ;;
+    *) _ff_answer_error "FREEFRAME_GPU (--gpu) must be nvidia or off; it is '$given'." "use --gpu nvidia to process video on an NVIDIA GPU, or --gpu off for the CPU." ;;
+  esac
+  # Unattended without --gpu: nothing to decide, so nothing to detect.
+  if [[ $given != off && $given != nvidia ]] && ! _ff_interactive; then return 0; fi
+  detect_gpu
+  case $given in
+    off)
+      [[ ${cur:-off} == off ]] || _cfg_set FREEFRAME_GPU off
+      return 0
+      ;;
+    nvidia)
+      _cfg_gpu_on
+      return 0
+      ;;
+  esac
+  say ""
+  say "4. Video processing"
+  if [[ $cur == nvidia ]]; then
+    if ! _gpu_usable; then
+      say "   Now: set to the GPU, but $(_gpu_no_nvidia_text), so the worker cannot use it."
+      confirm "   Process video on the CPU instead?" Y && _cfg_set FREEFRAME_GPU off
+      return 0
+    fi
+    say "   Now: on the GPU ($FF_GPU_NAME)"
+    if [[ $FF_GPU_STATE != ready ]]; then
+      say "   Docker cannot use it at the moment: the NVIDIA container toolkit is not set up. Keeping it sets the toolkit up."
+    fi
+    if confirm "   Keep using the NVIDIA GPU for video processing?" Y; then
+      [[ $FF_GPU_STATE == ready ]] || FF_GPU_SETUP=1
+    else
+      _cfg_set FREEFRAME_GPU off
+    fi
+    return 0
+  fi
+  if _gpu_usable; then
+    say "   Now: on the CPU"
+    say "   This server has an NVIDIA GPU: $FF_GPU_NAME (driver $FF_GPU_DRIVER)."
+    if [[ $FF_GPU_STATE != ready ]]; then
+      say "   Using it sets up the NVIDIA container toolkit from NVIDIA's repository and restarts Docker, which"
+      say "   stops every container on this server for a moment; FreeFrame is started again after."
+    fi
+    if confirm "   Use the NVIDIA GPU for video processing?" N; then _cfg_gpu_on; fi
+    return 0
+  fi
+  _gpu_cpu_reason
+  say "   Now: on the CPU ($FF_GPU_WHY)"
+  case $FF_GPU_STATE in
+    nodriver)
+      while IFS= read -r line; do say "   $line"; done <<<"To use the GPU, $(_gpu_driver_hint "run sudo freeframe configure again")"
+      ;;
+    unsupported) say "   To use it, build the images yourself as the guide explains: $FF_GPU_GUIDE" ;;
+  esac
+  return 0
+}
+
 # _cfg_show: the changes, before anything is written. Passwords and keys are
 # never shown.
 _cfg_show() {
   local k old new
   say ""
-  say "These settings will change:"
+  if ((${#FF_CFG_KEYS[@]})); then say "These settings will change:"; fi
   for k in "${FF_CFG_KEYS[@]}"; do
     case $k in
       SMTP_PASSWORD | S3_ACCESS_KEY | S3_SECRET_KEY) say "  $k: (changed; not shown)" ;;
@@ -5331,6 +5797,11 @@ _cfg_show() {
     say "Links already sent by email (invitations, sign-in links and shared review links) point at the old"
     say "address and stop working. Send them again from FreeFrame once it runs at the new address."
     say "Everyone signs in again there."
+  fi
+  if [[ -n ${FF_GPU_SETUP:-} ]]; then
+    say ""
+    say "Using the GPU first sets up the NVIDIA container toolkit from NVIDIA's repository and restarts Docker:"
+    say "every container on this server stops for a moment, and FreeFrame is started again after."
   fi
 }
 
@@ -5394,8 +5865,9 @@ cmd_configure() {
   if [[ -z ${FF_STORAGE:-}${FF_S3_ENDPOINT:-}${FF_S3_BUCKET:-}${FF_S3_ACCESS_KEY:-}${FF_S3_SECRET_KEY:-}${FF_S3_REGION:-} ]]; then
     _cfg_storage
   fi
+  _cfg_gpu
 
-  if ((${#FF_CFG_KEYS[@]} == 0)); then
+  if ((${#FF_CFG_KEYS[@]} == 0)) && [[ -z ${FF_GPU_SETUP:-} ]]; then
     say ""
     say "Nothing to change; the settings are as they were."
     return 0
@@ -5410,6 +5882,8 @@ cmd_configure() {
     fi
     [[ $k == FREEFRAME_CHANNEL ]] || restart=1
   done
+  # Setting the toolkit up restarts Docker, and the worker needs recreating.
+  [[ -z ${FF_GPU_SETUP:-} ]] || restart=1
   _cfg_show
   if _ff_interactive; then
     local question="Save these changes and restart FreeFrame?"
@@ -5443,25 +5917,46 @@ cmd_configure() {
   # Again under the lock: a restore may have stopped part-way meanwhile.
   _ff_refuse_unfinished_restore configure logged
 
+  # The GPU's toolkit first: when it cannot be set up, video stays on the
+  # CPU (FREEFRAME_GPU=off) and the other changes still go ahead. Docker is
+  # restarted either way, so FreeFrame is started again below.
+  FF_GPU_FAILED=""
+  if [[ -n ${FF_GPU_SETUP:-} ]]; then
+    FF_STEP="setting up the NVIDIA container toolkit"
+    FF_STATE="The settings were not changed yet; Docker may be restarting, and FreeFrame with it."
+    say "Setting up the NVIDIA container toolkit and restarting Docker (a minute or two; every container on this server stops for a moment)..."
+    if _gpu_setup; then
+      say "The NVIDIA container toolkit is set up, and Docker can use the GPU."
+    else
+      FF_GPU_FAILED=1
+      warn "The NVIDIA container toolkit could not be set up, so video is still processed on the CPU. The reason is at the end of $FF_LOG."
+      _cfg_set FREEFRAME_GPU off
+    fi
+  fi
+
   FF_STEP="saving the settings"
   # Plain HTTP goes through switch_to_http_mode, which writes the address
   # keys (after its own backup) and restarts FreeFrame.
   if [[ -n ${FF_CFG_NEW[FRONTEND_URL]:-} && $FF_CFG_MODE == off ]]; then http_switch=1; fi
-  backup=$(env_backup "$file") ||
-    install_fail "Could not back up $file, so nothing was changed." "check that the disk is not full, then run sudo freeframe configure again."
-  for k in "${FF_CFG_KEYS[@]}"; do
-    if ((http_switch)); then
-      case $k in
-        FREEFRAME_HTTPS | FRONTEND_URL | DOMAIN | S3_PUBLIC_ENDPOINT | STORAGE_DOMAIN | STORAGE_ROUTED | STORAGE_PORT_BIND) continue ;;
-      esac
-    fi
-    if ! env_set "$file" "$k" "${FF_CFG_NEW[$k]}"; then
-      install_fail "The setting $k could not be saved." \
-        "put the settings from before back with: sudo cp $(_ff_q "$backup") $(_ff_q "$file"), then run sudo freeframe configure again."
-    fi
-  done
-  say "Saved. The settings from before are in $backup"
-  FF_STATE="The new settings are saved. To put the ones from before back, run: sudo cp $(_ff_q "$backup") $(_ff_q "$file") && sudo freeframe restart"
+  if ((${#FF_CFG_KEYS[@]})); then
+    backup=$(env_backup "$file") ||
+      install_fail "Could not back up $file, so nothing was changed." "check that the disk is not full, then run sudo freeframe configure again."
+    for k in "${FF_CFG_KEYS[@]}"; do
+      if ((http_switch)); then
+        case $k in
+          FREEFRAME_HTTPS | FRONTEND_URL | DOMAIN | S3_PUBLIC_ENDPOINT | STORAGE_DOMAIN | STORAGE_ROUTED | STORAGE_PORT_BIND) continue ;;
+        esac
+      fi
+      if ! env_set "$file" "$k" "${FF_CFG_NEW[$k]}"; then
+        install_fail "The setting $k could not be saved." \
+          "put the settings from before back with: sudo cp $(_ff_q "$backup") $(_ff_q "$file"), then run sudo freeframe configure again."
+      fi
+    done
+    say "Saved. The settings from before are in $backup"
+    FF_STATE="The new settings are saved. To put the ones from before back, run: sudo cp $(_ff_q "$backup") $(_ff_q "$file") && sudo freeframe restart"
+  else
+    FF_STATE="The settings were not changed."
+  fi
   if ((!restart)); then
     say "The $(env_get "$file" FREEFRAME_CHANNEL) channel is used from the next sudo freeframe update."
     trap - ERR INT TERM HUP
@@ -5507,7 +6002,17 @@ cmd_configure() {
   fi
   trap - ERR INT TERM HUP
   say ""
+  if [[ -n ${FF_GPU_FAILED:-} ]]; then
+    warn "FreeFrame runs at $url, but video is still processed on the CPU: the NVIDIA container toolkit could not be set up. The reason is at the end of $FF_LOG."
+    warn "To try again, run: sudo freeframe configure"
+    _install_log_stop
+    exit 1
+  fi
   say "FreeFrame runs at $url with the new settings."
+  if [[ -n ${FF_CFG_NEW[FREEFRAME_GPU]+x} || -n ${FF_GPU_SETUP:-} ]]; then
+    FF_GPU=$(env_get "$file" FREEFRAME_GPU) FF_GPU_WHY="you chose the CPU"
+    say "$(_gpu_ready_line)"
+  fi
   _install_log_stop
 }
 
@@ -5532,6 +6037,56 @@ _ff_mount_of() {
   local p=$1
   while [[ ! -e $p && $p != / ]]; do p=$(dirname "$p"); done
   df -Pk "$p" 2>/dev/null | awk 'NR == 2 { print $6 }'
+}
+
+# _status_gpu FILE: where video is processed, as it is in effect: with
+# FREEFRAME_GPU=nvidia the worker container itself is asked whether it sees
+# the GPU (nvidia-smi -L, as the transcoder checks), and when it does not,
+# the reason and the fix are given.
+_status_gpu() {
+  local file=$1 root out name pre="  Video:        "
+  root=$(ff_root)
+  if [[ $(env_get "$file" FREEFRAME_GPU) != nvidia ]]; then
+    detect_gpu
+    if _gpu_usable; then
+      say "${pre}processed on the CPU. This server's NVIDIA GPU ($FF_GPU_NAME) is not used; to use it, run: sudo freeframe configure"
+    else
+      _gpu_cpu_reason
+      say "${pre}processed on the CPU ($FF_GPU_WHY)"
+    fi
+    return 0
+  fi
+  if [[ ! -f $root/docker-compose.gpu.yml ]]; then
+    say "${pre}on the CPU: the GPU is chosen (FREEFRAME_GPU=nvidia), but docker-compose.gpu.yml is missing from $root, so the worker runs without it. To fetch it, run: sudo freeframe update"
+    return 0
+  fi
+  if out=$(dc exec -T worker nvidia-smi -L 2>/dev/null) && [[ $out == "GPU "* ]]; then
+    name=${out%%$'\n'*}
+    name=${name#GPU *: }
+    name=${name% (UUID:*}
+    say "${pre}processed on the GPU ($name), with the CPU as a fallback"
+    return 0
+  fi
+  detect_gpu
+  if [[ -z $(dc ps -q --status running worker 2>/dev/null) ]]; then
+    if [[ $FF_GPU_STATE == ready ]]; then
+      say "${pre}set to the GPU, but the worker that processes video is not running. Start it with: sudo freeframe restart"
+    else
+      say "${pre}set to the GPU, but the worker that processes video is not running: $(_status_gpu_why)"
+    fi
+    return 0
+  fi
+  say "${pre}on the CPU: the GPU is chosen (FREEFRAME_GPU=nvidia), but the worker does not see it: $(_status_gpu_why)"
+}
+
+# _status_gpu_why: why the worker cannot have the GPU, and the fix.
+_status_gpu_why() {
+  case $FF_GPU_STATE in
+    ready) printf 'Docker can use the GPU now. To start the worker again with the GPU, run: sudo freeframe restart' ;;
+    notoolkit | noruntime) printf 'the NVIDIA container toolkit is not set up for Docker. To set it up, run: sudo freeframe configure --yes --gpu nvidia' ;;
+    nodriver) printf 'the NVIDIA driver on this server does not answer. To use the GPU, %s' "$(_gpu_driver_hint "run sudo freeframe restart" | tr '\n' ' ')" ;;
+    *) printf 'this server has no NVIDIA GPU. To process video on the CPU, run: sudo freeframe configure --yes --gpu off' ;;
+  esac
 }
 
 cmd_status() {
@@ -5614,6 +6169,7 @@ cmd_status() {
   else
     say "  Email:        not set up, so sign-in codes and invitations are not sent (sudo freeframe configure)"
   fi
+  _status_gpu "$file"
 
   say ""
   say "Parts of FreeFrame:"
@@ -5756,14 +6312,16 @@ Commands:
               (updates this command first; --channel picks another channel)
   rollback    After an update that did not come up: go back to the version
               from before, with the database as it was just before it
-  configure   Change the answers you gave (web address, email, storage);
+  configure   Change the answers you gave (web address, email, storage,
+              and whether video is processed on the GPU or the CPU);
               with --yes, give only the new answers as options
   backup      Save a copy of the database to /opt/freeframe/backups now
               (this also runs every night at 3:00; the newest 7 are kept)
   restore     List the backups; restore FILE puts one back (replaces the
               current database, after saving a copy of it)
-  status      Show the version, whether everything is running, disk space,
-              backups and whether a newer release is out
+  status      Show the version, whether everything is running, where video
+              is processed (GPU or CPU), disk space, backups and whether a
+              newer release is out
   logs        Show FreeFrame's recent messages and follow new ones (Ctrl-C
               stops); logs api shows one part only
   restart     Restart every part of FreeFrame and wait until it answers
@@ -5774,7 +6332,12 @@ example --domain review.yourstudio.com or FREEFRAME_DOMAIN=review.yourstudio.com
 Options: --domain --https --acme-email --storage --s3-endpoint --s3-bucket
   --s3-access-key --s3-secret-key --s3-region --smtp-host --smtp-port
   --smtp-user --smtp-password --smtp-from --admin-name --admin-email
-  --admin-password --channel --yes
+  --admin-password --channel --gpu --yes
+  --gpu       (install, configure) nvidia: process video on this server's
+              NVIDIA GPU, setting up NVIDIA's container toolkit if needed
+              (the driver must already work); off: on the CPU. Without it,
+              install uses a GPU Docker can already use, and asks about one
+              it cannot use yet (unattended runs stay on the CPU)
   --quiet     (backup) print nothing unless something goes wrong
 
 Passwords and keys (--admin-password, --smtp-password, --s3-secret-key) are

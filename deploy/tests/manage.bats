@@ -309,3 +309,85 @@ setup() {
   run env LC_ALL="$loc" bash -c 'source "$1"; _ff_version_gt 1.0.0-rc.a 1.0.0-rc.B' ff "$FF_SCRIPT"
   [ "$status" -eq 0 ]
 }
+
+# ---------------------------------------------------------------- status: video processing
+
+@test "status gpu: the GPU in use, seen by the worker, is named" {
+  printf 'services:\n  worker: {}\n' >"$FF_ROOT/docker-compose.gpu.yml"
+  env_set "$ENV" FREEFRAME_GPU nvidia
+  export STUB_GPU=ready STUB_WORKER_GPU="GPU 0: NVIDIA GeForce RTX 5070 Ti (UUID: GPU-0d5e2b6c-1111-2222-3333-444455556666)"
+  ff status
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -qxF "  Video:        processed on the GPU (NVIDIA GeForce RTX 5070 Ti), with the CPU as a fallback" <<<"$output" ||
+    { echo "$output"; false; }
+  grep -qx "dc exec -T worker nvidia-smi -L" "$CALLS"
+}
+
+@test "status gpu: the GPU chosen but not seen by the worker says why, with the fix" {
+  printf 'services:\n  worker: {}\n' >"$FF_ROOT/docker-compose.gpu.yml"
+  env_set "$ENV" FREEFRAME_GPU nvidia
+  export STUB_GPU=notoolkit
+  ff status
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "  Video:        on the CPU: the GPU is chosen (FREEFRAME_GPU=nvidia), but the worker does not see it"
+  assert_out "the NVIDIA container toolkit is not set up for Docker"
+  assert_out "sudo freeframe configure --yes --gpu nvidia"
+
+  export STUB_GPU=ready
+  ff status
+  assert_out "To start the worker again with the GPU, run: sudo freeframe restart"
+
+  export STUB_GPU=nodriver
+  ff status
+  assert_out "the NVIDIA driver on this server does not answer"
+}
+
+@test "status gpu: a stopped worker cannot be asked, and says so" {
+  printf 'services:\n  worker: {}\n' >"$FF_ROOT/docker-compose.gpu.yml"
+  env_set "$ENV" FREEFRAME_GPU nvidia
+  export STUB_GPU=ready STUB_WORKER_DOWN=1
+  ff status
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "  Video:        set to the GPU, but the worker that processes video is not running"
+}
+
+@test "status gpu: the GPU chosen without the GPU file (an older release's set) says so" {
+  env_set "$ENV" FREEFRAME_GPU nvidia
+  export STUB_GPU=ready
+  ff status
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "docker-compose.gpu.yml is missing"
+  assert_not_called "dc exec -T worker nvidia-smi -L"
+}
+
+@test "status gpu: on the CPU, a GPU that could be used is pointed out" {
+  export STUB_GPU=notoolkit
+  ff status
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -qxF "  Video:        processed on the CPU. This server's NVIDIA GPU (NVIDIA GeForce RTX 5070 Ti) is not used; to use it, run: sudo freeframe configure" <<<"$output" ||
+    { echo "$output"; false; }
+  assert_not_called "dc exec -T worker nvidia-smi -L"
+}
+
+@test "status gpu: on the CPU with no usable GPU, the reason is given" {
+  local s want
+  for s in none nodriver intel; do
+    export STUB_GPU=$s
+    ff status
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    case $s in
+      none) want="  Video:        processed on the CPU (no GPU found)" ;;
+      nodriver) want="  Video:        processed on the CPU (the NVIDIA driver is not working)" ;;
+      intel) want="  Video:        processed on the CPU (the Intel GPU is not used with the published images)" ;;
+    esac
+    grep -qxF "$want" <<<"$output" || { echo "$output"; false; }
+  done
+}
+
+@test "help: names --gpu and video processing" {
+  run bash "$FF_SCRIPT" help
+  [ "$status" -eq 0 ]
+  assert_out "--gpu"
+  assert_out "video"
+}
+

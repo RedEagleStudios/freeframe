@@ -147,3 +147,25 @@ derive_env() {
   [[ -z ${STUB_DERIVE_FAIL:-} ]] || return 1
   _real_derive_env "$@"
 }
+
+# The GPU: STUB_GPU is what detect_gpu finds: none (the default), ready,
+# notoolkit, noruntime, nodriver, intel or amd. install_nvidia_toolkit
+# makes a notoolkit or noruntime GPU ready, unless STUB_GPU_SETUP_FAIL.
+detect_gpu() {
+  _stub_log detect_gpu
+  FF_GPU_VENDOR=none FF_GPU_NAME="" FF_GPU_DRIVER="" FF_GPU_STATE=none FF_GPU_WSL=${STUB_GPU_WSL:-}
+  case ${STUB_GPU:-none} in
+    ready | notoolkit | noruntime)
+      FF_GPU_VENDOR=nvidia FF_GPU_NAME="NVIDIA GeForce RTX 5070 Ti" FF_GPU_DRIVER=610.47 FF_GPU_STATE=$STUB_GPU
+      ;;
+    nodriver) FF_GPU_VENDOR=nvidia FF_GPU_NAME=NVIDIA FF_GPU_STATE=nodriver ;;
+    intel) FF_GPU_VENDOR=intel FF_GPU_NAME=Intel FF_GPU_STATE=unsupported ;;
+    amd) FF_GPU_VENDOR=amd FF_GPU_NAME=AMD FF_GPU_STATE=unsupported ;;
+  esac
+}
+
+install_nvidia_toolkit() {
+  _stub_log install_nvidia_toolkit
+  [[ -z ${STUB_GPU_SETUP_FAIL:-} ]] || return 1
+  STUB_GPU=ready
+}

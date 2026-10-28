@@ -2279,3 +2279,207 @@ $(head -c 70000 /dev/zero | tr '\0' x)"
   assert_no_out "is not available on ghcr.io"
   assert_no_out "disk is full"
 }
+
+# ---------------------------------------------------------------- video processing (GPU)
+
+# The rest of an interactive run after the web address step, with the Video
+# processing question answered GPU_ANSWER before the confirmation.
+rest_gpu() { REST_GPU=(1 "" "Grace" "grace@example.com" "long-password-1" "long-password-1" "$1" "y"); }
+
+@test "gpu: a server without a GPU says so in the check, and processes video on the CPU" {
+  plain_answers
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -qxF "   GPU: none found" <<<"$output" || { echo "$output"; false; }
+  [[ $output == *"Checking this server ... ok"*"   GPU: none found"* ]] || { echo "$output"; false; }
+  assert_has "$ENV" "FREEFRAME_GPU=off"
+  assert_out "   Video         processed on the CPU (no GPU found)"
+  grep -qxF " Video processing: CPU (no GPU found)" <<<"$output" || { echo "$output"; false; }
+  assert_not_called install_nvidia_toolkit
+}
+
+@test "gpu: a ready NVIDIA GPU is used without a question, and nothing is installed for it" {
+  plain_answers
+  export STUB_GPU=ready
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -qxF "   GPU: NVIDIA GeForce RTX 5070 Ti (driver 610.47)" <<<"$output" || { echo "$output"; false; }
+  assert_has "$ENV" "FREEFRAME_GPU=nvidia"
+  assert_out "processed on the GPU (NVIDIA GeForce RTX 5070 Ti), with the CPU as a fallback"
+  grep -qxF " Video processing: GPU (NVIDIA GeForce RTX 5070 Ti)" <<<"$output" || { echo "$output"; false; }
+  assert_not_called install_nvidia_toolkit
+}
+
+@test "gpu: unattended, a GPU without the toolkit stays on the CPU and says how to use it" {
+  plain_answers
+  export STUB_GPU=notoolkit
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_has "$ENV" "FREEFRAME_GPU=off"
+  assert_out "add --gpu nvidia to the install command"
+  grep -qxF "         sudo freeframe configure" <<<"$output" || { echo "$output"; false; }
+  assert_out "processed on the CPU (the NVIDIA container toolkit is not set up)"
+  assert_not_called install_nvidia_toolkit
+}
+
+@test "gpu: unattended with --gpu nvidia, the toolkit is set up after Docker, before anything else" {
+  plain_answers
+  export STUB_GPU=notoolkit
+  ff_install --yes --gpu nvidia
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_order install_docker install_nvidia_toolkit "fetch latest docker-compose.prod.yml" derive_env "dc up -d"
+  assert_has "$ENV" "FREEFRAME_GPU=nvidia"
+  assert_out "Setting up the NVIDIA container toolkit"
+  grep -qxF " Video processing: GPU (NVIDIA GeForce RTX 5070 Ti)" <<<"$output" || { echo "$output"; false; }
+  # The toolkit output goes to the log, not the screen.
+  [[ $(grep -c install_nvidia_toolkit "$CALLS") == 1 ]]
+}
+
+@test "gpu: FREEFRAME_GPU=nvidia works like --gpu nvidia" {
+  plain_answers
+  export STUB_GPU=noruntime FREEFRAME_GPU=nvidia
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -qx install_nvidia_toolkit "$CALLS"
+  assert_has "$ENV" "FREEFRAME_GPU=nvidia"
+}
+
+@test "gpu: a toolkit that cannot be set up never fails the install; video stays on the CPU" {
+  plain_answers
+  export STUB_GPU=notoolkit STUB_GPU_SETUP_FAIL=1
+  ff_install --yes --gpu nvidia
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "The NVIDIA container toolkit could not be set up, so FreeFrame processes video on the CPU"
+  assert_has "$ENV" "FREEFRAME_GPU=off"
+  grep -qxF " Video processing: CPU (the NVIDIA container toolkit could not be set up)" <<<"$output" || { echo "$output"; false; }
+  assert_out "FreeFrame is ready: http://203.0.113.7"
+  # The way to try again, on a line of its own.
+  grep -qxF "   sudo freeframe configure" <<<"$output" || { echo "$output"; false; }
+}
+
+@test "gpu: an unknown --gpu value is refused before anything is written" {
+  plain_answers
+  ff_install --yes --gpu cuda
+  [ "$status" -eq 2 ]
+  assert_out "must be nvidia or off"
+  assert_root_untouched
+}
+
+@test "gpu: an NVIDIA card without a working driver gets the driver suggestion, and the install goes on" {
+  plain_answers
+  export STUB_GPU=nodriver
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -qxF "   GPU: NVIDIA (no working driver)" <<<"$output" || { echo "$output"; false; }
+  assert_out "its driver does not answer"
+  grep -qxF "         sudo ubuntu-drivers install" <<<"$output" || { echo "$output"; false; }
+  assert_has "$ENV" "FREEFRAME_GPU=off"
+  assert_not_called install_nvidia_toolkit
+}
+
+@test "gpu: an Intel GPU is explained, with the guide's section, and the install stays on the CPU" {
+  plain_answers
+  export STUB_GPU=intel
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -qxF "   GPU: Intel (not used with the published images)" <<<"$output" || { echo "$output"; false; }
+  assert_out "docs/deployment.md#hardware-accelerated-transcoding-optional"
+  assert_out "processed on the CPU (the Intel GPU is not used with the published images)"
+  assert_has "$ENV" "FREEFRAME_GPU=off"
+}
+
+@test "gpu screens: a GPU without the toolkit adds a fifth step, Video processing, and yes sets it up" {
+  unset LC_ALL LC_CTYPE
+  export LANG=C.UTF-8 STUB_GPU=notoolkit
+  rest_gpu y
+  tty_answers 3 "${REST_GPU[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "Five short questions"
+  assert_eq "$(step_headers)" "$(printf '%s\n' "1/5 Web address" "2/5 Storage" "3/5 Email" "4/5 Admin account" "5/5 Video processing")"
+  assert_out "This server has an NVIDIA GPU: NVIDIA GeForce RTX 5070 Ti (driver 610.47)."
+  assert_out " Use the NVIDIA GPU for video processing? [Y/n]"
+  # The question comes before the summary, and nothing is installed before
+  # the confirmation.
+  [[ $output == *"Use the NVIDIA GPU"*"Ready to install"*"Install now?"* ]] || { echo "$output"; false; }
+  assert_order install_docker install_nvidia_toolkit
+  assert_has "$ENV" "FREEFRAME_GPU=nvidia"
+}
+
+@test "gpu screens: no at the Video processing step keeps the CPU and installs nothing for the GPU" {
+  export STUB_GPU=notoolkit
+  rest_gpu n
+  tty_answers 3 "${REST_GPU[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_has "$ENV" "FREEFRAME_GPU=off"
+  assert_out "processed on the CPU (you chose the CPU)"
+  assert_not_called install_nvidia_toolkit
+}
+
+@test "gpu screens: Enter at the Video processing step means yes" {
+  export STUB_GPU=notoolkit
+  rest_gpu ""
+  tty_answers 3 "${REST_GPU[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_has "$ENV" "FREEFRAME_GPU=nvidia"
+}
+
+@test "gpu screens: cancelling at the summary installs nothing, GPU toolkit included" {
+  export STUB_GPU=notoolkit
+  tty_answers 3 1 "" "Grace" "grace@example.com" "long-password-1" "long-password-1" "y" "n"
+  ff_install
+  [ "$status" -eq 1 ]
+  assert_out "Install cancelled"
+  assert_not_called install_nvidia_toolkit
+  assert_not_called install_docker
+}
+
+@test "gpu screens: a ready GPU, no driver or no GPU ask nothing: still four steps" {
+  local s
+  for s in ready nodriver none intel; do
+    rm -rf "$FF_ROOT" && mkdir -p "$FF_ROOT"
+    : >"$CALLS"
+    export STUB_GPU=$s
+    tty_answers 3 "${REST[@]}"
+    ff_install
+    [ "$status" -eq 0 ] || { echo "$s: $output"; false; }
+    assert_eq "$(step_headers)" "$(printf '%s\n' "1/4 Web address" "2/4 Storage" "3/4 Email" "4/4 Admin account")"
+  done
+}
+
+@test "gpu screens: the GPU question alone is one step of one" {
+  export STUB_GPU=notoolkit FREEFRAME_HTTPS=off FREEFRAME_STORAGE=bundled FREEFRAME_SMTP_HOST=smtp.example.com \
+    FREEFRAME_SMTP_FROM=noreply@example.com FREEFRAME_ADMIN_NAME=Grace FREEFRAME_ADMIN_EMAIL=grace@example.com \
+    FREEFRAME_ADMIN_PASSWORD=long-password-1
+  tty_answers y y
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_eq "$(step_headers)" "1/1 Video processing"
+  assert_out "One short question"
+}
+
+@test "gpu: a re-run keeps the GPU chosen before, and sets the toolkit up without asking again" {
+  plain_answers
+  printf 'FREEFRAME_GPU=nvidia\n' >"$ENV"
+  export STUB_GPU=notoolkit
+  # Storage, email, then the confirmation: no Video processing question.
+  tty_answers 1 "" y
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  if [[ $output == *"Video processing?"* ]]; then echo "$output"; false; fi
+  grep -qx install_nvidia_toolkit "$CALLS"
+  assert_has "$ENV" "FREEFRAME_GPU=nvidia"
+}
+
+@test "gpu: settings that ask for the GPU on a server without a usable one are turned to the CPU, after a backup" {
+  plain_answers
+  printf 'FREEFRAME_GPU=nvidia\n' >"$ENV"
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "say FREEFRAME_GPU=nvidia"
+  assert_has "$ENV" "FREEFRAME_GPU=off"
+  grep -l '^FREEFRAME_GPU=nvidia$' "$FF_ROOT"/.env.prod.* >/dev/null
+  assert_not_called install_nvidia_toolkit
+}

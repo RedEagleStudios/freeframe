@@ -179,6 +179,7 @@ dc() {
       fi
       printf '%s\n' traefik postgres redis api worker email_worker maintenance_worker beat web minio minio-init
       ;;
+    "ps -q --status running worker") [[ -n ${STUB_WORKER_DOWN:-} ]] || echo 0123456789ab ;;
     "ps --format {{.Image}} api")
       # The image the running api container was started from.
       [[ -z ${STUB_RUNNING_IMAGE:-} ]] || printf '%s\n' "$STUB_RUNNING_IMAGE"
@@ -226,6 +227,12 @@ dc() {
       fi
       return 1
       ;;
+    # What the worker container sees of the GPU (STUB_WORKER_GPU: its
+    # nvidia-smi -L line; empty: nvidia-smi fails in it).
+    "exec -T worker nvidia-smi -L")
+      [[ -n ${STUB_WORKER_GPU:-} ]] || return 1
+      printf '%s\n' "$STUB_WORKER_GPU"
+      ;;
     "up -d"*) [[ -z ${STUB_UP_FAIL:-} ]] ;;
     "logs "*) printf 'api-1  | started\n' ;;
     *) return 0 ;;
@@ -270,3 +277,25 @@ if [[ -n ${STUB_AT_LOCK:-} ]]; then
     _real_ff_lock "$@"
   }
 fi
+
+# The GPU: STUB_GPU is what detect_gpu finds: none (the default), ready,
+# notoolkit, noruntime, nodriver, intel or amd. install_nvidia_toolkit
+# makes a notoolkit or noruntime GPU ready, unless STUB_GPU_SETUP_FAIL.
+detect_gpu() {
+  _stub_log detect_gpu
+  FF_GPU_VENDOR=none FF_GPU_NAME="" FF_GPU_DRIVER="" FF_GPU_STATE=none FF_GPU_WSL=${STUB_GPU_WSL:-}
+  case ${STUB_GPU:-none} in
+    ready | notoolkit | noruntime)
+      FF_GPU_VENDOR=nvidia FF_GPU_NAME="NVIDIA GeForce RTX 5070 Ti" FF_GPU_DRIVER=610.47 FF_GPU_STATE=$STUB_GPU
+      ;;
+    nodriver) FF_GPU_VENDOR=nvidia FF_GPU_NAME=NVIDIA FF_GPU_STATE=nodriver ;;
+    intel) FF_GPU_VENDOR=intel FF_GPU_NAME=Intel FF_GPU_STATE=unsupported ;;
+    amd) FF_GPU_VENDOR=amd FF_GPU_NAME=AMD FF_GPU_STATE=unsupported ;;
+  esac
+}
+
+install_nvidia_toolkit() {
+  _stub_log install_nvidia_toolkit
+  [[ -z ${STUB_GPU_SETUP_FAIL:-} ]] || return 1
+  STUB_GPU=ready
+}

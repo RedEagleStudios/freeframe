@@ -397,3 +397,172 @@ BEFORE() { printf '%s' "$BATS_TEST_TMPDIR/env.before"; }
   assert_has "$ENV" "FRONTEND_URL=https://203-0-113-7.sslip.io"
   assert_has "$ENV" "FREEFRAME_HTTPS=sslip"
 }
+
+# ---------------------------------------------------------------- video processing (GPU)
+
+# gpu_file: the GPU compose file, as a release that has it puts it in place.
+gpu_file() { printf 'services:\n  worker: {}\n' >"$FF_ROOT/docker-compose.gpu.yml"; }
+
+@test "configure gpu: --gpu nvidia sets the toolkit up, warns about the Docker restart, and restarts FreeFrame" {
+  installed_server off bundled
+  gpu_file
+  export STUB_GPU=notoolkit
+  keep_copy
+  ff configure --yes --gpu nvidia
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "FREEFRAME_GPU: (empty) -> nvidia"
+  assert_out "restarts Docker"
+  assert_out "every container on this server stops for a moment"
+  assert_order install_nvidia_toolkit "dc up -d --no-build --force-recreate" "localhost:8000/health"
+  assert_eq "$(changed_keys "$(BEFORE)" "$ENV")" "FREEFRAME_GPU"
+  assert_has "$ENV" "FREEFRAME_GPU=nvidia"
+  [[ $(compose_files "$ENV") == *"-f docker-compose.gpu.yml"* ]]
+  assert_out "Video processing: GPU (NVIDIA GeForce RTX 5070 Ti)"
+}
+
+@test "configure gpu: a ready GPU is switched on without installing anything" {
+  installed_server off bundled
+  gpu_file
+  export STUB_GPU=ready
+  ff configure --yes --gpu nvidia
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_not_called install_nvidia_toolkit
+  assert_no_out "restarts Docker"
+  assert_has "$ENV" "FREEFRAME_GPU=nvidia"
+  grep -q "^dc up -d --no-build --force-recreate" "$CALLS"
+}
+
+@test "configure gpu: --gpu off turns it off and restarts FreeFrame" {
+  installed_server off bundled
+  env_set "$ENV" FREEFRAME_GPU nvidia
+  export STUB_GPU=ready
+  ff configure --yes --gpu off
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_has "$ENV" "FREEFRAME_GPU=off"
+  assert_out "FREEFRAME_GPU: nvidia -> off"
+  grep -q "^dc up -d --no-build --force-recreate" "$CALLS"
+  assert_not_called install_nvidia_toolkit
+  assert_out "Video processing: CPU (you chose the CPU)"
+}
+
+@test "configure gpu: --gpu off on a server already on the CPU changes nothing" {
+  installed_server off bundled
+  keep_copy
+  ff configure --yes --gpu off
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "Nothing to change"
+  cmp "$ENV" "$(BEFORE)"
+}
+
+@test "configure gpu: a toolkit that cannot be set up leaves video on the CPU, brings FreeFrame back and says so" {
+  installed_server off bundled
+  gpu_file
+  export STUB_GPU=notoolkit STUB_GPU_SETUP_FAIL=1
+  keep_copy
+  ff configure --yes --gpu nvidia
+  [ "$status" -eq 1 ]
+  assert_out "The NVIDIA container toolkit could not be set up"
+  assert_out "video is still processed on the CPU"
+  # Docker may have been restarted part-way: FreeFrame is started again.
+  assert_order install_nvidia_toolkit "dc up -d --no-build" "localhost:8000/health"
+  assert_has "$ENV" "FREEFRAME_GPU=off"
+  [[ $(compose_files "$ENV") != *gpu* ]]
+}
+
+@test "configure gpu: --gpu nvidia without a usable NVIDIA GPU is refused and nothing changes" {
+  installed_server off bundled
+  keep_copy
+  local s
+  for s in none nodriver intel; do
+    : >"$CALLS"
+    export STUB_GPU=$s
+    ff configure --yes --gpu nvidia
+    [ "$status" -eq 2 ] || { echo "$s: $output"; false; }
+    assert_out "Nothing was changed"
+    cmp "$ENV" "$(BEFORE)"
+    assert_not_called install_nvidia_toolkit
+  done
+  STUB_GPU=nodriver ff configure --yes --gpu nvidia
+  assert_out "sudo ubuntu-drivers install"
+}
+
+@test "configure gpu: an unknown --gpu value is a usage error" {
+  installed_server off bundled
+  ff configure --yes --gpu cuda
+  [ "$status" -eq 2 ]
+  assert_out "must be nvidia or off"
+}
+
+@test "configure gpu: interactive, a usable GPU is offered as section 4, and Enter keeps the CPU" {
+  installed_server off bundled
+  export STUB_GPU=notoolkit
+  keep_copy
+  tty "" "" "" ""
+  ff configure
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "4. Video processing"
+  assert_out "   Now: on the CPU"
+  assert_out "This server has an NVIDIA GPU: NVIDIA GeForce RTX 5070 Ti (driver 610.47)."
+  assert_out "Use the NVIDIA GPU for video processing? [y/N]"
+  assert_out "Nothing to change"
+  cmp "$ENV" "$(BEFORE)"
+}
+
+@test "configure gpu: interactive yes turns the GPU on, after the summary and its confirmation" {
+  installed_server off bundled
+  gpu_file
+  export STUB_GPU=notoolkit
+  tty "" "" "" "y" "y"
+  ff configure
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  [[ $output == *"4. Video processing"*"FREEFRAME_GPU: (empty) -> nvidia"*"restarts Docker"*"Save these changes and restart FreeFrame?"* ]] ||
+    { echo "$output"; false; }
+  assert_has "$ENV" "FREEFRAME_GPU=nvidia"
+  grep -qx install_nvidia_toolkit "$CALLS"
+}
+
+@test "configure gpu: interactive, a GPU in use can be turned off" {
+  installed_server off bundled
+  gpu_file
+  env_set "$ENV" FREEFRAME_GPU nvidia
+  export STUB_GPU=ready
+  tty "" "" "" "n" "y"
+  ff configure
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "   Now: on the GPU (NVIDIA GeForce RTX 5070 Ti)"
+  assert_out "Keep using the NVIDIA GPU for video processing? [Y/n]"
+  assert_has "$ENV" "FREEFRAME_GPU=off"
+}
+
+@test "configure gpu: interactive, no usable GPU shows where video is processed and asks nothing" {
+  installed_server off bundled
+  local s want
+  for s in none nodriver intel; do
+    export STUB_GPU=$s
+    tty "" "" ""
+    ff configure
+    [ "$status" -eq 0 ] || { echo "$s: $output"; false; }
+    case $s in
+      none) want="   Now: on the CPU (no GPU found)" ;;
+      nodriver) want="   Now: on the CPU (the NVIDIA driver is not working)" ;;
+      intel) want="   Now: on the CPU (the Intel GPU is not used with the published images)" ;;
+    esac
+    assert_out "$want"
+    assert_no_out "Use the NVIDIA GPU"
+  done
+}
+
+
+@test "configure gpu: the GPU chosen before whose toolkit is gone is set up again, and FreeFrame restarted" {
+  installed_server off bundled
+  gpu_file
+  env_set "$ENV" FREEFRAME_GPU nvidia
+  export STUB_GPU=notoolkit
+  keep_copy
+  ff configure --yes --gpu nvidia
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_no_out "Nothing to change"
+  assert_order install_nvidia_toolkit "dc up -d --no-build --force-recreate" "localhost:8000/health"
+  cmp "$ENV" "$(BEFORE)"
+  assert_out "Video processing: GPU (NVIDIA GeForce RTX 5070 Ti)"
+}
