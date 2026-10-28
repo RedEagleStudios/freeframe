@@ -639,6 +639,17 @@ assert_removed() {
 
 # --- The way back --------------------------------------------------------
 
+@test "after an uninstall that kept the data, the installer points at the saved settings" {
+  ff uninstall --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  local d
+  d=$(saved_dir)
+  printf 'ID=ubuntu\nVERSION_ID=24.04\nPRETTY_NAME="Ubuntu 24.04"\n' >"$BATS_TEST_TMPDIR/os-release"
+  FF_OS_RELEASE="$BATS_TEST_TMPDIR/os-release" ff install --yes --admin-email you@example.com
+  [ "$status" -eq 3 ] || { echo "$output"; false; }
+  assert_out "sudo install -m 600 '$d/.env.prod' '$FF_ROOT/.env.prod'"
+}
+
 @test "after an uninstall, the saved settings put back make the kept volumes this installer's again" {
   ff uninstall --yes
   [ "$status" -eq 0 ] || { echo "$output"; false; }

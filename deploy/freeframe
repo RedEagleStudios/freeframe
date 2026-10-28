@@ -2040,10 +2040,17 @@ _install_check_system() {
 }
 
 _install_check_foreign() {
-  local rc=0
+  local rc=0 saved
   detect_foreign_install || rc=$?
   case $rc in
     0)
+      # FreeFrame's volumes without the settings file are also what an
+      # uninstall that kept the data leaves: point at the settings it saved.
+      saved=$(_uninstall_saved_settings)
+      if [[ -n $saved && ! -e $(ff_root)/.env.prod ]]; then
+        _ff_stop 3 "This server has FreeFrame's data (its Docker volumes) but not this installer's settings file, so nothing was changed." \
+          "if a freeframe uninstall kept that data, put the settings it saved back, then run the install command again: sudo mkdir -p $(_ff_q "$(ff_root)") && sudo install -m 600 $(_ff_q "$saved") $(_ff_q "$(ff_root)/.env.prod"). If the data belongs to a FreeFrame set up by hand instead, the installer will not touch it: keep updating that one with the manual steps in the guide: $FF_GUIDE_URL"
+      fi
       _ff_stop 3 "This server already runs FreeFrame that was set up by hand, not with this installer. The installer will not touch it, so nothing was changed." \
         "keep updating that FreeFrame with the manual steps in the guide: $FF_GUIDE_URL"
       ;;
