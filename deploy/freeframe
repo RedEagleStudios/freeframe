@@ -6123,7 +6123,7 @@ _ff_mount_of() {
 # the GPU (nvidia-smi -L, as the transcoder checks), and when it does not,
 # the reason and the fix are given.
 _status_gpu() {
-  local file=$1 root out name pre="  Video:        "
+  local file=$1 root out name forced pre="  Video:        "
   root=$(ff_root)
   if [[ $(env_get "$file" FREEFRAME_GPU) != nvidia ]]; then
     detect_gpu
@@ -6143,6 +6143,11 @@ _status_gpu() {
     name=${out%%$'\n'*}
     name=${name#GPU *: }
     name=${name% (UUID:*}
+    forced=$(_status_gpu_forced_off "$file")
+    if [[ -n $forced ]]; then
+      say "${pre}processed on the CPU: $forced in $file keeps video off the GPU (the worker sees $name). To use the GPU, delete that line, then run: sudo freeframe restart"
+      return 0
+    fi
     say "${pre}processed on the GPU ($name), with the CPU as a fallback"
     return 0
   fi
@@ -6156,6 +6161,26 @@ _status_gpu() {
     return 0
   fi
   say "${pre}on the CPU: the GPU is chosen (FREEFRAME_GPU=nvidia), but the worker does not see it: $(_status_gpu_why)"
+}
+
+# _status_gpu_forced_off FILE: the transcoder setting in FILE that keeps
+# video off the GPU although the worker has one, as KEY=VALUE (nothing when
+# none does). The GPU file sets TRANSCODER_PIPELINE=NVIDIA only when FILE
+# leaves it out; under Auto, the older TRANSCODER_BACKEND still decides.
+_status_gpu_forced_off() {
+  local p b
+  p=$(env_get "$1" TRANSCODER_PIPELINE)
+  case ${p,,} in
+    "" | nvidia) return 0 ;;
+    auto)
+      b=$(env_get "$1" TRANSCODER_BACKEND)
+      case ${b,,} in
+        "" | auto | nvenc | nvidia) return 0 ;;
+        *) printf 'TRANSCODER_BACKEND=%s' "$b" ;;
+      esac
+      ;;
+    *) printf 'TRANSCODER_PIPELINE=%s' "$p" ;;
+  esac
 }
 
 # _status_gpu_why: why the worker cannot have the GPU, and the fix.

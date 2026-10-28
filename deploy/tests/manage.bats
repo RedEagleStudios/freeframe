@@ -441,3 +441,32 @@ gpu_on() {
   assert_out "  Video:        on the CPU: the GPU is chosen (FREEFRAME_GPU=nvidia), but the worker does not see it: the NVIDIA driver on this server does not answer"
 }
 
+@test "status gpu: TRANSCODER_PIPELINE forcing the CPU in .env.prod is named, even with the GPU visible" {
+  gpu_on
+  export STUB_GPU=ready STUB_WORKER_GPU="GPU 0: NVIDIA L4 (UUID: GPU-1)"
+  local v
+  for v in Software cpu Intel; do
+    env_set "$ENV" TRANSCODER_PIPELINE "$v"
+    ff status
+    [ "$status" -eq 0 ] || { echo "$output"; false; }
+    assert_out "  Video:        processed on the CPU: TRANSCODER_PIPELINE=$v in $ENV keeps video off the GPU (the worker sees NVIDIA L4)"
+    assert_no_out "processed on the GPU"
+  done
+  # NVIDIA and Auto both use it.
+  for v in NVIDIA Auto; do
+    env_set "$ENV" TRANSCODER_PIPELINE "$v"
+    ff status
+    assert_out "processed on the GPU (NVIDIA L4)"
+  done
+}
+
+@test "status gpu: the older TRANSCODER_BACKEND=cpu under Auto is named too" {
+  gpu_on
+  env_set "$ENV" TRANSCODER_PIPELINE Auto
+  env_set "$ENV" TRANSCODER_BACKEND cpu
+  export STUB_GPU=ready STUB_WORKER_GPU="GPU 0: NVIDIA L4 (UUID: GPU-1)"
+  ff status
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "processed on the CPU: TRANSCODER_BACKEND=cpu in $ENV keeps video off the GPU"
+}
+
