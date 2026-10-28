@@ -400,3 +400,44 @@ setup() {
   grep -qx "dc_bounded 30 exec -T worker nvidia-smi -L" "$CALLS" || { cat "$CALLS"; false; }
 }
 
+# ---------------------------------------------------------------- a GPU that breaks later
+
+gpu_on() {
+  printf 'services:\n  worker: {}\n' >"$FF_ROOT/docker-compose.gpu.yml"
+  env_set "$ENV" FREEFRAME_GPU nvidia
+}
+
+@test "restart gpu: a GPU that works is used" {
+  gpu_on
+  export STUB_GPU=ready
+  ff restart
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -q '^files .*-f docker-compose.gpu.yml' "$CALLS" || { cat "$CALLS"; false; }
+  assert_no_out "on the CPU"
+}
+
+@test "restart gpu: a GPU that broke (driver, toolkit) starts on the CPU, says so, and keeps the setting" {
+  local s
+  for s in nodriver notoolkit none; do
+    gpu_on
+    : >"$CALLS"
+    export STUB_GPU=$s
+    ff restart
+    [ "$status" -eq 0 ] || { echo "$s: $output"; false; }
+    assert_out "FreeFrame starts with video processing on the CPU until that is fixed"
+    assert_out "FREEFRAME_GPU=nvidia is kept"
+    assert_out "sudo freeframe restart"
+    if grep -q '^files .*gpu' "$CALLS"; then cat "$CALLS"; false; fi
+    grep -q '^files ' "$CALLS"
+    assert_has "$ENV" "FREEFRAME_GPU=nvidia"
+  done
+}
+
+@test "status gpu: after a start on the CPU fallback, status says the CPU and why" {
+  gpu_on
+  export STUB_GPU=nodriver
+  ff status
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "  Video:        on the CPU: the GPU is chosen (FREEFRAME_GPU=nvidia), but the worker does not see it: the NVIDIA driver on this server does not answer"
+}
+

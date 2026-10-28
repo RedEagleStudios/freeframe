@@ -238,7 +238,11 @@ dc() {
       [[ -n ${STUB_WORKER_GPU:-} ]] || return 1
       printf '%s\n' "$STUB_WORKER_GPU"
       ;;
-    "up -d"*) [[ -z ${STUB_UP_FAIL:-} ]] ;;
+    "up -d"*)
+      # The compose files this start used.
+      _stub_log "files $(compose_files "$FF_ROOT/.env.prod")"
+      [[ -z ${STUB_UP_FAIL:-} ]]
+      ;;
     "logs "*) printf 'api-1  | started\n' ;;
     *) return 0 ;;
   esac

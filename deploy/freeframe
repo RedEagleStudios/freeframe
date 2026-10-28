@@ -852,6 +852,7 @@ EOF
 # compose_files ENVFILE: the -f arguments for this server, in order. The GPU
 # file (FREEFRAME_GPU=nvidia) is used only when it is there: the setup files
 # of a release from before it have none, and a rollback to them removes it.
+# FF_GPU_SKIP=1 (_gpu_start_check: the GPU cannot be used now) leaves it out.
 compose_files() {
   local file=$1 out="-f docker-compose.prod.yml -f docker-compose.images.yml"
   case "$(env_get "$file" FREEFRAME_HTTPS)" in
@@ -860,7 +861,7 @@ compose_files() {
   if [[ $(env_get "$file" FREEFRAME_STORAGE) == bundled ]]; then
     out+=" -f docker-compose.storage.yml"
   fi
-  if [[ $(env_get "$file" FREEFRAME_GPU) == nvidia && -f $(dirname "$file")/docker-compose.gpu.yml ]]; then
+  if [[ $(env_get "$file" FREEFRAME_GPU) == nvidia && -f $(dirname "$file")/docker-compose.gpu.yml && -z ${FF_GPU_SKIP:-} ]]; then
     out+=" -f docker-compose.gpu.yml"
   fi
   printf '%s\n' "$out"
@@ -1449,6 +1450,25 @@ _gpu_docker_back() {
 _gpu_now_ready() {
   detect_gpu
   [[ $FF_GPU_STATE == ready ]]
+}
+
+# _gpu_start_check: before update, restart, configure or rollback starts
+# FreeFrame. With FREEFRAME_GPU=nvidia and a GPU Docker cannot use now (a
+# driver broken by a kernel upgrade, a toolkit removed), the worker would
+# not start with the GPU file, so this start leaves it out (FF_GPU_SKIP)
+# and says video is processed on the CPU. The setting is kept, so a later
+# start uses the GPU again once it works.
+_gpu_start_check() {
+  local root
+  root=$(ff_root)
+  FF_GPU_SKIP=""
+  [[ $(env_get "$root/.env.prod" FREEFRAME_GPU) == nvidia && -f $root/docker-compose.gpu.yml ]] || return 0
+  detect_gpu
+  [[ $FF_GPU_STATE != ready ]] || return 0
+  FF_GPU_SKIP=1
+  _gpu_cpu_reason
+  warn "The NVIDIA GPU cannot be used now ($FF_GPU_WHY), so FreeFrame starts with video processing on the CPU until that is fixed."
+  warn "FREEFRAME_GPU=nvidia is kept: once the GPU works again, run: sudo freeframe restart"
 }
 
 # _gpu_setup: set the toolkit up (its output goes to the log), then wait for
@@ -5071,6 +5091,7 @@ cmd_update() {
   FF_UPDATE_PHASE=started
   FF_STATE="FreeFrame has been moved to $new. To go back to $old with the database as it was just before the update, run: sudo freeframe rollback"
   FF_TRAP_HINT="see why with: sudo freeframe logs. To go back to $old, run: sudo freeframe rollback"
+  _gpu_start_check
   say "Starting FreeFrame $new..."
   if ! _ff_logged dc up -d --no-build; then
     install_fail "FreeFrame $new could not be started." "see why with: sudo freeframe logs"
@@ -5160,6 +5181,7 @@ _rollback_unstarted() {
   url=$(env_get "$file" FRONTEND_URL)
   host=$(_ff_url_host "$url")
   mode=$(env_get "$file" FREEFRAME_HTTPS)
+  _gpu_start_check
   say "Starting FreeFrame $old with its setup files from before..."
   if ! _ff_logged dc up -d --no-build --remove-orphans; then
     install_fail "FreeFrame $old could not be started." "see why with: sudo freeframe logs"
@@ -5367,6 +5389,7 @@ cmd_rollback() {
   url=$(env_get "$file" FRONTEND_URL)
   host=$(_ff_url_host "$url")
   mode=$(env_get "$file" FREEFRAME_HTTPS)
+  _gpu_start_check
   say "Starting FreeFrame $old..."
   if ! _ff_logged dc up -d --no-build --remove-orphans; then
     install_fail "FreeFrame $old could not be started." "see why with: sudo freeframe logs"
@@ -6020,6 +6043,7 @@ cmd_configure() {
   fi
 
   FF_STEP="restarting FreeFrame"
+  _gpu_start_check
   if ((http_switch)); then
     if ! switch_to_http_mode "$file" "$FF_CFG_HOST"; then
       install_fail "FreeFrame could not be switched to plain HTTP." "see why with: sudo freeframe logs"
@@ -6337,6 +6361,7 @@ cmd_restart() {
       "wait a few minutes for it to finish, then run sudo freeframe restart again."
   fi
   _ff_refuse_unfinished_restore restart
+  _gpu_start_check
   say "Restarting FreeFrame..."
   if ! _ff_logged dc up -d --no-build --force-recreate; then
     _ff_manage_stop 1 "FreeFrame could not be restarted." \

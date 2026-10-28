@@ -592,3 +592,15 @@ gpu_file() { printf 'services:\n  worker: {}\n' >"$FF_ROOT/docker-compose.gpu.ym
   assert_has "$ENV" "FREEFRAME_GPU=off"
 }
 
+@test "configure gpu: another change while the GPU is broken restarts FreeFrame on the CPU, saying so" {
+  installed_server off bundled
+  gpu_file
+  env_set "$ENV" FREEFRAME_GPU nvidia
+  export STUB_GPU=notoolkit
+  ff configure --yes --smtp-host smtp.example.com --smtp-from noreply@example.com
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "FreeFrame starts with video processing on the CPU until that is fixed"
+  if grep -q '^files .*gpu' "$CALLS"; then cat "$CALLS"; false; fi
+  assert_has "$ENV" "FREEFRAME_GPU=nvidia"
+}
+

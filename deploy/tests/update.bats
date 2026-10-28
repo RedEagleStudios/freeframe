@@ -990,3 +990,18 @@ killed_update_state() {
   flock -n 9
   exec 9>&-
 }
+
+@test "update gpu: a GPU that broke since the last start leaves the GPU file out for this start, and says so" {
+  printf 'services:\n  worker: {}\n' >"$STUB_REMOTE/docker-compose.gpu.yml"
+  printf 'services:\n  worker: {}\n' >"$FF_ROOT/docker-compose.gpu.yml"
+  env_set "$ENV" FREEFRAME_GPU nvidia
+  export STUB_GPU=nodriver
+  ff update
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "FreeFrame starts with video processing on the CPU until that is fixed"
+  if grep -q '^files .*gpu' "$CALLS"; then cat "$CALLS"; false; fi
+  grep -q '^files ' "$CALLS"
+  assert_has "$ENV" "FREEFRAME_GPU=nvidia"
+  [ -f "$FF_ROOT/docker-compose.gpu.yml" ]
+}
+
