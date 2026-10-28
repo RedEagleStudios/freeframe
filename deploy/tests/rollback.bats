@@ -478,3 +478,15 @@ assert_state_is() {
   assert_out "changed while this rollback was getting ready"
   assert_out "Nothing was changed."
 }
+
+@test "rollback: to a set from before the GPU file, the GPU file goes and compose leaves it out" {
+  printf 'services:\n  worker: {}\n' >"$STUB_REMOTE/docker-compose.gpu.yml"
+  env_set "$ENV" FREEFRAME_GPU nvidia
+  failed_update
+  [ -f "$FF_ROOT/docker-compose.gpu.yml" ]
+  ff rollback --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  [ ! -e "$FF_ROOT/docker-compose.gpu.yml" ]
+  [[ $(compose_files "$ENV") != *gpu* ]]
+  assert_files_from_before
+}

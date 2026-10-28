@@ -724,6 +724,65 @@ started_record() {
   [ ! -e "$FF_ROOT/.update-undo" ]
 }
 
+# ---------------------------------------------------------------- the optional GPU file
+
+@test "update: a release with the GPU compose file brings it in with the set" {
+  printf 'services:\n  worker: {}\n' >"$STUB_REMOTE/docker-compose.gpu.yml"
+  ff update
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -qx "fetch latest docker-compose.gpu.yml" "$CALLS"
+  cmp "$STUB_REMOTE/docker-compose.gpu.yml" "$FF_ROOT/docker-compose.gpu.yml"
+}
+
+@test "update: a release without the GPU compose file (an older one) is no failure; the set has none" {
+  [ ! -e "$STUB_REMOTE/docker-compose.gpu.yml" ]
+  printf 'services:\n  worker: {}\n' >"$FF_ROOT/docker-compose.gpu.yml"
+  ff update
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -qx "fetch latest docker-compose.gpu.yml" "$CALLS"
+  [ ! -e "$FF_ROOT/docker-compose.gpu.yml" ]
+  # The saved way back still has the one from before.
+  [ -f "$FF_ROOT/rollback/docker-compose.gpu.yml" ]
+}
+
+@test "update: the GPU compose file failing for another reason than not being there fails the update as before" {
+  printf 'services:\n  worker: {}\n' >"$STUB_REMOTE/docker-compose.gpu.yml"
+  export STUB_FETCH_FAIL=docker-compose.gpu.yml
+  cp "$FF_ROOT/docker-compose.images.yml" "$BATS_TEST_TMPDIR/images.before"
+  ff update
+  [ "$status" -eq 1 ]
+  assert_out "Could not download docker-compose.gpu.yml"
+  cmp "$FF_ROOT/docker-compose.images.yml" "$BATS_TEST_TMPDIR/images.before"
+  assert_not_called "dc pull"
+}
+
+@test "update: a set whose move fails after a missing GPU file was taken out puts that file back" {
+  printf 'gpu from before\n' >"$FF_ROOT/docker-compose.gpu.yml"
+  export STUB_MV_FAIL=systemd/freeframe-backup.service
+  ff update
+  [ "$status" -eq 1 ]
+  assert_out "could not be put in place"
+  assert_eq "$(cat "$FF_ROOT/docker-compose.gpu.yml")" "gpu from before"
+}
+
+@test "update: the way back from an older release's tag without a GPU file is saved without one" {
+  local f
+  for f in $SETUP_NAMES; do cp "$STUB_REMOTE/$f" "$FF_ROOT/$f"; done
+  export STUB_RUNNING_IMAGE=ghcr.io/techiebutler/freeframe-api:1.21.0
+  export STUB_REMOTE_REFS="$BATS_TEST_TMPDIR/refs"
+  mkdir -p "$STUB_REMOTE_REFS/v1.21.0/deploy/systemd"
+  sed 's/1.22.0/1.21.0/g' "$STUB_REMOTE/docker-compose.images.yml" >"$STUB_REMOTE_REFS/v1.21.0/docker-compose.images.yml"
+  for f in docker-compose.prod.yml docker-compose.https.yml docker-compose.storage.yml; do
+    cp "$STUB_REMOTE/$f" "$STUB_REMOTE_REFS/v1.21.0/$f"
+  done
+  cp "$STUB_REMOTE"/deploy/systemd/* "$STUB_REMOTE_REFS/v1.21.0/deploy/systemd/"
+  ff update
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -qx "fetch v1.21.0 docker-compose.gpu.yml" "$CALLS"
+  [ -f "$FF_ROOT/rollback/docker-compose.images.yml" ]
+  [ ! -e "$FF_ROOT/rollback/docker-compose.gpu.yml" ]
+}
+
 # ---------------------------------------------------------------- minors (round 2)
 
 @test "update: a mixed set that can be put back from the saved copy ends true and safe" {

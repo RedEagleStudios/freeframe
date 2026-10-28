@@ -1505,6 +1505,39 @@ step_headers() {
   [ -z "$(ls "$FF_ROOT" | grep -v '^x$')" ]
 }
 
+@test "fetch: a file the ref does not have (HTTP 404) is told apart from other failures" {
+  printf 'old\n' >"$FF_ROOT/x"
+  curl() { printf '404'; return 22; }
+  run fetch v1.22.0 docker-compose.gpu.yml "$FF_ROOT/x"
+  [ "$status" -eq 4 ]
+  assert_eq "$(cat "$FF_ROOT/x")" "old"
+  curl() { printf '503'; return 22; }
+  run fetch v1.22.0 docker-compose.gpu.yml "$FF_ROOT/x"
+  [ "$status" -eq 1 ]
+  curl() { printf '000'; return 6; }
+  run fetch v1.22.0 docker-compose.gpu.yml "$FF_ROOT/x"
+  [ "$status" -eq 1 ]
+  [ -z "$(ls "$FF_ROOT" | grep -v '^x$')" ]
+}
+
+@test "fetch: a file missing from FF_FETCH_FROM_DIR counts as not in the ref" {
+  mkdir -p "$BATS_TEST_TMPDIR/src"
+  FF_FETCH_FROM_DIR="$BATS_TEST_TMPDIR/src"
+  run fetch latest docker-compose.gpu.yml "$FF_ROOT/docker-compose.gpu.yml"
+  [ "$status" -eq 4 ]
+  [ ! -e "$FF_ROOT/docker-compose.gpu.yml" ]
+  [ -z "$(ls -A "$FF_ROOT")" ]
+}
+
+@test "install: the GPU compose file is downloaded with the other setup files" {
+  plain_answers
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_order "fetch latest docker-compose.storage.yml" "fetch latest docker-compose.gpu.yml" \
+    "fetch latest deploy/systemd/freeframe-backup.service"
+  [ -f "$FF_ROOT/docker-compose.gpu.yml" ]
+}
+
 @test "port_holder names the program and its pid" {
   ss() { printf '%s\n' 'LISTEN 0 511 0.0.0.0:8080 0.0.0.0:* users:(("other",pid=1,fd=3))' \
     'LISTEN 0 511 0.0.0.0:80 0.0.0.0:* users:(("nginx",pid=812,fd=6))'; }

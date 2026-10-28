@@ -844,7 +844,9 @@ EOF
 # Docker compose
 # ------------------------------------------------------------
 
-# compose_files ENVFILE: the -f arguments for this server, in order.
+# compose_files ENVFILE: the -f arguments for this server, in order. The GPU
+# file (FREEFRAME_GPU=nvidia) is used only when it is there: the setup files
+# of a release from before it have none, and a rollback to them removes it.
 compose_files() {
   local file=$1 out="-f docker-compose.prod.yml -f docker-compose.images.yml"
   case "$(env_get "$file" FREEFRAME_HTTPS)" in
@@ -852,6 +854,9 @@ compose_files() {
   esac
   if [[ $(env_get "$file" FREEFRAME_STORAGE) == bundled ]]; then
     out+=" -f docker-compose.storage.yml"
+  fi
+  if [[ $(env_get "$file" FREEFRAME_GPU) == nvidia && -f $(dirname "$file")/docker-compose.gpu.yml ]]; then
+    out+=" -f docker-compose.gpu.yml"
   fi
   printf '%s\n' "$out"
 }
@@ -1096,18 +1101,26 @@ install_backup_timer() {
 
 # fetch REF PATH DEST: download PATH from the repository at REF (a branch or
 # tag) to DEST. The old DEST stays in place unless the download completes.
-# With FF_FETCH_FROM_DIR (test-only) PATH is copied from that folder instead.
+# Returns 4 when REF does not have PATH (HTTP 404), 1 for any other failure.
+# With FF_FETCH_FROM_DIR (test-only) PATH is copied from that folder instead,
+# and a file missing there counts as one REF does not have.
 fetch() {
-  local ref=$1 path=$2 dest=$3 tmp
+  local ref=$1 path=$2 dest=$3 tmp code="" rc=0
   tmp=$(mktemp "$dest.tmp.XXXXXX") || return 1
   if [[ -n ${FF_FETCH_FROM_DIR:-} ]]; then
-    cp "$FF_FETCH_FROM_DIR/$path" "$tmp"
+    if [[ ! -e $FF_FETCH_FROM_DIR/$path ]]; then
+      rm -f "$tmp"
+      return 4
+    fi
+    cp "$FF_FETCH_FROM_DIR/$path" "$tmp" || rc=1
   else
-    curl -fsSL --retry 3 --max-time 60 "$FF_RAW_BASE/$ref/$path" -o "$tmp"
-  fi || {
+    code=$(curl -fsSL --retry 3 --max-time 60 -w '%{http_code}' "$FF_RAW_BASE/$ref/$path" -o "$tmp") || rc=1
+  fi
+  if ((rc)); then
     rm -f "$tmp"
+    [[ $code != 404 ]] || return 4
     return 1
-  }
+  fi
   chmod 644 "$tmp" && mv -f "$tmp" "$dest"
 }
 
@@ -2564,7 +2577,12 @@ _install_dns_step() {
 }
 
 FF_SETUP_FILES=(docker-compose.prod.yml docker-compose.images.yml docker-compose.https.yml docker-compose.storage.yml
-  deploy/systemd/freeframe-backup.service deploy/systemd/freeframe-backup.timer)
+  docker-compose.gpu.yml deploy/systemd/freeframe-backup.service deploy/systemd/freeframe-backup.timer)
+
+# _ff_setup_optional PATH: 0 for a setup file a release may lack (it came
+# later): a ref that does not have it (fetch returns 4) leaves it out of the
+# set instead of failing. Only the GPU compose file is.
+_ff_setup_optional() { [[ $1 == docker-compose.gpu.yml ]]; }
 
 # _ff_setup_dest PATH: where the setup file PATH (as in the repository) lives
 # on this server: the compose files in $FF_ROOT, the units in $FF_ROOT/systemd.
@@ -2582,14 +2600,21 @@ _ff_setup_dest() {
 # FF_FETCH_FAILED names the file, FF_FETCH_STAGE is download or move, and
 # FF_FETCH_MIXED=1 says the old set could not be put back completely.
 fetch_setup_files() {
-  local ref=$1 root stage f dest name i
+  local ref=$1 root stage f dest name i rc
   local -a moved=()
+  local -A absent=()
   root=$(ff_root)
   FF_FETCH_FAILED="" FF_FETCH_STAGE=download FF_FETCH_MIXED=""
   mkdir -p "$root/systemd" || return 1
   stage=$(mktemp -d "$root/.download.XXXXXX") || return 1
   for f in "${FF_SETUP_FILES[@]}"; do
-    if ! _ff_logged fetch "$ref" "$f" "$stage/${f##*/}"; then
+    rc=0
+    _ff_logged fetch "$ref" "$f" "$stage/${f##*/}" || rc=$?
+    if ((rc == 4)) && _ff_setup_optional "$f"; then
+      absent[$f]=1
+      continue
+    fi
+    if ((rc)); then
       FF_FETCH_FAILED=$f
       rm -rf "$stage"
       return 1
@@ -2606,7 +2631,15 @@ fetch_setup_files() {
   for f in "${FF_SETUP_FILES[@]}"; do
     dest=$(_ff_setup_dest "$f")
     name=${f##*/}
-    if { [[ ! -e $dest ]] || cp -p "$dest" "$stage/old/$name"; } && mv -f "$stage/$name" "$dest"; then
+    # A file REF does not have is taken out of the set (and put back below,
+    # like the others, when a later one fails).
+    if [[ -n ${absent[$f]:-} ]]; then
+      if [[ ! -e $dest ]]; then continue; fi
+      if cp -p "$dest" "$stage/old/$name" && rm -f "$dest"; then
+        moved+=("$f")
+        continue
+      fi
+    elif { [[ ! -e $dest ]] || cp -p "$dest" "$stage/old/$name"; } && mv -f "$stage/$name" "$dest"; then
       moved+=("$f")
       continue
     fi
@@ -4278,7 +4311,7 @@ _update_undo_clear() { rm -f "$(_update_undo_file)"; }
 # ref instead (the release that runs, when the files on disk are already
 # another one's).
 _update_save_setup() {
-  local ref=${1:-} root new f dest
+  local ref=${1:-} root new f dest rc
   root=$(ff_root)
   new="$root/rollback.new"
   rm -rf "$new" "$root/rollback.old" || return 1
@@ -4286,7 +4319,11 @@ _update_save_setup() {
   chmod 700 "$new" || return 1
   for f in "${FF_SETUP_FILES[@]}"; do
     if [[ -n $ref ]]; then
-      if ! _ff_logged fetch "$ref" "$f" "$new/${f##*/}"; then
+      rc=0
+      _ff_logged fetch "$ref" "$f" "$new/${f##*/}" || rc=$?
+      # A file that release does not have is not part of its set.
+      if ((rc == 4)) && _ff_setup_optional "$f"; then continue; fi
+      if ((rc)); then
         rm -rf "$new"
         return 1
       fi
