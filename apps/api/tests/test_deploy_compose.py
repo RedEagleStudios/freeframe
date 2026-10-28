@@ -7,8 +7,9 @@ with DOMAIN and ACME_EMAIL set. docker-compose.https.yml adds Host() routers on
 the websecure entrypoint and an http -> https redirect, and is opt-in: the base
 file must not change for anyone who does not pass `-f docker-compose.https.yml`.
 
-docker-compose.images.yml names the published GHCR images and
-docker-compose.storage.yml runs the optional bundled Silo storage. Both are
+docker-compose.images.yml names the published GHCR images,
+docker-compose.storage.yml runs the optional bundled Silo storage and
+docker-compose.gpu.yml gives the transcoding worker an NVIDIA GPU. All are
 opt-in extra `-f` files too: nothing here may change docker-compose.prod.yml.
 """
 import re
@@ -21,6 +22,7 @@ PROD_COMPOSE = REPO_ROOT / "docker-compose.prod.yml"
 HTTPS_COMPOSE = REPO_ROOT / "docker-compose.https.yml"
 IMAGES_COMPOSE = REPO_ROOT / "docker-compose.images.yml"
 STORAGE_COMPOSE = REPO_ROOT / "docker-compose.storage.yml"
+GPU_COMPOSE = REPO_ROOT / "docker-compose.gpu.yml"
 CHANGELOG = REPO_ROOT / "CHANGELOG.md"
 
 APP_SERVICES = ("api", "worker", "email_worker", "maintenance_worker", "beat", "web")
@@ -283,3 +285,60 @@ def test_storage_file_matches_commented_block():
     # Same pinned tags as the commented block in the base file.
     base = PROD_COMPOSE.read_text()
     assert f"pgsty/silo:{SILO_TAG}" in base and f"pgsty/mc:{SILO_TAG}" in base
+
+
+def test_gpu_file_touches_only_the_worker():
+    services = _services(GPU_COMPOSE)
+    assert set(services) == {"worker"}
+    assert set(services["worker"]) == {"environment", "deploy"}
+    # Nothing but the GPU reservation: no limits, no replicas, no restart
+    # policy that would change the base file's worker.
+    assert services["worker"]["deploy"] == {
+        "resources": {"reservations": {"devices": services["worker"]["deploy"]["resources"]["reservations"]["devices"]}}
+    }
+
+
+def test_gpu_file_reserves_an_nvidia_gpu_with_the_video_capability():
+    worker = _services(GPU_COMPOSE)["worker"]
+    devices = worker["deploy"]["resources"]["reservations"]["devices"]
+    assert len(devices) == 1, devices
+    device = devices[0]
+    assert device["driver"] == "nvidia"
+    assert device["count"] == 1
+    # "gpu" picks Docker's NVIDIA driver; NVENC needs the "video" driver
+    # capability, and nvidia-smi (the transcoder's check, and status's) needs
+    # "utility". Docker passes these on as NVIDIA_DRIVER_CAPABILITIES.
+    assert set(device["capabilities"]) == {"gpu", "compute", "utility", "video"}
+    env = worker["environment"]
+    assert env["NVIDIA_DRIVER_CAPABILITIES"] == "compute,utility,video"
+
+
+def test_gpu_file_prefers_nvenc_and_keeps_the_cpu_fallback():
+    env = _services(GPU_COMPOSE)["worker"]["environment"]
+    # NVIDIA, not a backend that refuses to run without one: the transcoder
+    # falls back to the CPU when NVENC is missing or fails (detect_backend).
+    # A TRANSCODER_PIPELINE in .env.prod still wins.
+    assert env["TRANSCODER_PIPELINE"] == "${TRANSCODER_PIPELINE:-NVIDIA}"
+    assert set(env) == {"TRANSCODER_PIPELINE", "NVIDIA_DRIVER_CAPABILITIES"}
+
+
+def test_gpu_pipeline_maps_to_nvenc_with_cpu_fallback():
+    # The value the GPU file sets is one the transcoder knows, and it never
+    # forces a GPU that is not there.
+    import os
+    from unittest import mock
+
+    from packages.transcoder import ffmpeg_transcoder as ft
+
+    assert ft._pipeline_to_backend("NVIDIA") == "nvenc"
+
+    with mock.patch.dict(os.environ, {"TRANSCODER_PIPELINE": "NVIDIA"}), \
+            mock.patch.object(ft, "_nvidia_available", return_value=False):
+        assert ft.detect_backend() == "cpu"
+
+
+def test_base_prod_worker_has_no_gpu():
+    worker = _services(PROD_COMPOSE)["worker"]
+    assert "deploy" not in worker
+    assert "environment" not in worker
+

@@ -326,6 +326,7 @@ jobs:
           python3 -c "import yaml; yaml.safe_load(open('docker-compose.https.yml'))" && echo "HTTPS compose YAML is valid"
           python3 -c "import yaml; yaml.safe_load(open('docker-compose.images.yml'))" && echo "Images compose YAML is valid"
           python3 -c "import yaml; yaml.safe_load(open('docker-compose.storage.yml'))" && echo "Storage compose YAML is valid"
+          python3 -c "import yaml; yaml.safe_load(open('docker-compose.gpu.yml'))" && echo "GPU compose YAML is valid"
 
       - name: Verify the HTTPS compose override merges and needs DOMAIN
         run: |
@@ -342,7 +343,7 @@ jobs:
           echo "$err" | grep -q DOMAIN || { echo "::error::the error does not name DOMAIN: $err"; exit 1; }
           echo "an empty DOMAIN is refused and named"
 
-      - name: Verify the images and storage compose files merge
+      - name: Verify the images, storage and GPU compose files merge
         run: |
           cp .env.example .env.prod
           base() { docker compose --env-file .env.prod -f docker-compose.prod.yml "$@"; }
@@ -354,6 +355,23 @@ jobs:
             STORAGE_DOMAIN=storage.review.example.com STORAGE_ROUTED=true \
             base -f docker-compose.images.yml -f docker-compose.https.yml -f docker-compose.storage.yml config -q
           echo "images, https and storage files merge with the prod compose"
+          # The GPU file renders on a runner without a GPU (config starts
+          # nothing), alone and with every other file, and the reservation
+          # reaches the worker only.
+          base -f docker-compose.images.yml -f docker-compose.gpu.yml config -q
+          echo "images and GPU files merge with the prod compose"
+          DOMAIN=review.example.com ACME_EMAIL=ops@example.com \
+            STORAGE_DOMAIN=storage.review.example.com STORAGE_ROUTED=true \
+            base -f docker-compose.images.yml -f docker-compose.https.yml -f docker-compose.storage.yml \
+            -f docker-compose.gpu.yml config -q
+          echo "images, https, storage and GPU files merge with the prod compose"
+          gpu_services=$(base -f docker-compose.images.yml -f docker-compose.gpu.yml config --format json |
+            python3 -c 'import json, sys; s = json.load(sys.stdin)["services"]; print(" ".join(sorted(n for n in s if s[n].get("deploy", {}).get("resources", {}).get("reservations", {}).get("devices"))))')
+          if [ "$gpu_services" != "worker" ]; then
+            echo "::error::the GPU reservation reaches '$gpu_services', expected only the worker"
+            exit 1
+          fi
+          echo "only the worker reserves the GPU"
 
   # ─── Installer ────────────────────────────────────────────────────────────────
   # deploy/freeframe and install.sh: ShellCheck and the bats suite, on the OS
