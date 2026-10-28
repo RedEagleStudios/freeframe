@@ -114,6 +114,15 @@ assert_root_untouched() {
   assert_out "Sign in as admin@example.com"
 }
 
+@test "install: starting FreeFrame cancels an unfinished uninstall's marker, and says so" {
+  plain_answers
+  printf 'saved=/root/freeframe-removed-20261020-101010\nfinal=\n' >"$FF_ROOT/.uninstall-saved"
+  ff_install --yes --channel latest
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  [ ! -e "$FF_ROOT/.uninstall-saved" ]
+  assert_out "An earlier freeframe uninstall that did not finish is cancelled"
+}
+
 @test "install: the first start leaves traefik out, and starts every other service" {
   plain_answers
   ff_install --yes

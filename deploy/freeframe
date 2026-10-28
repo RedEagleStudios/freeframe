@@ -3738,6 +3738,7 @@ cmd_install() {
   _install_fetch_step
   _install_settings_step "$file"
   _install_start_step
+  _uninstall_marker_cancel
   _install_verify_step "$file"
   _install_backup_timer_step
 
@@ -4331,6 +4332,7 @@ _restore_restart() {
     return 0
   fi
   if _ff_logged dc up -d --no-build; then
+    _uninstall_marker_cancel
     printf 'FreeFrame has been started again.'
   else
     printf 'FreeFrame could not be started again. To start it, run: sudo freeframe restart'
@@ -4439,6 +4441,7 @@ cmd_restore() {
     install_fail "The backup has been put back, but FreeFrame could not be started again." \
       "see why with: sudo freeframe logs, then run: sudo freeframe restart"
   fi
+  _uninstall_marker_cancel
   if ! _ff_wait_for "${FF_API_WAIT:-600}" 5 _ff_logged dc exec -T api curl -fsS http://localhost:8000/health; then
     install_fail "The backup has been put back, but FreeFrame did not finish starting within $(((${FF_API_WAIT:-600} + 59) / 60)) minutes." \
       "see why with: sudo freeframe logs, then run: sudo freeframe restart"
@@ -5221,6 +5224,7 @@ cmd_update() {
   if ! _ff_logged dc up -d --no-build; then
     install_fail "FreeFrame $new could not be started." "see why with: sudo freeframe logs"
   fi
+  _uninstall_marker_cancel
   FF_STEP="waiting for FreeFrame to answer"
   say "Waiting for FreeFrame to finish starting (a new release may first update the database)..."
   if ! _ff_wait_healthy "${mode:-off}" "$host"; then
@@ -5311,6 +5315,7 @@ _rollback_unstarted() {
   if ! _ff_logged dc up -d --no-build --remove-orphans; then
     install_fail "FreeFrame $old could not be started." "see why with: sudo freeframe logs"
   fi
+  _uninstall_marker_cancel
   FF_STEP="waiting for FreeFrame to answer"
   if ! _ff_wait_healthy "${mode:-off}" "$host"; then
     install_fail "FreeFrame $old did not answer after the rollback." "see why with: sudo freeframe logs"
@@ -5519,6 +5524,7 @@ cmd_rollback() {
   if ! _ff_logged dc up -d --no-build --remove-orphans; then
     install_fail "FreeFrame $old could not be started." "see why with: sudo freeframe logs"
   fi
+  _uninstall_marker_cancel
   FF_STEP="waiting for FreeFrame to answer"
   if ! _ff_wait_healthy "${mode:-off}" "$host"; then
     install_fail "FreeFrame $old did not answer after the rollback." "see why with: sudo freeframe logs"
@@ -6179,6 +6185,7 @@ cmd_configure() {
       install_fail "FreeFrame could not be restarted with the new settings." "see why with: sudo freeframe logs"
     fi
   fi
+  _uninstall_marker_cancel
   url=$(env_get "$file" FRONTEND_URL)
   FF_STEP="waiting for FreeFrame to answer"
   if ! _ff_wait_healthy "$FF_CFG_MODE" "$FF_CFG_HOST"; then
@@ -6517,6 +6524,7 @@ cmd_restart() {
     _ff_manage_stop 1 "FreeFrame could not be restarted." \
       "the reason is at the end of ${FF_LOG:-the output above}. Then run sudo freeframe restart again."
   fi
+  _uninstall_marker_cancel
   say "Waiting for FreeFrame to finish starting..."
   if ! _ff_wait_for "${FF_API_WAIT:-600}" 5 _ff_logged dc exec -T api curl -fsS http://localhost:8000/health; then
     _ff_manage_stop 1 "FreeFrame was restarted but did not finish starting within $(((${FF_API_WAIT:-600} + 59) / 60)) minutes." \
@@ -6633,7 +6641,9 @@ _uninstall_saved_settings() {
 # stopped part-way, in the same folder. Whether that run backs up is decided
 # from the server, not the marker: only when FreeFrame's database can no
 # longer be there (_uninstall_db_state) is no backup made. It goes with
-# .env.prod. Nothing in it is trusted beyond _uninstall_saved_ok.
+# .env.prod, and every command that starts FreeFrame again removes it
+# (_uninstall_marker_cancel), so it stands only while an uninstall is really
+# unfinished. Nothing in it is trusted beyond _uninstall_saved_ok.
 _uninstall_marker_file() { printf '%s/.uninstall-saved' "$(ff_root)"; }
 
 # _uninstall_resume: FF_U_RESUME (a marker is there), FF_U_PREV_SAVED and
@@ -6696,6 +6706,20 @@ _uninstall_db_state() {
     " ${FF_U_VOLUMES[*]} " != *" freeframe_pgdata "* ]]; then
     FF_U_DB_GONE=1
   fi
+  return 0
+}
+
+# _uninstall_marker_cancel: FreeFrame was started again, so an uninstall
+# that stopped part-way is not unfinished any more: its marker goes, with
+# one line (on stderr, as some callers print into a sentence).
+_uninstall_marker_cancel() {
+  local f saved=""
+  f=$(_uninstall_marker_file)
+  [[ -f $f ]] || return 0
+  saved=$(sed -n 's/^saved=//p' "$f" 2>/dev/null | head -n 1) || saved=""
+  _uninstall_saved_ok "$saved" || saved=""
+  rm -f -- "$f" || return 0
+  warn "An earlier freeframe uninstall that did not finish is cancelled, as FreeFrame is running here again.${saved:+ The backups it saved stay in $saved.}"
   return 0
 }
 

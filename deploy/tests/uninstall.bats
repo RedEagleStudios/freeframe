@@ -638,6 +638,50 @@ plant_marker() {
   assert_no_out "rm -rf '$FF_ROOT/.'"
 }
 
+@test "restart cancels an unfinished uninstall's marker, and says so" {
+  plant_marker
+  ff restart
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  [ ! -e "$FF_ROOT/.uninstall-saved" ]
+  assert_out "An earlier freeframe uninstall that did not finish is cancelled"
+}
+
+@test "restore cancels an unfinished uninstall's marker" {
+  plant_marker
+  ff restore --yes "$BK/freeframe-20261026-030000.dump"
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  [ ! -e "$FF_ROOT/.uninstall-saved" ]
+  assert_out "An earlier freeframe uninstall that did not finish is cancelled"
+}
+
+@test "update cancels an unfinished uninstall's marker" {
+  plant_marker
+  remote_release 1.22.0
+  ff update
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  [ ! -e "$FF_ROOT/.uninstall-saved" ]
+  assert_out "An earlier freeframe uninstall that did not finish is cancelled"
+}
+
+@test "configure cancels an unfinished uninstall's marker" {
+  plant_marker
+  ff configure --yes --domain review.yourstudio.com
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  [ ! -e "$FF_ROOT/.uninstall-saved" ]
+  assert_out "An earlier freeframe uninstall that did not finish is cancelled"
+}
+
+@test "rollback cancels an unfinished uninstall's marker" {
+  remote_release 1.22.0
+  STUB_API_DOWN=1 FF_API_WAIT=10 ff update
+  [ "$status" -eq 1 ] || { echo "$output"; false; }
+  plant_marker
+  ff rollback --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  [ ! -e "$FF_ROOT/.uninstall-saved" ]
+  assert_out "An earlier freeframe uninstall that did not finish is cancelled"
+}
+
 @test "uninstall: an empty database is never saved as the final backup" {
   STUB_DB_EMPTY=1 ff uninstall --yes
   [ "$status" -eq 1 ] || { echo "$output"; false; }
