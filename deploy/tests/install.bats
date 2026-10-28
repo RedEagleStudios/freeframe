@@ -2707,3 +2707,112 @@ recreates() { grep -c '^dc up -d --no-build --no-deps --force-recreate worker$' 
   grep -qxF " Video processing: CPU for now: the worker could not use the GPU (NVIDIA GeForce RTX 5070 Ti)." <<<"$output" ||
     { echo "$output"; false; }
 }
+
+# ---------------------------------------------------------------- putting FreeFrame back, unattended
+
+# kept_install: what an uninstall that kept the data leaves, with its
+# settings put back: a complete .env.prod (from an earlier install) and the
+# database's volume.
+kept_install() {
+  plain_answers
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+  find "$FF_ROOT" -mindepth 1 -maxdepth 1 ! -name .env.prod -exec rm -rf {} +
+  : >"$CALLS"
+  unset FREEFRAME_ADMIN_NAME FREEFRAME_ADMIN_EMAIL FREEFRAME_ADMIN_PASSWORD
+}
+
+@test "admin kept: --yes with the settings and a database that has an admin needs no admin answers" {
+  kept_install
+  export STUB_PGDATA=1
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_no_out "Missing answer"
+  assert_out "An admin account already exists, so no new one was made."
+  assert_out "Sign in with the admin account that already existed."
+  assert_order "localhost:8000/health" "localhost:8000/setup/status" "dc up -d --no-build traefik"
+  assert_not_called create-superadmin
+  # The summary says what happens to the admin.
+  assert_out "   Admin         the one already in the database kept on this server"
+  [ -f "$FF_ROOT/.installed" ]
+}
+
+@test "admin kept: --yes with the settings and an empty database stops before opening up, and a re-run with the email finishes" {
+  kept_install
+  export STUB_PGDATA=1 STUB_SETUP_NEEDED=1
+  ff_install --yes
+  [ "$status" -eq 2 ] || { echo "$output"; false; }
+  assert_out "Missing answer: set FREEFRAME_ADMIN_EMAIL (the admin account's email)"
+  assert_out "FreeFrame is running but cannot be reached from outside yet, and its database has no admin account."
+  assert_out "Running the install command again with FREEFRAME_ADMIN_EMAIL set creates it and continues from here."
+  assert_not_called create-superadmin
+  assert_not_called "dc up -d --no-build traefik"
+  [ ! -e "$FF_ROOT/.installed" ]
+  grep -qF "Missing answer: set FREEFRAME_ADMIN_EMAIL" "$FF_ROOT/install.log"
+
+  : >"$CALLS"
+  export FREEFRAME_ADMIN_EMAIL=admin@example.com FREEFRAME_ADMIN_PASSWORD=s3cret-pass
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "Admin account created for admin@example.com."
+  assert_order create-superadmin "dc up -d --no-build traefik"
+  assert_not_called "setup/status"
+}
+
+@test "admin kept: an API that does not say whether there is an admin stops the same way" {
+  kept_install
+  export STUB_PGDATA=1 STUB_SETUP_STATUS_FAIL=1
+  ff_install --yes
+  [ "$status" -eq 2 ] || { echo "$output"; false; }
+  assert_out "Missing answer: set FREEFRAME_ADMIN_EMAIL"
+  assert_not_called create-superadmin
+  assert_not_called "dc up -d --no-build traefik"
+}
+
+@test "admin kept: with the settings but no database volume, the email is asked for up front, as before" {
+  kept_install
+  ff_install --yes
+  [ "$status" -eq 2 ] || { echo "$output"; false; }
+  assert_out "Missing answer: set FREEFRAME_ADMIN_EMAIL"
+  assert_not_called "dc up"
+  assert_not_called fetch
+}
+
+@test "admin kept: a fresh server (no settings) never looks for the volume and needs the email" {
+  export FREEFRAME_HTTPS=off STUB_PGDATA=1
+  ff_install --yes
+  [ "$status" -eq 2 ] || { echo "$output"; false; }
+  assert_out "Missing answer: set FREEFRAME_ADMIN_EMAIL"
+  assert_not_called _ff_pgdata_kept
+}
+
+@test "admin kept: an email given is used as before, even with the volume there" {
+  kept_install
+  export STUB_PGDATA=1 FREEFRAME_ADMIN_EMAIL=admin@example.com STUB_ADMIN_CODE=403 \
+    STUB_ADMIN_BODY='{"detail":"Setup already completed. Superadmin already exists."}'
+  ff_install --yes
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  grep -q create-superadmin "$CALLS"
+  assert_not_called "setup/status"
+  assert_out "An admin account already exists"
+}
+
+@test "admin kept: a bad admin password given ahead of time is still refused before anything changes" {
+  kept_install
+  export STUB_PGDATA=1 FREEFRAME_ADMIN_PASSWORD=short
+  ff_install --yes
+  [ "$status" -eq 2 ] || { echo "$output"; false; }
+  assert_out "The admin password must be 8 to 72 characters long."
+  assert_not_called "dc up"
+}
+
+@test "admin kept: interactive, the admin questions say an existing admin is kept" {
+  kept_install
+  export STUB_PGDATA=1
+  # Storage, skip email, name, email, password twice, confirm.
+  tty_answers "${REST[@]}"
+  ff_install
+  [ "$status" -eq 0 ] || { echo "$output"; false; }
+  assert_out "This server keeps FreeFrame's database from before. If it already has an admin account, these answers are not used: sign in with that account."
+  grep -q create-superadmin "$CALLS"
+}

@@ -368,6 +368,13 @@ detect_foreign_install() {
   return 1
 }
 
+# _ff_pgdata_kept: 0 when FreeFrame's database volume (freeframe_pgdata)
+# is on this server, as an uninstall that kept the data leaves it.
+_ff_pgdata_kept() {
+  command -v docker >/dev/null 2>&1 || return 1
+  timeout -k 5 "${FF_DOCKER_INFO_TIMEOUT:-20}" docker volume inspect freeframe_pgdata >/dev/null 2>&1
+}
+
 # ------------------------------------------------------------
 # Answers: flags, environment variables and prompts
 # ------------------------------------------------------------
@@ -1990,8 +1997,15 @@ _ff_answer_error() { _ff_stop 2 "$1" "$2"; }
 # missing, exit 2 the same way as every other stop (log named, programs
 # already stopped listed).
 _ff_answer_missing() {
+  # FF_ANSWER_STATE: what is already in place, when the answer is found
+  # missing after the server was changed (_install_admin_later).
+  if [[ -n ${FF_ANSWER_STATE:-} ]]; then warn "$FF_ANSWER_STATE"; fi
   _ff_already_done
   if [[ -n ${FF_LOG:-} ]]; then warn "Everything the installer did is written to $FF_LOG."; fi
+  if [[ -n ${FF_ANSWER_STATE:-} && -n ${FF_TERM_OUT:-} ]]; then
+    exec 1>&"$FF_TERM_OUT" 2>&"$FF_TERM_ERR"
+    _ff_wait_tee 20
+  fi
   exit 2
 }
 
@@ -2903,6 +2917,9 @@ _install_ask_admin() {
   if _ff_interactive && [[ -z ${FF_ADMIN_NAME:-} || -z ${FF_ADMIN_EMAIL:-} || -z ${FF_ADMIN_PASSWORD:-} ]]; then
     _install_step "Admin account"
     _ff_p "You sign in with this account, and invite your team from it."
+    if [[ -f $(ff_root)/.env.prod ]] && _ff_pgdata_kept; then
+      _ff_p "This server keeps FreeFrame's database from before. If it already has an admin account, these answers are not used: sign in with that account."
+    fi
     say ""
   fi
   if [[ -z ${FF_ADMIN_NAME:-} ]]; then
@@ -2911,6 +2928,18 @@ _install_ask_admin() {
     else
       FF_ADMIN_NAME=Admin
     fi
+  fi
+  # Putting FreeFrame back unattended (the settings and the database's
+  # volume kept, by an uninstall or a move): the database most likely has
+  # its admin already, so no email is needed up front. Once FreeFrame runs,
+  # _install_admin_later asks the database, and asks for the email only
+  # when there is no admin.
+  if [[ -z ${FF_ADMIN_EMAIL:-} && -n ${FF_YES:-} && -z ${FF_ADMIN_ASK_NOW:-} && -f $(ff_root)/.env.prod ]] && _ff_pgdata_kept; then
+    FF_ADMIN_LATER=1
+    if [[ -n ${FF_ADMIN_PASSWORD:-} ]] && ! _ff_password_ok "$FF_ADMIN_PASSWORD"; then
+      _ff_answer_error "The admin password must be 8 to 72 characters long." "choose another FREEFRAME_ADMIN_PASSWORD, or leave it out to have one made for you."
+    fi
+    return 0
   fi
   if [[ -z ${FF_ADMIN_EMAIL:-} ]]; then
     if _ff_interactive; then
@@ -3075,7 +3104,9 @@ _install_show_summary() {
   else
     _install_row "Email" "not set up"
   fi
-  if [[ -n $FF_PW_GENERATED ]]; then
+  if [[ -n ${FF_ADMIN_LATER:-} ]]; then
+    _install_row "Admin" "the one already in the database kept on this server; if it has none, the install stops before opening FreeFrame and asks for FREEFRAME_ADMIN_EMAIL"
+  elif [[ -n $FF_PW_GENERATED ]]; then
     _install_row "Admin" "$FF_ADMIN_NAME <$FF_ADMIN_EMAIL>, with a password made for you (shown at the end)"
   else
     _install_row "Admin" "$FF_ADMIN_NAME <$FF_ADMIN_EMAIL>"
@@ -3454,6 +3485,35 @@ _install_wait_api() {
   fi
 }
 
+# _install_admin_later: putting FreeFrame back with --yes and no admin
+# email (_install_ask_admin set FF_ADMIN_LATER). Asks the kept database
+# whether it has an admin (GET /setup/status, inside the compose network,
+# before Traefik opens anything). It has one: nothing is made, as when the
+# setup endpoint answers 403. It has none (an empty database), or there is
+# no clear answer: the admin answers are needed after all, so a missing
+# email stops here, with FreeFrame still closed to the outside, and a
+# re-run with FREEFRAME_ADMIN_EMAIL set continues.
+_install_admin_later() {
+  local out=""
+  FF_STEP="checking the kept database for an admin account"
+  out=$(dc exec -T api curl -fsS http://localhost:8000/setup/status 2>>"${FF_LOG:-/dev/null}") || out=""
+  if [[ $out =~ \"needs_setup\"[[:space:]]*:[[:space:]]*false ]]; then
+    FF_ADMIN_EXISTED=1
+    _ff_p "An admin account already exists, so no new one was made. Sign in with the existing admin account."
+    return 0
+  fi
+  if [[ $out =~ \"needs_setup\"[[:space:]]*:[[:space:]]*true ]]; then
+    FF_ANSWER_STATE="FreeFrame is running but cannot be reached from outside yet, and its database has no admin account."
+  else
+    FF_ANSWER_STATE="FreeFrame is running but cannot be reached from outside yet, and the installer could not tell whether its database has an admin account."
+  fi
+  FF_ANSWER_STATE+=" Running the install command again with FREEFRAME_ADMIN_EMAIL set creates it and continues from here."
+  FF_ADMIN_LATER="" FF_ADMIN_ASK_NOW=1
+  _install_ask_admin
+  FF_ANSWER_STATE=""
+  _install_create_admin
+}
+
 # Create the admin account through the API inside the compose network,
 # before Traefik makes anything reachable from outside. The answers go as
 # JSON on stdin, never on a command line, and the response (which holds
@@ -3641,7 +3701,11 @@ _install_start_step() {
   FF_STATE="FreeFrame is running but cannot be reached from outside yet. Running sudo freeframe install again keeps your settings and continues from here."
   _install_wait_api
   _install_traefik_closed
-  _install_create_admin
+  if [[ -n ${FF_ADMIN_LATER:-} ]]; then
+    _install_admin_later
+  else
+    _install_create_admin
+  fi
   FF_STEP="opening FreeFrame to the outside"
   if ! _ff_logged dc up -d --no-build traefik; then
     install_fail "FreeFrame's web entrance (Traefik) could not be started." "run sudo freeframe install again; the reason is at the end of the log."
@@ -3834,6 +3898,7 @@ cmd_install() {
   FF_STOPPED=()
   FF_ADDR_FROM_FILE="" FF_SMTP_FROM_FILE="" FF_ADMIN_EXISTED="" FF_CERT_PENDING="" FF_FELL_BACK=""
   FF_ADMIN_CREATED="" FF_PW_GENERATED="" FF_RERUN="the install command"
+  FF_ADMIN_LATER="" FF_ADMIN_ASK_NOW="" FF_ANSWER_STATE=""
   FF_DONE=()
   FF_GPU_FAILED=""
 
@@ -7569,7 +7634,7 @@ _uninstall_summary() {
     say "  $bootstrap"
     if ((${#back[@]})); then
       say "It uses the saved settings and the kept volumes, so $(_ff_and_list "${back[@]}") come back."
-      say "It still asks for an admin account, but the database already has one, so none is made: sign in as before."
+      say "The database already has its admin account, so none is made: sign in as before (with --yes, no admin answers are needed)."
       if [[ -n $dump ]]; then
         say "If the volumes have been deleted by then, it starts with an empty database; then put $label back:"
         say "  sudo freeframe restore $(_ff_q "$dump")"

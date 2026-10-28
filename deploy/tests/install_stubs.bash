@@ -136,6 +136,16 @@ dc() {
     "up -d --no-build "*) _stub_worker_started ;;
     "exec -T worker nvidia-smi -L") _stub_worker_smi ;;
     "ps -q --status running worker") [[ -n ${STUB_WORKER_DOWN:-} ]] || echo 0123456789ab ;;
+    # Whether the database has an admin account (STUB_SETUP_NEEDED: none;
+    # STUB_SETUP_STATUS_FAIL: the API does not answer).
+    *"localhost:8000/setup/status"*)
+      [[ -z ${STUB_SETUP_STATUS_FAIL:-} ]] || return 1
+      if [[ -n ${STUB_SETUP_NEEDED:-} ]]; then
+        printf '{"needs_setup":true,"message":"No superadmin found. Please complete initial setup."}'
+      else
+        printf '{"needs_setup":false,"message":"System is already configured"}'
+      fi
+      ;;
     *"localhost:8000/health"*) [[ -z ${STUB_API_DOWN:-} ]] ;;
     # Our own containers from an earlier attempt (STUB_OURS_RUNNING).
     # `stop traefik` stops it, unless STUB_TRAEFIK_STUCK.
@@ -209,4 +219,11 @@ dc_bounded() {
   _stub_log "dc_bounded $*"
   shift
   dc "$@"
+}
+
+# STUB_PGDATA: the database's volume (freeframe_pgdata) is on this server,
+# kept from an earlier install.
+_ff_pgdata_kept() {
+  _stub_log _ff_pgdata_kept
+  [[ -n ${STUB_PGDATA:-} ]]
 }
