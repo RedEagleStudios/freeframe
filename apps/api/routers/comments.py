@@ -960,7 +960,9 @@ def export_comments(
             probed_start_tc = None
             if start_tc is None:
                 probe_source = None
-                if media_file is not None:
+                # A streaming project's deleted original has nothing to probe;
+                # the web MP4 does not carry the camera timecode.
+                if media_file is not None and media_file.raw_deleted_at is None:
                     raw_key = media_file.s3_key_raw
                     if isinstance(raw_key, str) and raw_key:
                         probe_source = SimpleNamespace(

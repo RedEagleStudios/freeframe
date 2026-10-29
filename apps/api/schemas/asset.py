@@ -1,7 +1,7 @@
 from pydantic import BaseModel
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 from ..models.asset import AssetType, AssetStatus, ProcessingStatus, FileType
 from ..models.activity import NotificationType
 
@@ -69,6 +69,13 @@ class StreamUrlResponse(BaseModel):
     url: str
     asset_type: AssetType
     expires_in: int = 3600
+    # How to play `url`: "hls" is the proxied ladder (hls.js / native HLS),
+    # "progressive" is the uploaded original of a version still processing (a
+    # plain <video src>; the browser may not decode it), "file" is any other
+    # single object (audio, stills, downloads).
+    kind: Literal["hls", "progressive", "file"] = "file"
+    # True only for the progressive preview of a version that is not ready yet.
+    processing: bool = False
 
 class DownloadOption(BaseModel):
     """One file a version can be downloaded as: the original, or a transcode."""

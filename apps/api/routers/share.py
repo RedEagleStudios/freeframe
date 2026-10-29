@@ -5,6 +5,7 @@ from typing import Optional
 import bcrypt
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import RedirectResponse
 import sqlalchemy
 from sqlalchemy import func as sa_func, case
 from sqlalchemy.orm import Session
@@ -31,6 +32,9 @@ from ..schemas.share import (
     MultiShareCreate,
     ShareLinkActivityResponse,
     ShareLinkCreate,
+    ShareEmbedImage,
+    ShareEmbedResponse,
+    ShareEmbedVideo,
     ShareLinkListItem,
     ShareLinkResponse,
     ShareLinkUpdate,
@@ -51,6 +55,9 @@ from ..schemas.asset import DownloadOption
 from ..services.downloads import (
     describe_choices, download_choices, download_filename, may_download_original,
     original_allowed_for_download, pick_or_refuse,
+)
+from ..services.streaming import (
+    PREVIEW_URL_EXPIRES_IN, can_preview_processing, original_available, progressive_preview_url,
 )
 from ..services.crypto_service import encrypt_password, decrypt_password
 from .hls_proxy import create_hls_token
@@ -330,7 +337,7 @@ def _build_share_validate_response(
                     stream_url = f"/stream/hls/master.m3u8?token={hls_token}"
                 else:
                     stream_url = generate_presigned_get_url(media_file.s3_key_processed)
-            elif media_file.s3_key_raw:
+            elif media_file.s3_key_raw and original_available(media_file):
                 stream_url = generate_presigned_get_url(media_file.s3_key_raw)
 
         asset_data = {
@@ -1556,6 +1563,31 @@ def _share_media_file(db: Session, link, asset, version_id: Optional[uuid.UUID])
     return media_file
 
 
+def _share_processing_preview(db: Session, asset: Asset) -> Optional[tuple[AssetVersion, MediaFile]]:
+    """The version a share link may preview from its original while it transcodes.
+
+    The rule: only when the asset has no ready version at all (a share link
+    otherwise keeps serving its latest ready version, exactly as before), and
+    then only the newest live `processing` version -- the one the link will
+    select as soon as it is ready, since an `uploading` or `failed` version
+    above it is never selected. `version_id` plays no part, so a link that hides
+    version history cannot be used to reach any other version. Called only
+    after `_share_media_file` found no ready version, and only for streaming,
+    never for a download.
+    """
+    version = db.query(AssetVersion).filter(
+        AssetVersion.asset_id == asset.id,
+        AssetVersion.deleted_at.is_(None),
+        AssetVersion.processing_status == ProcessingStatus.processing,
+    ).order_by(AssetVersion.version_number.desc()).first()
+    if version is None:
+        return None
+    media_file = db.query(MediaFile).filter(MediaFile.version_id == version.id).first()
+    if not can_preview_processing(asset, version, media_file):
+        return None
+    return version, media_file
+
+
 @router.get(
     "/share/{token}/downloads/{asset_id}",
     response_model=list[DownloadOption],
@@ -1620,9 +1652,37 @@ def get_share_stream_url(
     # Validate asset belongs to this share
     validate_asset_in_share(db, link, asset)
 
-    media_file = _share_media_file(db, link, asset, version_id)
+    try:
+        media_file = _share_media_file(db, link, asset, version_id)
+    except HTTPException as exc:
+        preview = None if download or exc.status_code != 404 else _share_processing_preview(db, asset)
+        if preview is None:
+            raise
+        version, media_file = preview
+        _log_share_activity(
+            db, link.id, ShareActivityAction.viewed_asset,
+            actor_email=current_user.email if current_user else "anonymous",
+            actor_name=current_user.name if current_user else None,
+            asset_id=asset.id,
+            asset_name=asset.name,
+        )
+        return {
+            "url": progressive_preview_url(media_file),
+            "asset_type": asset.asset_type.value,
+            "name": asset.name,
+            "version_id": str(version.id),
+            "thumbnail_url": (
+                generate_presigned_get_url(media_file.s3_key_thumbnail)
+                if media_file.s3_key_thumbnail else None
+            ),
+            "duration_seconds": media_file.duration_seconds,
+            "expires_in": PREVIEW_URL_EXPIRES_IN,
+            "kind": "progressive",
+            "processing": True,
+        }
 
     choice = None
+    kind = "file"
     if download:
         # The MP4 remuxed from the top rung unless another file was chosen,
         # falling back to the camera master for versions that predate it (see
@@ -1642,6 +1702,7 @@ def get_share_stream_url(
         # Route through /stream/hls so S3 can stay private (#51)
         hls_token = create_hls_token(media_file.s3_key_processed)
         url = f"/stream/hls/master.m3u8?token={hls_token}"
+        kind = "hls"
     else:
         url = generate_presigned_get_url(media_file.s3_key_processed or media_file.s3_key_raw)
 
@@ -1668,6 +1729,8 @@ def get_share_stream_url(
         "version_id": str(media_file.version_id) if media_file.version_id else None,
         "thumbnail_url": thumb_url,
         "duration_seconds": media_file.duration_seconds,
+        "kind": kind,
+        "processing": False,
     }
 
 
@@ -1727,3 +1790,130 @@ def get_share_asset_versions(
         versions = versions[:1]
 
     return versions
+
+
+# ── Link previews (Discord / OpenGraph) ──────────────────────────────────────
+#
+# A pasted share link unfurls into a playable video in Discord (and other
+# OpenGraph consumers) when the page carries og:video pointing at an MP4. The
+# share page renders those tags server-side from GET /share/{token}/embed; the
+# URLs in them must outlive the cache of whoever unfurls the link, so they are
+# these stable endpoints, which redirect to a fresh presigned URL on every
+# fetch, never a presigned URL itself.
+#
+# Only links anyone holding them can open qualify: a password or a `secure`
+# (sign-in) link, a disabled, expired or missing one all answer 404, so an
+# unfurl reveals nothing those links would not. The MP4 is the version's web MP4
+# (`s3_key_download`); without one there is no video embed. Streaming projects
+# always have one; elsewhere it depends on TRANSCODER_DOWNLOAD_MP4.
+
+_EMBED_REDIRECT_HEADERS = {"Cache-Control": "no-store"}
+
+
+def _embed_link(db: Session, token: str) -> ShareLink:
+    """The link, when it may be unfurled by an anonymous crawler; 404 otherwise."""
+    try:
+        link = validate_share_link(db, token)
+    except HTTPException:
+        raise HTTPException(status_code=404, detail="Not found")
+    if link.password_hash or link.visibility == "secure":
+        raise HTTPException(status_code=404, detail="Not found")
+    return link
+
+
+def _embed_media(db: Session, link: ShareLink) -> tuple[Optional[Asset], Optional[MediaFile]]:
+    """The asset a single-asset link shows and the media of its latest ready version."""
+    if not link.asset_id:
+        return None, None
+    asset = db.query(Asset).filter(Asset.id == link.asset_id, Asset.deleted_at.is_(None)).first()
+    if asset is None:
+        return None, None
+    validate_asset_in_share(db, link, asset)
+    return asset, _get_latest_media_file(db, asset.id)
+
+
+def _embed_video_key(asset: Optional[Asset], media_file: Optional[MediaFile]) -> Optional[str]:
+    if asset is None or media_file is None or asset.asset_type != AssetType.video:
+        return None
+    if not media_file.s3_key_processed:
+        return None
+    return media_file.s3_key_download
+
+
+@router.get(
+    "/share/{token}/embed",
+    response_model=ShareEmbedResponse,
+    dependencies=[Depends(rate_limit("share_embed", 60, 60))],
+)
+def get_share_embed(token: str, db: Session = Depends(get_db)):
+    """Public. What a link preview of this share link may show (see above)."""
+    from ..services.branding_service import resolve_org_name
+
+    link = _embed_link(db, token)
+    asset, media_file = _embed_media(db, link)
+
+    title = link.title
+    if not title and asset is not None:
+        title = asset.name
+    if not title and link.folder_id:
+        folder = db.query(Folder).filter(Folder.id == link.folder_id, Folder.deleted_at.is_(None)).first()
+        title = folder.name if folder else None
+    if not title and link.project_id:
+        project = db.query(Project).filter(Project.id == link.project_id, Project.deleted_at.is_(None)).first()
+        title = project.name if project else None
+
+    width = media_file.width if media_file else None
+    height = media_file.height if media_file else None
+    image = None
+    if media_file is not None and media_file.s3_key_thumbnail and asset.asset_type != AssetType.audio:
+        image = ShareEmbedImage(url=f"/share/{token}/embed.jpg", width=width, height=height)
+    video = None
+    if _embed_video_key(asset, media_file):
+        url = f"/share/{token}/embed.mp4"
+        video = ShareEmbedVideo(url=url, secure_url=url, width=width, height=height)
+
+    return ShareEmbedResponse(
+        title=title or "Shared media",
+        description=link.description,
+        site_name=resolve_org_name(),
+        asset_type=asset.asset_type.value if asset is not None else None,
+        image=image,
+        video=video,
+    )
+
+
+@router.api_route(
+    "/share/{token}/embed.mp4",
+    methods=["GET", "HEAD"],
+    dependencies=[Depends(rate_limit("share_embed_media", 120, 60))],
+)
+def get_share_embed_video(token: str, db: Session = Depends(get_db)):
+    """Public. 302 to a fresh presigned GET of the shared video's web MP4."""
+    link = _embed_link(db, token)
+    asset, media_file = _embed_media(db, link)
+    key = _embed_video_key(asset, media_file)
+    if not key:
+        raise HTTPException(status_code=404, detail="Not found")
+    return RedirectResponse(
+        generate_presigned_get_url(key), status_code=302, headers=_EMBED_REDIRECT_HEADERS,
+    )
+
+
+@router.api_route(
+    "/share/{token}/embed.jpg",
+    methods=["GET", "HEAD"],
+    dependencies=[Depends(rate_limit("share_embed_media", 120, 60))],
+)
+def get_share_embed_image(token: str, db: Session = Depends(get_db)):
+    """Public. 302 to a fresh presigned GET of the shared asset's thumbnail."""
+    link = _embed_link(db, token)
+    asset, media_file = _embed_media(db, link)
+    if (
+        media_file is None or not media_file.s3_key_thumbnail
+        or asset.asset_type == AssetType.audio  # its "thumbnail" is waveform JSON
+    ):
+        raise HTTPException(status_code=404, detail="Not found")
+    return RedirectResponse(
+        generate_presigned_get_url(media_file.s3_key_thumbnail), status_code=302,
+        headers=_EMBED_REDIRECT_HEADERS,
+    )

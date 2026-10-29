@@ -5,7 +5,7 @@ import { createPortal } from 'react-dom'
 import Hls from 'hls.js'
 import { cn, formatTimecode } from '@/lib/utils'
 import { useReviewStore } from '@/stores/review-store'
-import type { Comment } from '@/types'
+import type { Comment, StreamKind } from '@/types'
 import { Avatar } from '@/components/shared/avatar'
 
 // ─── Avatar helpers ───────────────────────────────────────────────────────────
@@ -31,14 +31,21 @@ interface ProgressBarProps {
   buffered?: number
   comments?: Comment[]
   videoRef?: React.RefObject<HTMLVideoElement | null>
+  /**
+   * Feeds the hover frame preview. Leave it out for a progressive preview of
+   * an original: the hidden preview video would download the whole upload a
+   * second time.
+   */
   streamUrl?: string | null
+  /** How to load `streamUrl`; sniffs `.m3u8` when not given. */
+  streamKind?: StreamKind
   onSeek: (time: number) => void
   className?: string
 }
 
 // ─── Frame Preview Hook ───────────────────────────────────────────────────────
 
-function useFramePreview(streamUrl: string | null | undefined) {
+function useFramePreview(streamUrl: string | null | undefined, streamKind: StreamKind | undefined) {
   const previewVideoRef = useRef<HTMLVideoElement | null>(null)
   const previewHlsRef = useRef<Hls | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -64,7 +71,7 @@ function useFramePreview(streamUrl: string | null | undefined) {
     canvas.height = 90
     canvasRef.current = canvas
 
-    const isHls = streamUrl.includes('.m3u8')
+    const isHls = streamKind ? streamKind === 'hls' : streamUrl.includes('.m3u8')
 
     const onReady = () => {
       readyRef.current = true
@@ -121,7 +128,7 @@ function useFramePreview(streamUrl: string | null | undefined) {
       canvasRef.current = null
       setPreviewImage(null)
     }
-  }, [streamUrl])
+  }, [streamUrl, streamKind])
 
   const seekPreview = useCallback((time: number) => {
     const video = previewVideoRef.current
@@ -271,6 +278,7 @@ export function ProgressBar({
   buffered = 0,
   comments = [],
   streamUrl,
+  streamKind,
   onSeek,
   className,
 }: ProgressBarProps) {
@@ -282,7 +290,7 @@ export function ProgressBar({
   const [hoveredCommentId, setHoveredCommentId] = useState<string | null>(null)
   const focusedCommentId = useReviewStore((s) => s.focusedCommentId)
 
-  const { previewImage, seekPreview, clearPreview } = useFramePreview(streamUrl)
+  const { previewImage, seekPreview, clearPreview } = useFramePreview(streamUrl, streamKind)
 
   const timeToPercent = useCallback(
     (time: number): number => {

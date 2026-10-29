@@ -4,6 +4,7 @@ import os
 import asyncio
 import json
 import logging
+from datetime import datetime, timezone
 
 # Ensure the workspace root is on the path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
@@ -14,6 +15,7 @@ from .celery_app import celery_app
 from ..database import SessionLocal
 from ..models.asset import AssetVersion, MediaFile, ProcessingStatus, AssetType
 from ..models.asset import Asset
+from ..models.project import Project
 from ..services.s3_service import get_s3_client
 from ..config import settings
 
@@ -49,6 +51,17 @@ def process_asset(self, asset_id: str, version_id: str):
             version.processing_status = ProcessingStatus.failed
             db.commit()
             return
+        if media_file.raw_deleted_at is not None:
+            # A streaming project deleted this version's original after it was
+            # ready. There is nothing left to transcode from, and trying would
+            # end in `failed` on a version whose ladder plays fine.
+            log.warning("transcode: version %s has no original any more; leaving it as is", version_id)
+            return
+
+        # Streaming projects always keep a web MP4, whatever the instance default.
+        streaming_mode = bool(
+            db.query(Project.streaming_mode).filter(Project.id == asset.project_id).scalar()
+        )
 
         # Reset to processing status before each attempt
         version.processing_status = ProcessingStatus.processing
@@ -69,7 +82,7 @@ def process_asset(self, asset_id: str, version_id: str):
             if asset.asset_type in (AssetType.video,):
                 _process_video(
                     db, asset, version, media_file, s3, output_prefix,
-                    final_attempt=final_attempt,
+                    final_attempt=final_attempt, streaming_mode=streaming_mode,
                 )
             elif asset.asset_type == AssetType.audio:
                 _process_audio(db, asset, version, media_file, s3, output_prefix)
@@ -77,6 +90,7 @@ def process_asset(self, asset_id: str, version_id: str):
                 _process_image(db, asset, version, media_file, s3, output_prefix)
 
             version.processing_status = ProcessingStatus.ready
+            version.ready_at = datetime.now(timezone.utc)
             db.commit()
 
             # Publish SSE event (best-effort)
@@ -130,7 +144,7 @@ def process_asset(self, asset_id: str, version_id: str):
 
 def _process_video(
     db, asset, version, media_file, s3, output_prefix, *,
-    final_attempt: bool = False,
+    final_attempt: bool = False, streaming_mode: bool = False,
 ):
     from packages.transcoder.ffmpeg_transcoder import FFmpegTranscoder, parse_qualities
     from packages.transcoder.base import TranscodeJob
@@ -171,7 +185,7 @@ def _process_video(
         qualities=parse_qualities(settings.transcoder_qualities),
         progress_cb=_on_progress,
         final_attempt=final_attempt,
-        download_mp4=settings.transcoder_download_mp4,
+        download_mp4=settings.transcoder_download_mp4 or streaming_mode,
     )
     result = _run_async(transcoder.transcode(job))
 
@@ -256,6 +270,8 @@ def _eligible_media_rows(db):
             AssetVersion.deleted_at.is_(None),
             Asset.deleted_at.is_(None),
             MediaFile.duration_seconds.is_(None),
+            # Probes read the original; one a streaming project deleted has none.
+            MediaFile.raw_deleted_at.is_(None),
             Asset.asset_type.in_([AssetType.video, AssetType.audio]),
         )
         .all()
@@ -323,5 +339,64 @@ def backfill_media_metadata(self):
                 )
                 continue
         return {"updated": updated, "skipped": skipped}
+    finally:
+        db.close()
+
+
+@celery_app.task(bind=True, max_retries=2, default_retry_delay=300)
+def build_download_mp4(self, version_id: str):
+    """Give a ready video version the web MP4 it was transcoded without.
+
+    Queued by the streaming-original retention task (cleanup_tasks) for a
+    version in a streaming project that has no `s3_key_download` -- made before
+    the project was streaming, with TRANSCODER_DOWNLOAD_MP4=false, or by the
+    source-copy backend. The original is only deleted once this has succeeded.
+    Remuxes the tallest rung of the ladder already in storage, with the same
+    ffmpeg command the transcode uses, so the original is never read.
+    """
+    from packages.transcoder.ffmpeg_transcoder import FFmpegTranscoder
+
+    db = SessionLocal()
+    try:
+        row = (
+            db.query(MediaFile, AssetVersion)
+            .join(AssetVersion, MediaFile.version_id == AssetVersion.id)
+            .filter(AssetVersion.id == uuid.UUID(version_id))
+            .first()
+        )
+        if row is None:
+            return None
+        media_file, version = row
+        if (
+            version.deleted_at is not None
+            or version.processing_status != ProcessingStatus.ready
+            or not media_file.s3_key_processed
+            or media_file.s3_key_download
+        ):
+            return media_file.s3_key_download
+        hls_prefix = media_file.s3_key_processed
+        # Nothing is held open while ffmpeg runs; the row is re-read to record it.
+        db.commit()
+
+        transcoder = FFmpegTranscoder(
+            get_s3_client(), settings.s3_bucket, settings.s3_endpoint,
+            storage_class=settings.s3_storage_class,
+        )
+        try:
+            key = transcoder.rebuild_download_mp4(hls_prefix)
+        except Exception as exc:  # noqa: BLE001 - retried here, and again by the next daily run
+            from packages.transcoder.redact import redact_presigned_urls
+            log.warning("download-mp4: version %s: %s", version_id, redact_presigned_urls(str(exc)))
+            if self.request.retries >= self.max_retries:
+                return None
+            raise self.retry(exc=exc)
+
+        media_file = db.query(MediaFile).filter(MediaFile.version_id == version.id).first()
+        if media_file is None or media_file.s3_key_processed != hls_prefix:
+            return None  # deleted or re-transcoded meanwhile; that run owns the key
+        media_file.s3_key_download = key
+        db.commit()
+        log.info("download-mp4: built %s for version %s", key, version_id)
+        return key
     finally:
         db.close()

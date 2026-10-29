@@ -17,7 +17,7 @@ import type { InstanceBranding } from '@/stores/branding-store'
  * back to the public one so a deployment that has not set it, and any setup
  * where both happen to be the same host, keeps working.
  */
-const INTERNAL_API_URL =
+export const INTERNAL_API_URL =
   process.env.API_INTERNAL_URL ||
   process.env.NEXT_PUBLIC_API_URL ||
   'http://localhost:8000'

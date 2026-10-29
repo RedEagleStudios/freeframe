@@ -199,6 +199,7 @@ def _video_asset(mock_db, download_key):
     media_file.s3_key_download = download_key
     media_file.s3_key_thumbnail = None
     media_file.original_filename = "Hero Spot.mov"
+    media_file.raw_deleted_at = None
 
     mock_db.first.side_effect = [asset, version, media_file]
     return asset
@@ -295,6 +296,7 @@ def test_a_share_link_download_serves_the_mp4_rung_too(
     media_file.s3_key_download = "processed/p/a/v/download.mp4"
     media_file.s3_key_thumbnail = None
     media_file.original_filename = "Hero Spot.mov"
+    media_file.raw_deleted_at = None
     media_file.duration_seconds = 12.0
     mock_get_latest_media_file.return_value = media_file
     mock_presign.return_value = "https://s3.example.com/download.mp4?sig=x"

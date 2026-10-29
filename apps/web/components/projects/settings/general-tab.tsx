@@ -34,6 +34,7 @@ interface DetailsValues {
   name: string
   description: string
   isPublic: boolean
+  streamingMode: boolean
 }
 
 interface BrandingValues {
@@ -42,12 +43,31 @@ interface BrandingValues {
   customFooter: string
 }
 
-function detailsFrom(project: Pick<Project, 'name' | 'description' | 'is_public'>): DetailsValues {
+function detailsFrom(
+  project: Pick<Project, 'name' | 'description' | 'is_public' | 'streaming_mode'>,
+): DetailsValues {
   return {
     name: project.name,
     description: project.description ?? '',
     isPublic: project.is_public ?? false,
+    streamingMode: project.streaming_mode ?? false,
   }
+}
+
+/**
+ * What the Streaming project switch warns about. The retention is the
+ * instance's, not the project's: 0 means the server deletes nothing.
+ */
+export function streamingModeDescription(retentionDays: number | undefined): string {
+  const keeps = 'Keeps a web MP4 for playback and download'
+  if (retentionDays === 0) {
+    return `${keeps}. Deleting uploaded originals is currently disabled on this server, so they are kept for now.`
+  }
+  const when =
+    retentionDays == null
+      ? 'some days after it\u2019s ready'
+      : `${retentionDays} ${retentionDays === 1 ? 'day' : 'days'} after it\u2019s ready`
+  return `${keeps} and deletes each uploaded original ${when}. Originals can\u2019t be recovered.`
 }
 
 function brandingFrom(branding: ProjectBranding): BrandingValues {
@@ -142,7 +162,8 @@ export function ProjectGeneralTab({ project }: { project: Project }) {
   const detailsDirty =
     details.name !== savedDetails.name ||
     details.description !== savedDetails.description ||
-    details.isPublic !== savedDetails.isPublic
+    details.isPublic !== savedDetails.isPublic ||
+    details.streamingMode !== savedDetails.streamingMode
   const brandingDirty =
     !!brandingDraft &&
     !!savedBranding &&
@@ -234,6 +255,9 @@ export function ProjectGeneralTab({ project }: { project: Project }) {
       patch.description = sentDetails.description.trim() || null
     }
     if (sentDetails.isPublic !== savedDetails.isPublic) patch.is_public = sentDetails.isPublic
+    if (sentDetails.streamingMode !== savedDetails.streamingMode) {
+      patch.streaming_mode = sentDetails.streamingMode
+    }
     if (Object.keys(patch).length > 0) {
       try {
         await api.patch<Project>(`/projects/${projectId}`, patch)
@@ -324,6 +348,7 @@ export function ProjectGeneralTab({ project }: { project: Project }) {
           onPickCover={pickCover}
           onRemoveCover={() => setCover(savedCoverUrl ? { kind: 'remove' } : KEEP)}
           coverError={coverError}
+          streamingRetentionDays={project.streaming_retention_days}
         />
 
         <section className="rounded-xl border border-border bg-bg-secondary p-5 space-y-5">
@@ -435,6 +460,7 @@ function ProjectCard({
   onPickCover,
   onRemoveCover,
   coverError,
+  streamingRetentionDays,
 }: {
   projectId: string
   details: DetailsValues
@@ -444,6 +470,7 @@ function ProjectCard({
   onPickCover: (e: React.ChangeEvent<HTMLInputElement>) => void
   onRemoveCover: () => void
   coverError: string | null
+  streamingRetentionDays: number | undefined
 }) {
   const fileRef = React.useRef<HTMLInputElement>(null)
   const descriptionId = React.useId()
@@ -528,6 +555,14 @@ function ProjectCard({
             }
             checked={!details.isPublic}
             onCheckedChange={(isPrivate) => onDetailsChange({ isPublic: !isPrivate })}
+          />
+          {/* Only owners reach this tab (the settings page shows everyone else
+              a refusal), and the API takes `streaming_mode` from owners only. */}
+          <ToggleRow
+            label="Streaming project"
+            description={streamingModeDescription(streamingRetentionDays)}
+            checked={details.streamingMode}
+            onCheckedChange={(streamingMode) => onDetailsChange({ streamingMode })}
           />
         </div>
       </div>

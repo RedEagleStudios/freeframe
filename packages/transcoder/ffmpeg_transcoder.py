@@ -621,6 +621,58 @@ def rung_height(name: str) -> int:
     return int(QUALITY_MAP[name][0].split(":")[1])
 
 
+def download_mp4_command(playlist: str, mp4_path: str) -> list[str]:
+    """The ffmpeg command that remuxes one HLS rung into the download MP4.
+
+    Shared by the transcode (`_build_download_mp4`) and by the rebuild of an
+    MP4 for a version transcoded without one (`rebuild_download_mp4`), so the
+    two produce the same file.
+    """
+    return [
+        "ffmpeg", "-y",
+        "-i", playlist,
+        "-c", "copy",
+        # AAC inside MPEG-TS is ADTS-framed and MP4 wants the bare
+        # stream with an ASC in the sample entry. Recent ffmpeg
+        # inserts this filter itself (7.1 produces byte-identical
+        # output with and without it) and ignores it on a variant
+        # that carries no audio at all, so saying it costs nothing
+        # and keeps the requirement visible.
+        "-bsf:a", "aac_adtstoasc",
+        "-movflags", "+faststart",
+        mp4_path,
+    ]
+
+
+_STREAM_INF_RESOLUTION = re.compile(r"RESOLUTION=(\d+)x(\d+)")
+
+
+def tallest_variant_uri(master_playlist: str) -> Optional[str]:
+    """The URI of the tallest rendition in an HLS master playlist.
+
+    Measured by the short side, as the ladder names its rungs (a 1080x1920
+    portrait rung is 1080p). When no variant carries a RESOLUTION, the first
+    variant; None when the playlist lists none.
+    """
+    best: Optional[tuple[int, str]] = None
+    first: Optional[str] = None
+    pending: Optional[int] = None
+    in_variant = False
+    for line in master_playlist.splitlines():
+        line = line.strip()
+        if line.startswith("#EXT-X-STREAM-INF"):
+            m = _STREAM_INF_RESOLUTION.search(line)
+            pending = min(int(m.group(1)), int(m.group(2))) if m else None
+            in_variant = True
+        elif line and not line.startswith("#") and in_variant:
+            first = first or line
+            if pending is not None and (best is None or pending > best[0]):
+                best = (pending, line)
+            pending = None
+            in_variant = False
+    return best[1] if best else first
+
+
 def parse_qualities(raw: str | None) -> list[str]:
     """Turn a configured rung list into one this transcoder can build.
 
@@ -1879,20 +1931,7 @@ class FFmpegTranscoder(BaseTranscoder):
         key = f"{output_prefix}/download.mp4"
         try:
             self._run(
-                [
-                    "ffmpeg", "-y",
-                    "-i", str(playlist),
-                    "-c", "copy",
-                    # AAC inside MPEG-TS is ADTS-framed and MP4 wants the bare
-                    # stream with an ASC in the sample entry. Recent ffmpeg
-                    # inserts this filter itself (7.1 produces byte-identical
-                    # output with and without it) and ignores it on a variant
-                    # that carries no audio at all, so saying it costs nothing
-                    # and keeps the requirement visible.
-                    "-bsf:a", "aac_adtstoasc",
-                    "-movflags", "+faststart",
-                    str(mp4_path),
-                ],
+                download_mp4_command(str(playlist), str(mp4_path)),
                 timeout=3600,
                 label="ffmpeg",
             )
@@ -1907,6 +1946,46 @@ class FFmpegTranscoder(BaseTranscoder):
             )
             return None
         return key
+
+    def rebuild_download_mp4(self, hls_prefix: str) -> str:
+        """Build `<hls_prefix>/download.mp4` from a ladder already in storage.
+
+        For a version transcoded without the download MP4 (before it existed,
+        with TRANSCODER_DOWNLOAD_MP4=false, or by the source-copy backend) whose
+        project now needs one. Reads the master playlist to find the tallest
+        rung, downloads that rung's playlist and segments, and remuxes them with
+        the same command the transcode uses. Returns the key; raises on any
+        failure, so the caller can leave the version for a later attempt.
+        """
+        master = self.s3.get_object(Bucket=self.bucket, Key=f"{hls_prefix}/master.m3u8")
+        uri = tallest_variant_uri(master["Body"].read().decode("utf-8"))
+        if uri is None:
+            raise RuntimeError(f"no variant listed in {hls_prefix}/master.m3u8")
+        rung_prefix = f"{hls_prefix}/{os.path.dirname(uri)}".rstrip("/") + "/"
+        work_dir = Path(tempfile.mkdtemp(prefix="ff-mp4-"))
+        try:
+            rung_dir = work_dir / "rung"
+            rung_dir.mkdir()
+            paginator = self.s3.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=self.bucket, Prefix=rung_prefix):
+                for obj in page.get("Contents", []):
+                    rel = obj["Key"][len(rung_prefix):]
+                    if not rel or "/" in rel:
+                        continue  # the rung is flat: a playlist and its segments
+                    self.s3.download_file(self.bucket, obj["Key"], str(rung_dir / rel))
+            playlist = rung_dir / os.path.basename(uri)
+            if not playlist.exists():
+                raise RuntimeError(f"rung {rung_prefix} is missing from storage")
+            mp4_path = work_dir / "download.mp4"
+            self._run(download_mp4_command(str(playlist), str(mp4_path)), timeout=3600, label="ffmpeg")
+            key = f"{hls_prefix}/download.mp4"
+            self.s3.upload_file(
+                str(mp4_path), self.bucket, key,
+                ExtraArgs=self._extra_args("video/mp4", "max-age=86400"),
+            )
+            return key
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
     async def get_video_metadata(self, s3_key: str) -> VideoMetadata:
         """Get video metadata using streaming (no full download)."""

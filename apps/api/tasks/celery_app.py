@@ -58,6 +58,7 @@ celery_app.conf.update(
         "cleanup_soft_deleted": {"queue": "maintenance"},
         "requeue_stuck_processing": {"queue": "maintenance"},
         "sweep_orphan_s3": {"queue": "maintenance"},
+        "delete_streaming_originals": {"queue": "maintenance"},
         # Not housekeeping: this one is dispatched from a request handler and
         # is a full FFmpeg re-encode, so it belongs with the other transcoding
         # work rather than behind an hour-long bucket sweep.
@@ -93,6 +94,10 @@ celery_app.conf.beat_schedule = {
     "cleanup-soft-deleted": {
         "task": "cleanup_soft_deleted",
         "schedule": crontab(minute=0, hour=3),  # daily at 03:00 UTC
+    },
+    "delete-streaming-originals": {
+        "task": "delete_streaming_originals",
+        "schedule": crontab(minute=30, hour=3),  # daily at 03:30 UTC, after the GC
     },
     "sweep-orphan-s3": {
         "task": "sweep_orphan_s3",

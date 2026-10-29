@@ -205,6 +205,9 @@ def update_project(project_id: uuid.UUID, body: ProjectUpdate, db: Session = Dep
         project.description = body.description or None
     if body.is_public is not None:
         project.is_public = body.is_public
+    if body.streaming_mode is not None:
+        # Off stops future deletions only; originals already deleted stay deleted.
+        project.streaming_mode = body.streaming_mode
     db.commit()
     db.refresh(project)
     resp = ProjectResponse.model_validate(project)

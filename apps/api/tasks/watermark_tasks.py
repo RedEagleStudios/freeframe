@@ -64,13 +64,20 @@ def apply_watermark(
         s3 = get_s3_client()
 
         with tempfile.TemporaryDirectory() as tmp:
-            # Determine file extension from original filename
-            _, ext = os.path.splitext(source.original_filename)
-            ext = ext.lower() or ".mp4"
+            # The original, or the web MP4 when a streaming project has deleted
+            # the original (it only does once that MP4 exists).
+            if source.raw_deleted_at is None:
+                source_key = source.s3_key_raw
+                _, ext = os.path.splitext(source.original_filename)
+                ext = ext.lower() or ".mp4"
+            elif source.s3_key_download:
+                source_key, ext = source.s3_key_download, ".mp4"
+            else:
+                return
             local_path = os.path.join(tmp, f"source{ext}")
 
             # Download source from S3
-            s3.download_file(settings.s3_bucket, source.s3_key_raw, local_path)
+            s3.download_file(settings.s3_bucket, source_key, local_path)
 
             output_ext = ".mp4"
             output_path = os.path.join(tmp, f"watermarked_{asset_id}{output_ext}")

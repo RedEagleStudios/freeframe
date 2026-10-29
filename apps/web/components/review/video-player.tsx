@@ -22,12 +22,15 @@ import { useVideoPlayer } from "@/hooks/use-video-player";
 import { useMediaQuery, MEDIA_SM } from "@/hooks/use-media-query";
 import { useReview } from "./review-provider";
 import { ProgressBar } from "./progress-bar";
-import type { Comment } from "@/types";
+import { ProcessingPlaceholder } from "./processing-placeholder";
+import type { Comment, StreamKind, StreamResponse } from "@/types";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-interface StreamUrlResponse {
+interface PlayableStream {
   url: string;
+  /** Undefined for an API response that predates `kind`. */
+  kind?: StreamKind;
 }
 
 interface VideoPlayerProps {
@@ -37,6 +40,20 @@ interface VideoPlayerProps {
   className?: string;
   /** Pre-fetched stream URL (for share mode — skips authenticated API call) */
   initialStreamUrl?: string | null;
+  /** The `kind` the pre-fetched stream came with. */
+  initialStreamKind?: StreamKind;
+  /**
+   * Transcode progress of the selected version, shown when a processing
+   * version cannot be previewed and the player falls back to the placeholder.
+   */
+  processingPercent?: number | null;
+}
+
+function absoluteStreamUrl(url: string): string {
+  // HLS proxy returns relative paths — prepend API URL
+  return url.startsWith("/")
+    ? `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}${url}`
+    : url;
 }
 
 // ─── Video frame constraint ──────────────────────────────────────────────────
@@ -130,9 +147,13 @@ export function VideoPlayer({
   overlay,
   className,
   initialStreamUrl,
+  initialStreamKind,
+  processingPercent,
 }: VideoPlayerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [streamUrl, setStreamUrl] = useState<string | null>(null);
+  // "failed": a processing version whose stream request failed (409/404: no
+  // playable original). Null while the stream is (re)fetched.
+  const [stream, setStream] = useState<PlayableStream | "failed" | null>(null);
   const [loop, setLoop] = useState(false);
 
   const { isDrawingMode, timeFormat, setTimeFormat, setPlayheadTime, currentVersion } =
@@ -211,19 +232,19 @@ export function VideoPlayer({
   }
 
   // Load the stream URL — reset immediately on asset OR version change so the old
-  // video doesn't keep playing while the new URL is being fetched.
+  // video doesn't keep playing while the new URL is being fetched. The version's
+  // status is a trigger too: a processing version plays a progressive preview of
+  // its original, and the same version once ready must refetch to get HLS.
   const versionId = currentVersion?.id;
+  const versionProcessing = currentVersion?.processing_status === "processing";
   useEffect(() => {
     // Guard against a superseded fetch: rapid version switching starts overlapping
     // requests, and without this a slower earlier response could land last and leave
     // the player on the wrong version's stream.
     let ignore = false;
-    setStreamUrl(null);
+    setStream(null);
     if (initialStreamUrl) {
-      const resolved = initialStreamUrl.startsWith("/")
-        ? `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}${initialStreamUrl}`
-        : initialStreamUrl;
-      setStreamUrl(resolved);
+      setStream({ url: absoluteStreamUrl(initialStreamUrl), kind: initialStreamKind });
       return;
     }
     // Pin the stream to the selected version — without version_id the API falls
@@ -233,24 +254,31 @@ export function VideoPlayer({
       ? `/assets/${assetId}/stream?version_id=${versionId}`
       : `/assets/${assetId}/stream`;
     api
-      .get<StreamUrlResponse>(streamPath)
+      .get<StreamResponse>(streamPath)
       .then((data) => {
         if (ignore) return;
-        // HLS proxy returns relative paths — prepend API URL
-        const url = data.url.startsWith("/")
-          ? `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}${data.url}`
-          : data.url;
-        setStreamUrl(url);
+        setStream({ url: absoluteStreamUrl(data.url), kind: data.kind });
       })
       .catch(() => {
-        /* stream URL errors handled by player error state */
+        // A processing version with nothing the browser can play falls back
+        // to the placeholder; other stream URL errors are left to the player.
+        if (!ignore && versionProcessing) setStream("failed");
       });
     return () => {
       ignore = true;
     };
-  }, [assetId, initialStreamUrl, versionId]);
+  }, [assetId, initialStreamUrl, initialStreamKind, versionId, versionProcessing]);
 
-  const player = useVideoPlayer(streamUrl);
+  const playable = stream === "failed" ? null : stream;
+  const streamUrl = playable?.url ?? null;
+  const isPreview = playable?.kind === "progressive";
+
+  const player = useVideoPlayer(streamUrl, { kind: playable?.kind });
+
+  // The original a preview plays may be a codec the browser cannot decode
+  // (ProRes, most HEVC). That is not an error worth showing: the version is
+  // still processing, so it gets the same placeholder as one with no preview.
+  const previewUnavailable = stream === "failed" || (isPreview && !!player.error);
 
   const {
     videoRef,
@@ -399,7 +427,7 @@ export function VideoPlayer({
         // away from the thumb. Keeping the media under the header puts the
         // leftover between the controls and the comment sheet, which is where
         // the sheet expands into anyway.
-        "flex flex-col h-full w-full",
+        "relative flex flex-col h-full w-full",
         isFullscreen && "fixed inset-0 z-50",
         className,
       )}
@@ -459,8 +487,9 @@ export function VideoPlayer({
           </div>
         )}
 
-        {/* Error state */}
-        {error && (
+        {/* Error state. Not for a preview: its media error falls back to the
+            processing placeholder below. */}
+        {error && !isPreview && (
           <div className="absolute inset-0 flex items-center justify-center bg-black/60">
             <p className="text-red-400 text-sm">{error}</p>
           </div>
@@ -472,6 +501,14 @@ export function VideoPlayer({
             {overlay}
           </VideoFrameConstraint>
         )}
+
+        {/* A processing version previewed from its original, not the HLS
+            ladder: say so, since quality and seeking can differ. */}
+        {isPreview && !previewUnavailable && (
+          <div className="absolute top-2.5 left-2.5 z-10 pointer-events-none rounded-full bg-black/60 backdrop-blur-sm px-2.5 py-1 text-[11px] font-medium text-white/90">
+            Preview — still processing
+          </div>
+        )}
       </div>
 
       {/* Progress bar */}
@@ -481,7 +518,8 @@ export function VideoPlayer({
           duration={duration}
           buffered={buffered}
           comments={comments}
-          streamUrl={streamUrl}
+          streamUrl={isPreview ? null : streamUrl}
+          streamKind={playable?.kind}
           onSeek={seek}
         />
       </div>
@@ -721,6 +759,13 @@ export function VideoPlayer({
           </button>
         </div>
       </div>
+      {/* A processing version that cannot be previewed: covers the whole
+          player, transport row included, since there is nothing to control. */}
+      {previewUnavailable && (
+        <div className="absolute inset-0 z-20 flex bg-bg-primary">
+          <ProcessingPlaceholder percent={processingPercent} />
+        </div>
+      )}
     </div>
   );
 }

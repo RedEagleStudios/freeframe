@@ -22,6 +22,7 @@ import type { SharePermission } from '@/types'
 import { fetchShareDownloadOptions, handleDownload } from './share-download'
 import { DownloadMenu } from '@/components/shared/download-menu'
 import { ShareBrandMark } from './share-brand-mark'
+import { ProcessingPlaceholder } from '@/components/review/processing-placeholder'
 
 /** Signed in, or a guest who has already given a name and email. */
 function hasIdentity(): boolean {
@@ -174,6 +175,11 @@ function ShareReviewInner({
 
   const canComment = permission === 'comment' || permission === 'approve'
   const versionReady = currentVersion?.processing_status === 'ready'
+  // A link to an asset with no ready version yet previews the newest one still
+  // processing, played from its original (the player shows the badge and falls
+  // back to the placeholder when the browser cannot decode it).
+  const videoPreview =
+    asset?.asset_type === 'video' && currentVersion?.processing_status === 'processing' && !!asset.stream_url
 
   // Guest identity flow for non-authenticated users
   const [guestIdentity, setGuestIdentity] = React.useState<{ name: string; email: string } | null>(null)
@@ -340,12 +346,13 @@ function ShareReviewInner({
           ref={mediaRootRef}
           className="flex-1 flex flex-col bg-bg-primary overflow-hidden min-w-0"
         >
-          {asset.asset_type === 'video' && versionReady && VideoPlayer ? (
+          {asset.asset_type === 'video' && (versionReady || videoPreview) && VideoPlayer ? (
             <VideoPlayer
               assetId={asset.id}
               comments={comments}
               className="flex-1"
-              initialStreamUrl={(asset as any).stream_url}
+              initialStreamUrl={asset.stream_url}
+              initialStreamKind={asset.stream_kind}
               overlay={
                 <>
                   {AnnotationOverlay && <AnnotationOverlay key={focusedCommentId ?? 'none'} />}
@@ -368,6 +375,11 @@ function ShareReviewInner({
                 }
               />
             </div>
+          ) : !currentVersion || currentVersion.processing_status === 'processing' ? (
+            // Nothing playable yet: the share stream answers 404 until the
+            // asset has a ready version or a previewable original. The
+            // provider keeps asking, so this turns into the player on its own.
+            <ProcessingPlaceholder />
           ) : (
             <div className="flex-1 flex items-center justify-center">
               <Loader2 className="h-8 w-8 animate-spin text-text-tertiary" />

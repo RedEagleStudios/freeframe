@@ -222,3 +222,29 @@ class DirectShareResponse(BaseModel):
     permission: SharePermission
     created_at: datetime
     model_config = {"from_attributes": True}
+
+
+class ShareEmbedImage(BaseModel):
+    """A stable, API-relative image URL for a link preview (redirects to storage)."""
+    url: str
+    width: Optional[int] = None
+    height: Optional[int] = None
+
+
+class ShareEmbedVideo(BaseModel):
+    """A stable, API-relative MP4 URL for a link preview (redirects to storage)."""
+    url: str
+    secure_url: str
+    type: str = "video/mp4"
+    width: Optional[int] = None
+    height: Optional[int] = None
+
+
+class ShareEmbedResponse(BaseModel):
+    """What a link preview (OpenGraph / Discord unfurl) of a share link may show."""
+    title: str
+    description: Optional[str] = None
+    site_name: str
+    asset_type: Optional[str] = None
+    image: Optional[ShareEmbedImage] = None
+    video: Optional[ShareEmbedVideo] = None

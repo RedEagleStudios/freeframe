@@ -32,6 +32,7 @@ def _media(fps=25.0, duration=60.0):
     m = MagicMock()
     m.fps = fps
     m.duration_seconds = duration
+    m.raw_deleted_at = None
     return m
 
 

@@ -27,6 +27,7 @@ def _media_file(**overrides):
         s3_key_thumbnail=None,
         original_filename="Hero Spot.mov",
         file_size_bytes=5_000_000_000,
+        raw_deleted_at=None,
     )
     fields.update(overrides)
     return SimpleNamespace(**fields)

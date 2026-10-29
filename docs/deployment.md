@@ -323,6 +323,19 @@ That call **replaces** the bucket's whole lifecycle configuration, so if the buc
 
 **MinIO and Silo** have no equivalent rule to set: `mc ilm rule add` has no option for it, and Silo's `mc ilm import` rejected a rule with `AbortIncompleteMultipartUpload` as not valid for its lifecycle schema. MinIO expires abandoned multipart uploads on its own, after about 24 hours, so there is nothing to configure there. On either, the API's own reaper (`STALE_UPLOAD_TIMEOUT_HOURS`) still reclaims the uploads it has a record of.
 
+#### Streaming projects — originals deleted after a retention period
+
+A project owner can turn on **Streaming project** under **Project settings > General**. It is meant for projects whose clips are shared and watched rather than reviewed and handed back as masters. In a streaming project:
+
+- Every video keeps a **web MP4** (`download.mp4`, the top rendition remuxed into one file) next to its HLS ladder, even with `TRANSCODER_DOWNLOAD_MP4=false`. Download serves that MP4. Versions transcoded without one get it built from their ladder (a `build_download_mp4` job on the transcoding queue) before anything is deleted.
+- The **uploaded original of each video version is deleted `STREAMING_ORIGINAL_RETENTION_DAYS` after the version became ready** (default 30; `0` switches the deletion off). The `delete_streaming_originals` task runs daily at 03:30 UTC on the maintenance queue. Images and audio are never touched.
+- **Deleted originals are gone for good.** Nothing can bring them back, turning streaming mode off only stops future deletions, and download menus stop offering "Original" for those versions. Do not use streaming mode for anything you may need the master of.
+- Review projects (streaming mode off, the default) are unaffected.
+
+**Bucket locks.** If the bucket has an object lock or retention rule on `raw/` (for example a Cloudflare R2 bucket lock rule), set `STREAMING_ORIGINAL_RETENTION_DAYS` to at least the lock period. Storage refuses to delete a locked original (R2 answers `409 ObjectLockedByBucketPolicy`); the task logs a warning, leaves the original recorded as present and tries again on the next run, so a shorter retention only means the originals go once the lock expires.
+
+Streaming projects are also what makes a share link **play inline in Discord** (and other OpenGraph link previews): the share page advertises the version's web MP4 as `og:video`, and only a version that has one gets a playable embed. In a review project with `TRANSCODER_DOWNLOAD_MP4=false` the preview is the thumbnail only. Link previews are shown for public, passwordless, enabled links to a single asset; password-protected and sign-in-required links show none. If the site is behind Cloudflare, make sure no WAF/bot rule blocks the `Discordbot` user agent on the web app and on `/share/*/embed.*` of the API, or Discord shows a bare link.
+
 ### External SMTP
 
 > **⚠️ Email is needed for sign-in codes and invites.** Without a mailer, invites and notifications are not delivered, and sign-in codes are switched off: with `EMAIL_CODE_LOGIN=auto` (the default) the login page offers only password sign-in (and [Sign in with Discord](#sign-in-with-discord), if configured) until `SMTP_HOST` is set or `MAIL_PROVIDER=ses`. Set `EMAIL_CODE_LOGIN=true` or `false` to force it either way. The app logs a warning at startup when email isn't configured.
