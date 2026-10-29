@@ -9,9 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Upgrade notes
 - **HTTPS is now a separate compose file, and nothing changes unless you add it.** If you set `DOMAIN` and `ACME_EMAIL` expecting Let's Encrypt certificates, they were never requested; add `-f docker-compose.https.yml` after `-f docker-compose.prod.yml` to get them (see "SSL / TLS Setup" in `docs/deployment.md`). It needs `DOMAIN` and `ACME_EMAIL` set, DNS pointing at the host, and ports 80 and 443 open, and it redirects plain HTTP to HTTPS. Also set `FRONTEND_URL=https://<DOMAIN>`. With self-hosted storage, serve the storage endpoint (`S3_PUBLIC_ENDPOINT`) over HTTPS too: the bucket CORS follows `FRONTEND_URL`, and browsers block `http://` storage from an `https://` page, so uploads and playback fail otherwise. If you do not add the file, `docker-compose.prod.yml` behaves exactly as before, including behind Cloudflare in "Full" mode or another proxy.
+- **One migration.** `7c2e9a4b1d60` changes `asset_versions.upload_id` from `VARCHAR(255)` to `TEXT`. Postgres makes this change in place, so it is quick on any size of table; the production compose runs it when the API starts.
 
 ### Fixed
 - **HTTPS certificates were never requested.** The production compose routes by path only, and Traefik takes the domain to request a certificate for from a host rule, so it logged `No domain parsed in provider ACME` and requested nothing, whatever `DOMAIN` and `ACME_EMAIL` were set to. The new opt-in `docker-compose.https.yml` adds host-based routers, so Traefik asks Let's Encrypt for `DOMAIN`, and redirects plain HTTP to HTTPS. The existing routers keep their rules.
+- **Uploads to Cloudflare R2 failed before a byte was sent.** R2's multipart upload ids are longer than 255 characters, and the column storing them was `VARCHAR(255)`, so every `/upload/initiate` on R2 answered 500 (`StringDataRightTruncation`). The column is now `TEXT`.
 
 ## [1.21.0] - 2026-10-24
 

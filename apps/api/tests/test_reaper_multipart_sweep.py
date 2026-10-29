@@ -61,6 +61,21 @@ def test_a_stale_version_has_its_own_upload_aborted(real_db, sweep):
     assert (key, "upload-abc") in aborted
 
 
+def test_an_upload_id_longer_than_255_characters_is_stored_and_aborted(real_db, sweep):
+    """R2's multipart ids run past 255 characters; VARCHAR(255) refused them, so
+    every upload to R2 failed at /upload/initiate before a byte was sent."""
+    ct, aborted, _ = sweep
+    long_id = "r2-" + "A" * 400
+    v, key = _seed(real_db, ProcessingStatus.uploading, 48, upload_id=long_id)
+
+    real_db.expire(v)
+    assert v.upload_id == long_id
+
+    ct._reap_stale_uploads(real_db)
+
+    assert (key, long_id) in aborted
+
+
 def test_an_upload_still_making_progress_is_not_aborted(real_db, sweep):
     """The regression that mattered: ageing by initiate time killed live uploads.
 
