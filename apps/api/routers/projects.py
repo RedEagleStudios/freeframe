@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from sqlalchemy.orm import Session
 from sqlalchemy import func
+from typing import Literal
 import uuid
 from datetime import datetime, timezone
 from ..database import get_db
@@ -8,7 +9,7 @@ from ..middleware.auth import get_current_user
 from ..models.user import User
 from ..models.project import Project, ProjectMember, ProjectRole
 from ..models.asset import Asset, AssetVersion, MediaFile, ProcessingStatus
-from ..schemas.project import ProjectCreate, ProjectUpdate, ProjectResponse, ProjectMemberResponse, AddProjectMemberRequest, UpdateProjectMemberRequest
+from ..schemas.project import ProjectCreate, ProjectUpdate, ProjectResponse, ProjectListItem, ProjectOwner, ProjectMemberResponse, AddProjectMemberRequest, UpdateProjectMemberRequest
 from ..tasks.email_tasks import send_project_added_email
 from ..tasks.celery_app import send_task_safe
 from ..services.s3_service import put_object, generate_presigned_get_url, delete_object
@@ -54,9 +55,18 @@ def create_project(body: ProjectCreate, db: Session = Depends(get_db), current_u
     db.refresh(project)
     return project
 
-@router.get("", response_model=list[ProjectResponse])
-def list_projects(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+@router.get("", response_model=list[ProjectListItem])
+def list_projects(
+    scope: Literal["mine", "all"] = "mine",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     from sqlalchemy import or_
+
+    # scope=all lets a superadmin see every live project, member or not, so an
+    # orphaned private project can be found and joined (POST /admin/projects/{id}/join).
+    if scope == "all" and not current_user.is_superadmin:
+        raise HTTPException(status_code=403, detail="Admin access required")
 
     # Get memberships for current user
     memberships = db.query(ProjectMember).filter(
@@ -66,15 +76,28 @@ def list_projects(db: Session = Depends(get_db), current_user: User = Depends(ge
     membership_map = {m.project_id: m.role for m in memberships}
     member_project_ids = list(membership_map.keys())
 
-    # Get projects: user's memberships + all public projects
-    projects = db.query(Project).filter(
-        Project.deleted_at.is_(None),
-        or_(
-            Project.id.in_(member_project_ids) if member_project_ids else False,
-            Project.is_public == True,
-        ),
-    ).all()
+    if scope == "all":
+        projects = db.query(Project).filter(Project.deleted_at.is_(None)).all()
+    else:
+        # Get projects: user's memberships + all public projects
+        projects = db.query(Project).filter(
+            Project.deleted_at.is_(None),
+            or_(
+                Project.id.in_(member_project_ids) if member_project_ids else False,
+                Project.is_public == True,
+            ),
+        ).all()
 
+    # Owner names and emails only go to a superadmin's all-projects view: in the
+    # normal list a public project would hand every signed-in user its owners' emails.
+    return build_project_list(db, projects, membership_map, include_owners=scope == "all")
+
+def build_project_list(
+    db: Session, projects: list[Project], membership_map: dict[uuid.UUID, ProjectRole],
+    *, include_owners: bool = False,
+) -> list[ProjectListItem]:
+    """List rows for ``projects`` with batched counts, storage and (on request) owners.
+    ``membership_map`` maps project id to the caller's role there."""
     all_project_ids = [p.id for p in projects]
     if not all_project_ids:
         return []
@@ -111,9 +134,32 @@ def list_projects(db: Session = Depends(get_db), current_user: User = Depends(ge
         .all()
     )
 
+    # Batch: live owners per project (live membership, live user)
+    owners_map: dict[uuid.UUID, list[ProjectOwner]] = {}
+    if include_owners:
+        owner_rows = (
+            db.query(ProjectMember.project_id, User.id, User.name, User.email)
+            .join(User, User.id == ProjectMember.user_id)
+            .filter(
+                ProjectMember.project_id.in_(all_project_ids),
+                ProjectMember.deleted_at.is_(None),
+                ProjectMember.role == ProjectRole.owner,
+                User.deleted_at.is_(None),
+            )
+            .order_by(ProjectMember.invited_at)
+            .all()
+        )
+        for pid, uid, name, email in owner_rows:
+            owners_map.setdefault(pid, []).append(ProjectOwner(id=uid, name=name, email=email))
+
     result = []
     for p in projects:
-        resp = ProjectResponse.model_validate(p)
+        # Validate the ORM row as a plain ProjectResponse first: `owners` is not a
+        # Project attribute and must not be read from it.
+        resp = ProjectListItem(
+            **ProjectResponse.model_validate(p).model_dump(),
+            owners=owners_map.get(p.id, []),
+        )
         resp.poster_url = _resolve_poster_url(p)
         resp.asset_count = asset_counts.get(p.id, 0)
         resp.storage_bytes = storage_map.get(p.id, 0)

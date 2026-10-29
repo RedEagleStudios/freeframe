@@ -101,6 +101,14 @@ export interface Project {
   storage_bytes?: number;
   member_count?: number;
   role?: string | null;
+  /** Live owners; sent by GET /projects. */
+  owners?: ProjectOwner[];
+}
+
+export interface ProjectOwner {
+  id: string;
+  name: string;
+  email: string;
 }
 
 export interface ProjectMember {

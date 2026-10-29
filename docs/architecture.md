@@ -176,9 +176,14 @@ Share Link (unauthenticated access, by token)
 └── view     ── read-only
 ```
 
-`User.is_superadmin` is a separate, instance-level flag covering user administration only:
+`User.is_superadmin` is a separate, instance-level flag covering user administration:
 invite, deactivate, role change, first-run setup. It grants **no** content access and is not
-consulted when resolving asset permissions.
+consulted when resolving asset permissions. A superadmin may list every live project
+(`GET /projects?scope=all`, with each project's owners) and join any of them as owner
+(`POST /admin/projects/{id}/join`), which is how a private project whose owners are gone is
+recovered. Joining adds (or revives, or upgrades) a real `ProjectMember` row with role `owner`,
+so the admin gets access through the ordinary member checks and appears in the project's People
+list; until they join, they have none.
 
 **Asset access** is resolved by `can_access_asset` in `apps/api/services/permissions.py`, which
 returns true on the first of these that matches:

@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import useSWR from "swr";
 import * as Dialog from "@radix-ui/react-dialog";
 import {
@@ -12,18 +12,22 @@ import {
   Users,
   Share2,
   Globe,
+  Lock,
 } from "lucide-react";
 import { cn, formatBytes } from "@/lib/utils";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { ProjectCard } from "@/components/projects/project-card";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { Segment, type SegmentOption } from "@/components/ui/setting-controls";
+import { ProjectCard, ownersLabel } from "@/components/projects/project-card";
 import { useProjectMenu } from "@/components/projects/menus/project-menu";
 import { ContextMenuArea } from "@/components/shared/item-menu";
 import { ProjectPoster } from "@/components/projects/project-poster";
 import { ProjectsAppearancePopover } from "@/components/projects/projects-appearance-popover";
 import { ProjectsSortPopover } from "@/components/projects/projects-sort-popover";
 import { EmptyState } from "@/components/shared/empty-state";
+import { useToast } from "@/components/shared/toast";
 import { useAuthStore } from "@/stores/auth-store";
 import { useProjectsViewStore } from "@/stores/projects-view-store";
 import type { ViewLayout, CardSize } from "@/stores/view-store";
@@ -48,10 +52,13 @@ function ProjectListRow({
   project,
   showRole,
   isOwner,
+  onJoin,
 }: {
   project: Project;
   showRole?: boolean;
   isOwner?: boolean;
+  /** As on ProjectCard: a project the viewer isn't in; clicking asks to join. */
+  onJoin?: () => void;
 }) {
   // The card's menu, on right-click: a list row has no ⋯ button.
   const { items: menuItems } = useProjectMenu(project, { isOwner });
@@ -71,6 +78,7 @@ function ProjectListRow({
     <ContextMenuArea items={menuItems}>
     <Link
       href={`/projects/${project.id}`}
+      onClick={onJoin ? (e) => { e.preventDefault(); onJoin(); } : undefined}
       className="flex items-center gap-4 px-4 py-3 hover:bg-bg-hover transition-colors border-b border-border last:border-b-0"
     >
       {/* The card's picture, so a project looks the same in both views. */}
@@ -82,9 +90,11 @@ function ProjectListRow({
           {project.name}
         </span>
         <span className="text-2xs text-text-tertiary">
-          {(project.asset_count ?? 0) > 0
-            ? `${project.asset_count} item${(project.asset_count ?? 0) !== 1 ? "s" : ""} · ${formatBytes(project.storage_bytes ?? 0)}`
-            : "No assets yet"}
+          {onJoin
+            ? ownersLabel(project)
+            : (project.asset_count ?? 0) > 0
+              ? `${project.asset_count} item${(project.asset_count ?? 0) !== 1 ? "s" : ""} · ${formatBytes(project.storage_bytes ?? 0)}`
+              : "No assets yet"}
         </span>
       </div>
       <div className="hidden sm:flex items-center gap-1.5 text-xs text-text-tertiary">
@@ -98,7 +108,11 @@ function ProjectListRow({
           year: "numeric",
         })}
       </span>
-      {showRole && (
+      {onJoin ? (
+        <span className="hidden sm:inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium w-fit bg-bg-tertiary text-text-tertiary">
+          Not a member
+        </span>
+      ) : showRole && (
         <span
           className={cn(
             "hidden sm:inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium w-fit",
@@ -132,6 +146,7 @@ function ProjectSection({
   showNewButton,
   showRole,
   userId,
+  onJoin,
 }: {
   title: string;
   icon?: React.ReactNode;
@@ -144,6 +159,8 @@ function ProjectSection({
   showNewButton?: boolean;
   showRole?: boolean;
   userId?: string;
+  /** Offered for each project the viewer isn't a member of. */
+  onJoin?: (project: Project) => void;
 }) {
   if (projects.length === 0 && !showNewButton) {
     return null;
@@ -185,6 +202,7 @@ function ProjectSection({
               showRole={showRole}
               isOwner={!!userId && project.created_by === userId}
               showInfo={showCardInfo}
+              onJoin={onJoin && !project.role ? () => onJoin(project) : undefined}
             />
           ))}
           {showNewButton && onNewProject && (
@@ -209,6 +227,7 @@ function ProjectSection({
               project={project}
               showRole={showRole}
               isOwner={!!userId && project.created_by === userId}
+              onJoin={onJoin && !project.role ? () => onJoin(project) : undefined}
             />
           ))}
           {showNewButton && onNewProject && (
@@ -228,10 +247,32 @@ function ProjectSection({
   );
 }
 
+type ProjectScope = "mine" | "all";
+
+const scopeOptions: SegmentOption<ProjectScope>[] = [
+  { value: "mine", label: "My projects" },
+  { value: "all", label: "All projects" },
+];
+
+// useSearchParams needs a Suspense boundary for the static build.
 export default function ProjectsPage() {
+  return (
+    <React.Suspense fallback={null}>
+      <ProjectsPageContent />
+    </React.Suspense>
+  );
+}
+
+function ProjectsPageContent() {
   usePageTitle("Projects");
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const toast = useToast();
   const { user } = useAuthStore();
+  const isSuperAdmin = !!user?.is_superadmin;
+  // Superadmins may list every project (?scope=all) and join any as owner.
+  const scope: ProjectScope =
+    isSuperAdmin && searchParams.get("scope") === "all" ? "all" : "mine";
   const {
     layout: viewMode,
     cardSize,
@@ -252,11 +293,15 @@ export default function ProjectsPage() {
     project_type: "personal",
   });
 
+  const [joinTarget, setJoinTarget] = React.useState<Project | null>(null);
+  const [joinError, setJoinError] = React.useState<string | null>(null);
+
+  const projectsKey = scope === "all" ? "/projects?scope=all" : "/projects";
   const {
     data: projects,
     isLoading,
     mutate,
-  } = useSWR<Project[]>("/projects", () => api.get<Project[]>("/projects"));
+  } = useSWR<Project[]>(projectsKey, () => api.get<Project[]>(projectsKey));
 
   const sortedProjects = React.useMemo(
     () => sortProjects(projects ?? [], sortKey, sortDirection),
@@ -273,13 +318,36 @@ export default function ProjectsPage() {
     [sortedProjects, user?.id],
   );
 
-  const publicProjects = React.useMemo(
+  // Projects the user isn't in: the public ones, or in All projects every one.
+  const otherProjects = React.useMemo(
     () =>
       sortedProjects.filter(
-        (p) => p.is_public && p.created_by !== user?.id && !p.role,
+        (p) =>
+          (scope === "all" || p.is_public) &&
+          p.created_by !== user?.id &&
+          !p.role,
       ),
-    [sortedProjects, user?.id],
+    [sortedProjects, user?.id, scope],
   );
+
+  const openJoin = scope === "all"
+    ? (project: Project) => {
+        setJoinError(null);
+        setJoinTarget(project);
+      }
+    : undefined;
+
+  const handleJoin = async () => {
+    if (!joinTarget) return;
+    try {
+      await api.post<Project>(`/admin/projects/${joinTarget.id}/join`);
+    } catch (err) {
+      setJoinError(err instanceof Error ? err.message : "Failed to join project");
+      throw err;
+    }
+    toast.success(`You joined ${joinTarget.name} as owner`);
+    router.push(`/projects/${joinTarget.id}`);
+  };
 
   const resetForm = () => {
     setForm({ name: "", description: "", project_type: "personal" });
@@ -341,6 +409,22 @@ export default function ProjectsPage() {
           <ProjectsAppearancePopover />
           <div className="h-4 w-px bg-border mx-0.5" />
           <ProjectsSortPopover />
+          {isSuperAdmin && (
+            <>
+              <div className="h-4 w-px bg-border mx-0.5" />
+              <Segment<ProjectScope>
+                label="Which projects"
+                options={scopeOptions}
+                value={scope}
+                onChange={(next) =>
+                  router.replace(
+                    next === "all" ? "/projects?scope=all" : "/projects",
+                    { scroll: false },
+                  )
+                }
+              />
+            </>
+          )}
         </div>
 
         <div className="ml-auto flex items-center gap-2">
@@ -478,6 +562,7 @@ export default function ProjectsPage() {
             onNewProject={() => setDialogOpen(true)}
             showNewButton
             userId={user?.id}
+            onJoin={openJoin}
           />
           {sharedProjects.length > 0 && (
             <ProjectSection
@@ -492,20 +577,39 @@ export default function ProjectsPage() {
               userId={user?.id}
             />
           )}
-          {publicProjects.length > 0 && (
+          {otherProjects.length > 0 && (
             <ProjectSection
-              title="Public Projects"
-              icon={<Globe className="h-4 w-4 text-text-tertiary" />}
-              projects={publicProjects}
+              title={scope === "all" ? "Other Projects" : "Public Projects"}
+              icon={
+                scope === "all" ? (
+                  <Lock className="h-4 w-4 text-text-tertiary" />
+                ) : (
+                  <Globe className="h-4 w-4 text-text-tertiary" />
+                )
+              }
+              projects={otherProjects}
               viewMode={viewMode}
               cardSize={cardSize}
               showCardInfo={showCardInfo}
               emptyMessage=""
               userId={user?.id}
+              onJoin={openJoin}
             />
           )}
         </div>
       )}
+
+      <ConfirmDialog
+        open={joinTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setJoinTarget(null);
+        }}
+        title={`Join ${joinTarget?.name ?? ""} as owner?`}
+        description="You'll appear in its People list."
+        confirmLabel="Join as owner"
+        error={joinError}
+        onConfirm={handleJoin}
+      />
     </div>
   );
 }

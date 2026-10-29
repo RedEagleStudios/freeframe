@@ -9,12 +9,25 @@ import { ProjectPoster } from './project-poster'
 import { useProjectMenu } from './menus/project-menu'
 import type { Project } from '@/types'
 
+/** "Owner: Ana" / "Owners: Ana, Ben" / "No owner", for a project the viewer isn't in. */
+export function ownersLabel(project: Project): string {
+  const names = (project.owners ?? []).map((o) => o.name)
+  if (names.length === 0) return 'No owner'
+  return `${names.length === 1 ? 'Owner' : 'Owners'}: ${names.join(', ')}`
+}
+
 interface ProjectCardProps {
   project: Project
   showRole?: boolean
   isOwner?: boolean
   /** Show the info row under the poster. */
   showInfo?: boolean
+  /**
+   * Set for a project the viewer isn't a member of (a superadmin's All
+   * projects view): the card shows its owners and clicking it asks to join
+   * instead of opening it.
+   */
+  onJoin?: () => void
   className?: string
 }
 
@@ -23,6 +36,7 @@ export function ProjectCard({
   showRole,
   isOwner,
   showInfo = true,
+  onJoin,
   className,
 }: ProjectCardProps) {
   const assetCount = project.asset_count ?? 0
@@ -34,6 +48,7 @@ export function ProjectCard({
       <div className={cn('group relative', className)}>
         <Link
           href={`/projects/${project.id}`}
+          onClick={onJoin ? (e) => { e.preventDefault(); onJoin() } : undefined}
           className="block rounded-xl overflow-hidden bg-bg-secondary border border-border hover:border-accent/40 transition-all duration-200 hover:shadow-lg hover:shadow-black/10"
         >
           {/* Square poster area */}
@@ -68,17 +83,28 @@ export function ProjectCard({
                   {project.role}
                 </span>
               )}
+              {onJoin && (
+                <span className="inline-flex items-center rounded-full bg-black/30 backdrop-blur-sm px-2 py-0.5 text-[10px] font-medium text-white/90">
+                  Not a member
+                </span>
+              )}
             </div>
           </div>
 
           {/* Footer */}
           {showInfo && (
             <div className="flex items-center justify-between px-3 py-2.5">
-              <span className="text-2xs text-text-tertiary">
-                {assetCount > 0
-                  ? `${assetCount} item${assetCount !== 1 ? 's' : ''} · ${formatBytes(project.storage_bytes ?? 0)}`
-                  : `Updated ${formatRelativeTime(project.created_at)}`}
-              </span>
+              {onJoin ? (
+                <span className="text-2xs text-text-tertiary truncate" title={ownersLabel(project)}>
+                  {ownersLabel(project)}
+                </span>
+              ) : (
+                <span className="text-2xs text-text-tertiary">
+                  {assetCount > 0
+                    ? `${assetCount} item${assetCount !== 1 ? 's' : ''} · ${formatBytes(project.storage_bytes ?? 0)}`
+                    : `Updated ${formatRelativeTime(project.created_at)}`}
+                </span>
+              )}
             </div>
           )}
         </Link>

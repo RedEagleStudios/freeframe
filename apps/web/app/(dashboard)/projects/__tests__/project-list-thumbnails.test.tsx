@@ -11,7 +11,11 @@ const { viewState, projects } = vi.hoisted(() => ({
   projects: [] as Project[],
 }))
 
-vi.mock('next/navigation', () => ({ useRouter: () => ({ push: vi.fn() }) }))
+vi.mock('next/navigation', () => ({
+  useRouter: () => ({ push: vi.fn(), replace: vi.fn() }),
+  useSearchParams: () => new URLSearchParams(),
+}))
+vi.mock('@/components/shared/toast', () => ({ useToast: () => ({ success: vi.fn(), error: vi.fn() }) }))
 vi.mock('swr', () => ({ default: () => ({ data: projects, isLoading: false, mutate: vi.fn() }) }))
 vi.mock('@/lib/api', () => ({ api: { get: vi.fn(), post: vi.fn(), delete: vi.fn() } }))
 vi.mock('@/hooks/use-page-title', () => ({ usePageTitle: () => undefined }))

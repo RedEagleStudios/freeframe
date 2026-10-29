@@ -28,6 +28,16 @@ class ProjectResponse(BaseModel):
     role: ProjectRole | None = None
     model_config = {"from_attributes": True}
 
+class ProjectOwner(BaseModel):
+    id: uuid.UUID
+    name: str
+    email: str
+
+class ProjectListItem(ProjectResponse):
+    """A ``GET /projects`` row: the project plus its live owners, so a superadmin
+    browsing every project can tell whose it is."""
+    owners: list[ProjectOwner] = []
+
 class ProjectMemberResponse(BaseModel):
     id: uuid.UUID
     project_id: uuid.UUID

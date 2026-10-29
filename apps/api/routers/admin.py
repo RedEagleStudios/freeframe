@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 import secrets
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 import uuid
@@ -11,9 +12,12 @@ import uuid
 from ..database import get_db
 from ..middleware.auth import get_current_user
 from ..models.instance_auth_settings import InstanceAuthSettings
+from ..models.project import Project, ProjectMember, ProjectRole
 from ..models.user import User, UserStatus
 from ..schemas.auth import UserResponse, AdminUserResponse, UpdateUserRoleRequest
+from ..schemas.project import ProjectResponse
 from .users import require_admin
+from .projects import build_project_list
 from ..tasks.celery_app import send_task_safe
 from ..tasks.cleanup_tasks import cleanup_soft_deleted
 from ..schemas.admin import PurgeStartResponse
@@ -149,6 +153,49 @@ def purge_now(current_user: User = Depends(require_admin)):
         status="started",
         detail="Retention garbage collection is running in the background; see worker logs for reclaimed counts.",
     )
+
+
+# ── Project access ─────────────────────────────────────────────────────────────
+
+@router.post("/projects/{project_id}/join", response_model=ProjectResponse)
+def join_project_as_owner(
+    project_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Make the calling superadmin an owner of any live project.
+
+    Access comes from a real ProjectMember row rather than a permission bypass,
+    so every existing check applies unchanged and the admin is listed in the
+    project's People list. An existing live membership is upgraded in place, a
+    soft-deleted one is revived as a fresh membership.
+    """
+    project = db.query(Project).filter(Project.id == project_id, Project.deleted_at.is_(None)).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    member = db.query(ProjectMember).filter(
+        ProjectMember.project_id == project_id,
+        ProjectMember.user_id == current_user.id,
+    ).first()
+    if member is None:
+        db.add(ProjectMember(
+            project_id=project_id, user_id=current_user.id,
+            role=ProjectRole.owner, invited_by=current_user.id,
+        ))
+    elif member.deleted_at is not None:
+        # Same revival as POST /projects/{id}/members: a new membership for the
+        # member list's joined date and inviter.
+        member.deleted_at = None
+        member.role = ProjectRole.owner
+        member.invited_by = current_user.id
+        member.invited_at = func.now()
+    else:
+        member.role = ProjectRole.owner
+    db.commit()
+    db.refresh(project)
+
+    return build_project_list(db, [project], {project.id: ProjectRole.owner}, include_owners=True)[0]
 
 
 # ── Sign in with Discord ───────────────────────────────────────────────────────
