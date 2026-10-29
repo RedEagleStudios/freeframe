@@ -325,6 +325,26 @@ AWS_MAIL_REGION=us-east-1
 
 ---
 
+## Sign in with Discord
+
+FreeFrame can offer **Continue with Discord** on the login page. It is off until you configure it.
+
+1. In the [Discord Developer Portal](https://discord.com/developers/applications), create an application (or open an existing one) and go to **OAuth2**.
+2. Copy the **Client ID**, and reset and copy the **Client Secret**.
+3. Under **Redirects**, add the redirect URI shown in FreeFrame's **Sign in with Discord** card (**Settings > Admin > Instance settings**). For a standard install it is `https://<your-domain>/api/auth/discord/callback` (the origin of `FRONTEND_URL`, even on a sub-path install, because the API stays at `/api`). Set `DISCORD_OAUTH_REDIRECT_URI` only if the API is reached somewhere else; in the dev stack, where the browser calls the API directly, that is `http://localhost:8000/auth/discord/callback`.
+4. In that card, enter the Client ID and Client secret and turn it on. You can set the same values with `DISCORD_LOGIN_ENABLED`, `DISCORD_CLIENT_ID` and `DISCORD_CLIENT_SECRET` instead; a value saved in the app wins over its variable, and clearing it there falls back to the variable.
+
+Who can sign in depends on whether a **Server ID** is set:
+
+- **No server ID:** Discord only signs in people who already have a FreeFrame account, or a pending invite, under the email address verified on their Discord account. Signing in this way accepts a pending invite. Nobody else gets an account; they see "No FreeFrame account uses this Discord email."
+- **Server ID set** (`DISCORD_SERVER_ID`, the ID of your Discord server; turn on Developer Mode in Discord, then right-click the server and Copy Server ID): only members of that server can sign in, checked on every sign-in, so someone who leaves the server can no longer use Discord to get in. **A member without a FreeFrame account gets one on their first sign-in** (a regular member, never an admin), named after their server nickname or Discord display name. Add **Allowed role IDs** (`DISCORD_SERVER_ROLES`, comma-separated) to require at least one of those roles as well.
+
+The Discord account's email must be verified on Discord. A deactivated FreeFrame account cannot sign in with Discord.
+
+The client secret is stored in the database encrypted, with a key derived from `JWT_SECRET`, and the admin settings never show it again. **Changing `JWT_SECRET` makes the stored secret unreadable**: Discord sign-in then reports itself as not configured until you enter the secret again (a secret set with `DISCORD_CLIENT_SECRET` is not affected).
+
+---
+
 ## Configuration Reference
 
 All environment variables are documented in [`.env.example`](../.env.example). Key settings:
@@ -343,6 +363,9 @@ All environment variables are documented in [`.env.example`](../.env.example). K
 | `FRONTEND_URL` | Your FreeFrame URL (with https://) | (required) |
 | `DOMAIN` | Your domain; required with `docker-compose.https.yml`, which requests the certificate | (optional) |
 | `ACME_EMAIL` | Email for Let's Encrypt notifications; required with `docker-compose.https.yml` | (optional) |
+| `DISCORD_LOGIN_ENABLED`, `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET` | Sign in with Discord, as a fallback for the values saved under Settings > Admin > Instance settings (see [Sign in with Discord](#sign-in-with-discord)) | (empty = off) |
+| `DISCORD_SERVER_ID`, `DISCORD_SERVER_ROLES` | Restrict Discord sign-in to members of one server (with one of these role IDs); members without an account get one on first sign-in | (empty) |
+| `DISCORD_OAUTH_REDIRECT_URI` | Redirect URI registered on the Discord application | `<FRONTEND_URL origin>/api/auth/discord/callback` |
 | `MAIL_PROVIDER` | `smtp` or `ses` | `smtp` |
 | `API_WORKERS` | Gunicorn worker processes | `4` |
 | `TRANSCODING_CONCURRENCY` | Parallel transcoding jobs | `2` |

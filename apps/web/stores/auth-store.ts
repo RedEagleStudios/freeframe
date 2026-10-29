@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 import { User } from '@/types'
 import { api } from '@/lib/api'
-import { clearTokens } from '@/lib/auth'
+import { clearTokens, setTokens } from '@/lib/auth'
 
 interface AuthState {
   user: User | null
@@ -59,3 +59,12 @@ export const useAuthStore = create<AuthState>()((set) => ({
     }
   },
 }))
+
+/**
+ * Finishes any sign-in that ended with a token pair (password, magic code,
+ * Discord): stores the tokens and loads the signed-in user into the store.
+ */
+export async function completeSignIn(tokens: { access_token: string; refresh_token: string }): Promise<void> {
+  setTokens(tokens.access_token, tokens.refresh_token)
+  await useAuthStore.getState().fetchUser()
+}

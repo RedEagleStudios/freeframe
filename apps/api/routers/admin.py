@@ -4,17 +4,23 @@ from datetime import datetime, timedelta, timezone
 import secrets
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 import uuid
 
 from ..database import get_db
 from ..middleware.auth import get_current_user
+from ..models.instance_auth_settings import InstanceAuthSettings
 from ..models.user import User, UserStatus
 from ..schemas.auth import UserResponse, AdminUserResponse, UpdateUserRoleRequest
 from .users import require_admin
 from ..tasks.celery_app import send_task_safe
 from ..tasks.cleanup_tasks import cleanup_soft_deleted
 from ..schemas.admin import PurgeStartResponse
+from ..schemas.discord_auth import DiscordAuthSettingsResponse, DiscordAuthSettingsUpdate
+from ..config import settings
+from ..services import discord_oauth
+from ..services.instance_secrets import encrypt_secret
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -143,3 +149,84 @@ def purge_now(current_user: User = Depends(require_admin)):
         status="started",
         detail="Retention garbage collection is running in the background; see worker logs for reclaimed counts.",
     )
+
+
+# ── Sign in with Discord ───────────────────────────────────────────────────────
+
+# Fixed sentinel PK: instance_auth_settings is a singleton, so concurrent
+# first-time creates collide on it instead of making two rows.
+_AUTH_SETTINGS_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+
+
+def _discord_settings_response(row: InstanceAuthSettings | None) -> DiscordAuthSettingsResponse:
+    config = discord_oauth.resolve_discord_config(row)
+    return DiscordAuthSettingsResponse(
+        enabled=config.enabled,
+        client_id=config.client_id,
+        client_secret_set=bool(config.client_secret),
+        server_id=config.server_id,
+        allowed_role_ids=config.allowed_role_ids,
+        redirect_uri=discord_oauth.discord_redirect_uri(),
+        configured_via=config.configured_via,
+    )
+
+
+def _get_or_create_auth_settings(db: Session) -> InstanceAuthSettings:
+    row = discord_oauth.get_auth_settings_row(db)
+    if row:
+        return row
+    # A new row starts from the env toggle, so saving only a client id does
+    # not silently switch off a DISCORD_LOGIN_ENABLED=true instance.
+    row = InstanceAuthSettings(id=_AUTH_SETTINGS_ID, discord_enabled=settings.discord_login_enabled)
+    db.add(row)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        return discord_oauth.get_auth_settings_row(db)
+    return row
+
+
+@router.get("/auth/discord", response_model=DiscordAuthSettingsResponse)
+def get_discord_auth_settings(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Superadmin only. The client secret is never returned, only whether one is set."""
+    return _discord_settings_response(discord_oauth.get_auth_settings_row(db))
+
+
+@router.put("/auth/discord", response_model=DiscordAuthSettingsResponse)
+def update_discord_auth_settings(
+    body: DiscordAuthSettingsUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Superadmin only. Omitted fields are unchanged; an empty or null value
+    clears the saved value (its DISCORD_* env var then applies again)."""
+    row = _get_or_create_auth_settings(db)
+    fields = body.model_fields_set
+    if "enabled" in fields and body.enabled is not None:
+        row.discord_enabled = body.enabled
+    if "client_id" in fields:
+        row.discord_client_id = (body.client_id or "").strip() or None
+    if "client_secret" in fields:
+        secret = (body.client_secret or "").strip()
+        row.discord_client_secret_encrypted = encrypt_secret(secret) if secret else None
+    if "server_id" in fields:
+        row.discord_server_id = body.server_id
+    if "allowed_role_ids" in fields:
+        row.discord_allowed_role_ids = body.allowed_role_ids or None
+
+    config = discord_oauth.resolve_discord_config(row)
+    problem = None
+    if config.enabled and not (config.client_id and config.client_secret):
+        problem = "Discord sign-in needs a client ID and a client secret before it can be enabled."
+    elif config.allowed_role_ids and not config.server_id:
+        problem = "Allowed roles need a Discord server ID."
+    if problem:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=problem)
+    db.commit()
+    db.refresh(row)
+    return _discord_settings_response(row)

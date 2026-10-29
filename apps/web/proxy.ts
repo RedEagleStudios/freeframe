@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { withBasePath } from './lib/base-path'
 
-const PUBLIC_ROUTES = ['/login', '/setup']
+const PUBLIC_ROUTES = ['/login', '/setup', '/auth/discord/callback']
 const PUBLIC_PREFIXES = ['/invite/', '/share/']
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'

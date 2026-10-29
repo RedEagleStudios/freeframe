@@ -4,8 +4,9 @@ import { useState, useRef, useEffect, KeyboardEvent, ClipboardEvent } from 'reac
 import { useRouter } from 'next/navigation'
 import { api, ApiError } from '@/lib/api'
 import { setTokens } from '@/lib/auth'
-import { useAuthStore } from '@/stores/auth-store'
+import { completeSignIn } from '@/stores/auth-store'
 import { useBranding } from '@/components/shared/branding-provider'
+import { DiscordSignInButton } from '@/components/auth/discord-sign-in-button'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { cn } from '@/lib/utils'
@@ -13,7 +14,14 @@ import type { VerifyCodeResponse, AuthTokens } from '@/types'
 
 type Step = 'email' | 'code' | 'password' | 'classic'
 
-export function LoginForm() {
+interface LoginFormProps {
+  /** Where "Continue with Discord" leads; no button when absent. */
+  discordHref?: string | null
+  /** A message the page arrived with (e.g. a Discord `?error=` code), shown as the form error. */
+  notice?: string | null
+}
+
+export function LoginForm({ discordHref, notice }: LoginFormProps = {}) {
   const router = useRouter()
   const { defaultLoginMode } = useBranding()
   const initialStep: Step = defaultLoginMode === 'password' ? 'classic' : 'email'
@@ -47,6 +55,12 @@ export function LoginForm() {
       codeRefs.current[0]?.focus()
     }
   }, [step])
+
+  useEffect(() => {
+    if (!notice) return
+    setGeneralError(notice)
+    setClassicError(notice)
+  }, [notice])
 
   // ─── Step 1: Send magic code ──────────────────────────────────────────────
 
@@ -137,9 +151,7 @@ export function LoginForm() {
         setTokens(res.access_token, res.refresh_token)
         setStep('password')
       } else {
-        setTokens(res.access_token, res.refresh_token)
-        await useAuthStore.getState().fetchUser()
-        const user = useAuthStore.getState().user
+        await completeSignIn(res)
         router.replace('/projects')
       }
     } catch (err) {
@@ -192,9 +204,7 @@ export function LoginForm() {
         code: code.join(''),
         password,
       })
-      setTokens(res.access_token, res.refresh_token)
-      await useAuthStore.getState().fetchUser()
-      const u = useAuthStore.getState().user
+      await completeSignIn(res)
       router.replace('/projects')
     } catch (err) {
       if (err instanceof ApiError) {
@@ -228,9 +238,7 @@ export function LoginForm() {
         email: classicEmail,
         password: classicPassword,
       })
-      setTokens(res.access_token, res.refresh_token)
-      await useAuthStore.getState().fetchUser()
-      const u = useAuthStore.getState().user
+      await completeSignIn(res)
       router.replace('/projects')
     } catch (err) {
       if (err instanceof ApiError) {
@@ -282,6 +290,8 @@ export function LoginForm() {
             Sign in
           </Button>
         </form>
+
+        {discordHref && <DiscordSignInButton href={discordHref} className="mt-4" />}
 
         <div className="mt-6 text-center">
           <button
@@ -441,6 +451,8 @@ export function LoginForm() {
           Send magic code
         </Button>
       </form>
+
+      {discordHref && <DiscordSignInButton href={discordHref} className="mt-4" />}
 
       <div className="mt-6 text-center">
         <button

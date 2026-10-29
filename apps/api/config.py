@@ -148,6 +148,19 @@ class Settings(BaseSettings):
     smtp_password: str | None = None
     smtp_use_tls: bool = True
 
+    # Sign in with Discord. These are the fallback for the values an admin saves
+    # under Settings > Admin > Instance settings; a value saved there wins. The redirect URI
+    # defaults to <FRONTEND_URL origin>/api/auth/discord/callback.
+    discord_login_enabled: bool = False
+    discord_client_id: str | None = None
+    discord_client_secret: str | None = None
+    # Server (guild) ID: only its members may sign in, and a member with no
+    # FreeFrame account gets one on first sign-in. Roles: comma-separated role
+    # IDs, one of which the member must hold (needs a server ID).
+    discord_server_id: str | None = None
+    discord_server_roles: str | None = None
+    discord_oauth_redirect_uri: str | None = None
+
     @field_validator("s3_storage_class")
     @classmethod
     def _check_s3_storage_class(cls, value: str | None) -> str | None:

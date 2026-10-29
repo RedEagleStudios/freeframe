@@ -17,6 +17,7 @@ import { useRouter } from "next/navigation";
 import type { User, UserStatus } from "@/types";
 import { InstanceSettingsTab } from "@/components/settings/instance-settings-tab";
 import { BrandingTab } from "@/components/settings/branding-tab";
+import { DiscordAuthSettings } from "@/components/settings/discord-auth-settings";
 
 // The API requires a name and the dialog doesn't ask for one, so each invitee
 // is listed under the local part of their address until they accept the invite
@@ -370,6 +371,7 @@ export default function AdminPage() {
       </div>
 
       {tab === "instance" && <InstanceSettingsTab />}
+      {tab === "instance" && <DiscordAuthSettings />}
       {tab === "branding" && <BrandingTab />}
 
       {/* User management */}
