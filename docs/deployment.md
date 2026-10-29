@@ -611,6 +611,26 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
 
 Database migrations run automatically on API startup. Always check the [CHANGELOG](../CHANGELOG.md) before updating.
 
+### Automatic deploys (GitHub Actions)
+
+A fork can deploy itself on every push. In this repository the `Deploy` workflow (`.github/workflows/deploy.yml`) runs after `CI` completes on the `re-main` branch, and only when CI succeeded on a push (not a pull request). It connects to the server over SSH and runs the deploy script; a failed build or an API/web container that does not come up healthy fails the run. Afterwards it fetches `$DEPLOY_URL/api/health` and `$DEPLOY_URL/login`.
+
+The deploy script, [`deploy/vps-deploy.sh`](../deploy/vps-deploy.sh), takes a lock so deploys run one at a time, resets the checkout in `/opt/freeframe` to `origin/re-main`, builds the images before restarting anything, runs `up -d --remove-orphans`, waits for the `api` and `web` health checks, and prunes old images. It logs to `/var/log/freeframe-deploy.log`. `APP_DIR`, `DEPLOY_BRANCH`, `COMPOSE_FILES` and `HEALTH_URL` override its defaults.
+
+Set it up once:
+
+1. Install the script on the server:
+   ```bash
+   install -m 755 deploy/vps-deploy.sh /usr/local/sbin/freeframe-deploy
+   ```
+2. Create a key pair for CI (`ssh-keygen -t ed25519 -N '' -f deploy_key`) and add the public key to the deploying user's `~/.ssh/authorized_keys` as a **forced command**, so the key can start a deploy and nothing else, whatever the client asks to run:
+   ```
+   command="/usr/local/sbin/freeframe-deploy",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty ssh-ed25519 AAAA... freeframe-ci-deploy
+   ```
+3. Add the repository secrets `DEPLOY_HOST` (the server's address), `DEPLOY_SSH_KEY` (the private key) and `DEPLOY_KNOWN_HOSTS` (the output of `ssh-keyscan <host>`, which pins the server's host key), and the repository variable `DEPLOY_URL` (the public base URL, e.g. `https://review.example.com`). Then delete the local copy of the private key.
+
+The job runs in the `production` environment, so protection rules added to that environment (required reviewers, for example) apply to it. To redeploy without a new commit, run the workflow by hand: **Actions > Deploy > Run workflow**, or `gh workflow run deploy.yml`. It always deploys the current `origin/re-main`.
+
 ### Upgrading past the maintenance-queue fix ([#240](https://github.com/Techiebutler/freeframe/issues/240))
 
 Before this fix, no worker consumed the `default` queue, so the retention GC,

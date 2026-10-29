@@ -1,0 +1,61 @@
+name: Deploy
+
+# Deploys re-main to the VPS after CI passes on it (or on demand).
+# The SSH key in DEPLOY_SSH_KEY is restricted on the server to a forced command
+# (/usr/local/sbin/freeframe-deploy, from deploy/vps-deploy.sh): it can trigger a
+# deploy of origin/re-main and nothing else, whatever this workflow sends.
+#
+# Secrets: DEPLOY_HOST (ip or name), DEPLOY_SSH_KEY (private key),
+#          DEPLOY_KNOWN_HOSTS (the server's `ssh-keyscan` line, pins its host key).
+# Variable: DEPLOY_URL (public base URL, checked after the deploy).
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [re-main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to VPS
+    # Only a successful CI run of a push to re-main (not a pull request), or a manual run.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 30
+    steps:
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      - name: Deploy
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes -o BatchMode=yes \
+            -o ServerAliveInterval=30 "root@$DEPLOY_HOST" deploy
+
+      - name: Check the public site
+        if: vars.DEPLOY_URL != ''
+        run: |
+          curl -fsS --retry 5 --retry-delay 5 --max-time 15 -A "freeframe-deploy-check" \
+            "${{ vars.DEPLOY_URL }}/api/health"
+          echo
+          curl -fsS --max-time 15 -o /dev/null -A "freeframe-deploy-check" "${{ vars.DEPLOY_URL }}/login"
