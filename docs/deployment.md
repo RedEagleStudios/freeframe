@@ -92,11 +92,11 @@ FreeFrame is now running on **port 80**. The first user to sign up becomes the s
 
 ## SSL / TLS Setup
 
-FreeFrame uses **Traefik** as its reverse proxy, which can automatically provision and renew **Let's Encrypt** SSL certificates with zero manual setup.
+FreeFrame uses **Traefik** as its reverse proxy. HTTPS with **Let's Encrypt** certificates is opt-in: add `docker-compose.https.yml` to the command. `docker-compose.prod.yml` on its own serves plain HTTP on port 80 and never requests a certificate, even if `DOMAIN` and `ACME_EMAIL` are set.
 
 ### Enabling SSL
 
-Set these two variables in your `.env.prod`:
+Set these variables in your `.env.prod`:
 
 ```
 DOMAIN=your-domain.com
@@ -104,22 +104,27 @@ ACME_EMAIL=admin@your-domain.com
 FRONTEND_URL=https://your-domain.com
 ```
 
-Then start (or restart) the services:
+Then start (or restart) the services with both compose files:
 
 ```bash
-docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
+docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.https.yml up -d --build
 ```
 
-That's it. Traefik will:
-- Automatically obtain SSL certificates from Let's Encrypt
+Use the same two `-f` flags for every later `docker compose` command (`ps`, `logs`, `down`). Traefik will:
+- Request an SSL certificate from Let's Encrypt for `DOMAIN`
 - Serve your site over HTTPS on port 443
-- Auto-renew certificates before they expire
+- Redirect plain HTTP on port 80 to HTTPS
+- Auto-renew the certificate before it expires
+
+`docker compose` refuses to start if `DOMAIN` or `ACME_EMAIL` is empty when the HTTPS file is used.
+
+With the HTTPS file, every plain-HTTP request is redirected to HTTPS, so opening the server by its IP address or another hostname lands on HTTPS with a certificate warning. Use the domain.
 
 > **Requirements:** Your domain's DNS A record must point to your server, and ports 80 + 443 must be open. Traefik needs port 80 for the ACME HTTP challenge even when serving HTTPS.
 
 ### Without SSL (HTTP only)
 
-If you don't set `DOMAIN` and `ACME_EMAIL`, FreeFrame runs on **HTTP port 80** only. This is fine for:
+Use `docker-compose.prod.yml` alone, the command at the top of this guide. FreeFrame then runs on **HTTP port 80** only, whatever `DOMAIN` and `ACME_EMAIL` are set to. This is fine for:
 - Local testing of the production build
 - Running behind an external reverse proxy that handles SSL
 
@@ -127,7 +132,7 @@ If you don't set `DOMAIN` and `ACME_EMAIL`, FreeFrame runs on **HTTP port 80** o
 
 If FreeFrame sits behind another proxy that already handles SSL:
 
-1. Don't set `DOMAIN` / `ACME_EMAIL` — let Traefik run in HTTP mode
+1. Use `docker-compose.prod.yml` alone, without `docker-compose.https.yml`, so Traefik runs in HTTP mode
 2. Point your external proxy to FreeFrame's port 80
 3. Ensure the proxy forwards these headers: `X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`
 4. For **Cloudflare**: set SSL mode to "Full"
@@ -336,8 +341,8 @@ All environment variables are documented in [`.env.example`](../.env.example). K
 | `CORS_ALLOW_ORIGINS` | Extra browser origins, comma-separated, allowed by the API and (non-AWS) the bucket | (empty) |
 | `JWT_SECRET` | Auth token signing key | (required, generate with `openssl rand -hex 64`) |
 | `FRONTEND_URL` | Your FreeFrame URL (with https://) | (required) |
-| `DOMAIN` | Your domain for auto SSL | (optional) |
-| `ACME_EMAIL` | Email for Let's Encrypt notifications | (optional) |
+| `DOMAIN` | Your domain; required with `docker-compose.https.yml`, which requests the certificate | (optional) |
+| `ACME_EMAIL` | Email for Let's Encrypt notifications; required with `docker-compose.https.yml` | (optional) |
 | `MAIL_PROVIDER` | `smtp` or `ses` | `smtp` |
 | `API_WORKERS` | Gunicorn worker processes | `4` |
 | `TRANSCODING_CONCURRENCY` | Parallel transcoding jobs | `2` |
@@ -659,10 +664,11 @@ docker compose --env-file .env.prod -f docker-compose.prod.yml run --rm api sh -
 
 ### SSL certificate not working
 
+- Verify you started with `-f docker-compose.prod.yml -f docker-compose.https.yml`; the base file alone never requests a certificate
 - Verify `DOMAIN` and `ACME_EMAIL` are set in `.env.prod`
 - Check that DNS A record points to your server: `dig your-domain.com`
 - Ensure ports 80 and 443 are open: `sudo ufw allow 80,443/tcp`
-- Check Traefik logs: `docker compose --env-file .env.prod -f docker-compose.prod.yml logs traefik`
+- Check Traefik logs: `docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.https.yml logs traefik`
 - Let's Encrypt has rate limits — if you hit them, wait an hour and retry
 
 ### S3 connection issues

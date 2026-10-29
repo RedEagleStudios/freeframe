@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade notes
+- **HTTPS is now a separate compose file, and nothing changes unless you add it.** If you set `DOMAIN` and `ACME_EMAIL` expecting Let's Encrypt certificates, they were never requested; add `-f docker-compose.https.yml` after `-f docker-compose.prod.yml` to get them (see "SSL / TLS Setup" in `docs/deployment.md`). It needs `DOMAIN` and `ACME_EMAIL` set, DNS pointing at the host, and ports 80 and 443 open, and it redirects plain HTTP to HTTPS. Also set `FRONTEND_URL=https://<DOMAIN>`. With self-hosted storage, serve the storage endpoint (`S3_PUBLIC_ENDPOINT`) over HTTPS too: the bucket CORS follows `FRONTEND_URL`, and browsers block `http://` storage from an `https://` page, so uploads and playback fail otherwise. If you do not add the file, `docker-compose.prod.yml` behaves exactly as before, including behind Cloudflare in "Full" mode or another proxy.
+
+### Fixed
+- **HTTPS certificates were never requested.** The production compose routes by path only, and Traefik takes the domain to request a certificate for from a host rule, so it logged `No domain parsed in provider ACME` and requested nothing, whatever `DOMAIN` and `ACME_EMAIL` were set to. The new opt-in `docker-compose.https.yml` adds host-based routers, so Traefik asks Let's Encrypt for `DOMAIN`, and redirects plain HTTP to HTTPS. The existing routers keep their rules.
+
 ## [1.21.0] - 2026-10-24
 
 Folder uploads and a project settings page. Drop a folder, or choose Upload folder, and its files upload with the folder tree recreated; a project's owner now edits its details, members and share page branding on one settings page, and every kind of share link shows the project's logo, colour and footer. The web app moves to Next.js 16 and React 19, leaving the Next.js 14 line, which no longer gets security fixes (see Security). This release also adds settings for the S3 storage class and the audio bitrate of review streams, transcodes portrait video at its own size, and carries fixes to uploads, compare, invites, sign-in and production logging.

@@ -137,7 +137,8 @@ git clone -b stable https://github.com/Techiebutler/freeframe.git
 cd freeframe
 cp .env.example .env.prod
 # Edit .env.prod — set your credentials, S3, email config
-# For SSL: also set DOMAIN and ACME_EMAIL (Traefik auto-provisions Let's Encrypt certs)
+# For SSL: also set DOMAIN and ACME_EMAIL, and add -f docker-compose.https.yml below
+# (Traefik then requests a Let's Encrypt certificate; see docs/deployment.md)
 docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
 ```
 
@@ -189,7 +190,7 @@ For the full guide including **SSL setup**, **bring-your-own infrastructure** (e
 | Queue        | Celery + Redis                                    |
 | Transcoding  | FFmpeg (multi-bitrate HLS)                        |
 | Storage      | Any S3-compatible (AWS, R2, B2, Garage, Silo)    |
-| Proxy        | Traefik (auto SSL via Let's Encrypt)              |
+| Proxy        | Traefik (opt-in Let's Encrypt SSL)                |
 | Auth         | JWT + magic code email login                      |
 
 ## Documentation

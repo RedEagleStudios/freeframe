@@ -323,3 +323,19 @@ jobs:
           # Validate compose file syntax (skip env file resolution)
           python3 -c "import yaml; yaml.safe_load(open('docker-compose.dev.yml'))" && echo "Dev compose YAML is valid"
           python3 -c "import yaml; yaml.safe_load(open('docker-compose.prod.yml'))" && echo "Prod compose YAML is valid"
+          python3 -c "import yaml; yaml.safe_load(open('docker-compose.https.yml'))" && echo "HTTPS compose YAML is valid"
+
+      - name: Verify the HTTPS compose override merges and needs DOMAIN
+        run: |
+          cp .env.example .env.prod
+          https() { docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.https.yml "$@"; }
+          DOMAIN=review.example.com ACME_EMAIL=ops@example.com https config -q
+          echo "HTTPS override merges with the prod compose"
+          # An empty DOMAIN has to fail loudly; without it the router would
+          # match Host(``) and no certificate would be requested.
+          if err=$(DOMAIN='' ACME_EMAIL=ops@example.com https config -q 2>&1); then
+            echo "::error::an empty DOMAIN was accepted by docker-compose.https.yml"
+            exit 1
+          fi
+          echo "$err" | grep -q DOMAIN || { echo "::error::the error does not name DOMAIN: $err"; exit 1; }
+          echo "an empty DOMAIN is refused and named"
