@@ -1085,6 +1085,17 @@ def rotation_unreadable(stream: dict) -> bool:
                for value in values)
 
 
+def display_size(meta: VideoMetadata, stream: dict) -> tuple[Optional[int], Optional[int]]:
+    """(width, height) as a player shows the video: the probed storage size,
+    swapped for a quarter-turn display rotation, so a phone clip recorded on
+    its side is portrait. None for a side the probe did not establish. This is
+    what is persisted; the ladder keeps working from the storage size."""
+    width, height = meta.width or None, meta.height or None
+    if width and height and round(display_rotation(stream)) % 180 == 90:
+        width, height = height, width
+    return width, height
+
+
 def is_display_transformed(stream: dict) -> bool:
     """Whether ffmpeg will turn this stream's frames before the filter graph.
 
@@ -2023,6 +2034,38 @@ class FFmpegTranscoder(BaseTranscoder):
         # Simplified waveform: just return peak data (full waveform extraction is complex)
         return {"samples": [], "peak": 1.0, "source": s3_key}
 
+    def _report_early_meta(
+        self, job: TranscodeJob, input_url: str, work_dir: Path, meta: VideoMetadata,
+        stream: dict, is_hdr: bool, dv_software: bool,
+    ) -> None:
+        """Make and upload the poster frame, then hand it and the probed size to
+        `job.early_meta_cb`. Best-effort throughout: nothing here may fail the
+        transcode, which goes on to make the same frame again at its end."""
+        width, height = display_size(meta, stream)
+        thumbnail_key = None
+        try:
+            early_thumb = work_dir / "early_thumb.jpg"
+            self._run([
+                "ffmpeg", "-y", "-i", input_url,
+                "-vf", _thumbnail_filter(is_hdr, dv_software), "-q:v", "2", "-frames:v", "1",
+                str(early_thumb),
+            ], timeout=300, label="ffmpeg")
+            if early_thumb.exists():
+                key = f"{job.output_s3_prefix}/thumbnail.jpg"
+                self.s3.upload_file(
+                    str(early_thumb), self.bucket, key,
+                    ExtraArgs=self._extra_args("image/jpeg", "max-age=86400"),
+                )
+                thumbnail_key = key
+        except Exception as e:
+            print(f"[transcoder] early thumbnail for {job.input_s3_key} failed: "
+                  f"{redact_presigned_urls(str(e))}", flush=True)
+        try:
+            job.early_meta_cb(width, height, meta.duration_seconds or None, thumbnail_key)
+        except Exception as e:
+            print(f"[transcoder] early metadata callback for {job.input_s3_key} failed: "
+                  f"{redact_presigned_urls(str(e))}", flush=True)
+
     async def transcode(self, job: TranscodeJob) -> TranscodeResult:
         """
         Transcode video using streaming input from S3.
@@ -2074,6 +2117,11 @@ class FFmpegTranscoder(BaseTranscoder):
             # A display matrix, which ffmpeg applies to system-memory frames
             # only; see _MEMORY_DECODE_HWACCEL.
             turned = is_display_transformed(_vid_stream)
+
+            # 1b. The poster frame and size, now rather than hours from now, so
+            # a version can be shown (and unfurled) while it encodes.
+            if job.early_meta_cb is not None:
+                self._report_early_meta(job, input_url, work_dir, meta, _vid_stream, is_hdr, dv_software)
 
             # 2. Check if input has an audio stream
             audio_cmd = [
@@ -2697,14 +2745,15 @@ class FFmpegTranscoder(BaseTranscoder):
                 )
                 uploaded_thumb = True
 
+            width, height = display_size(meta, _vid_stream)
             return TranscodeResult(
                 success=True,
                 hls_prefix=job.output_s3_prefix,
                 mp4_key=mp4_key,
                 thumbnail_keys=[thumbnail_key] if uploaded_thumb else [],
                 duration_seconds=(meta.duration_seconds or None) if meta else None,
-                width=(meta.width or None) if meta else None,
-                height=(meta.height or None) if meta else None,
+                width=width,
+                height=height,
                 fps=(meta.fps or None) if meta else None,
             )
 
