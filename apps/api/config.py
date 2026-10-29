@@ -78,6 +78,11 @@ class Settings(BaseSettings):
     # frontend + localhost defaults). Set to "*" to allow any origin — handy for
     # testing on a LAN via a machine's IP; do not use "*" in production.
     cors_allow_origins: str = ""
+    # Request header that carries the visitor's IP when FreeFrame sits behind a
+    # CDN, e.g. "cf-connecting-ip" behind Cloudflare. Empty = X-Real-Ip from
+    # Traefik, else the socket peer. Only set it when the origin accepts
+    # connections from that CDN alone: any other client can send the header.
+    client_ip_header: str = ""
     transcoder_engine: str = "ffmpeg"
     # Which rungs of the quality ladder to build, comma-separated. Valid names
     # are the keys of packages.transcoder.ffmpeg_transcoder.QUALITY_MAP; the

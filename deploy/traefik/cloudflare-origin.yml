@@ -1,0 +1,12 @@
+# Traefik dynamic config for docker-compose.cloudflare.yml: serve the Cloudflare
+# Origin CA certificate on :443 so Cloudflare can run in "Full (strict)" mode.
+# The files come from CLOUDFLARE_ORIGIN_CERT_DIR, mounted at /certs.
+tls:
+  options:
+    default:
+      minVersion: VersionTLS12
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /certs/origin.pem
+        keyFile: /certs/origin.key

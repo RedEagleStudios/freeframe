@@ -1,0 +1,17 @@
+# Re-applies deploy/cloudflare-firewall.sh at boot and whenever Docker restarts.
+# Install: copy the script to /usr/local/sbin/freeframe-cloudflare-firewall,
+# this unit to /etc/systemd/system/, then
+#   systemctl daemon-reload && systemctl enable --now freeframe-cloudflare-firewall
+[Unit]
+Description=FreeFrame: allow ports 80/443 from Cloudflare only
+After=docker.service network-online.target
+Wants=network-online.target
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/freeframe-cloudflare-firewall
+
+[Install]
+WantedBy=multi-user.target docker.service

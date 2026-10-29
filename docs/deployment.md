@@ -128,15 +128,47 @@ Use `docker-compose.prod.yml` alone, the command at the top of this guide. FreeF
 - Local testing of the production build
 - Running behind an external reverse proxy that handles SSL
 
-### Behind an External Reverse Proxy (Cloudflare, Caddy, etc.)
+### Behind an External Reverse Proxy (Caddy, nginx, etc.)
 
 If FreeFrame sits behind another proxy that already handles SSL:
 
 1. Use `docker-compose.prod.yml` alone, without `docker-compose.https.yml`, so Traefik runs in HTTP mode
 2. Point your external proxy to FreeFrame's port 80
 3. Ensure the proxy forwards these headers: `X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`
-4. For **Cloudflare**: set SSL mode to "Full"
-5. Set `FRONTEND_URL` in `.env.prod` to your `https://` URL
+4. Set `FRONTEND_URL` in `.env.prod` to your `https://` URL
+
+### Behind Cloudflare (proxied, orange cloud)
+
+Cloudflare terminates the visitor's TLS and connects to the server on port 443. `docker-compose.cloudflare.yml` makes Traefik present a **Cloudflare Origin CA certificate** there, so the zone can use SSL mode **Full (strict)**. Use it *instead of* `docker-compose.https.yml`: Let's Encrypt's HTTP challenge does not get through the proxy.
+
+1. **Certificate.** Create a private key and CSR on the server, outside the repository:
+   ```bash
+   install -d -m 700 /opt/freeframe-certs && cd /opt/freeframe-certs
+   openssl req -new -newkey rsa:2048 -nodes -keyout origin.key -subj "/CN=review.example.com" -out origin.csr
+   chmod 600 origin.key
+   ```
+   In Cloudflare go to **SSL/TLS > Origin Server > Create Certificate**, choose *Use my private key and CSR*, paste `origin.csr`, and list your FreeFrame hostname. Save the certificate as `/opt/freeframe-certs/origin.pem`. The private key never leaves the server.
+2. **`.env.prod`:**
+   ```bash
+   FRONTEND_URL=https://review.example.com
+   CLOUDFLARE_ORIGIN_CERT_DIR=/opt/freeframe-certs
+   CLIENT_IP_HEADER=cf-connecting-ip
+   ```
+   Behind the proxy every request reaches Traefik from a Cloudflare edge address, so without `CLIENT_IP_HEADER` the per-IP rate limits (sign-in, share links) would count many visitors as one.
+3. **Start:**
+   ```bash
+   docker compose --env-file .env.prod -f docker-compose.prod.yml -f docker-compose.cloudflare.yml up -d
+   ```
+4. **Close the origin to everyone but Cloudflare.** Otherwise anyone can skip Cloudflare by using the server's IP, and send their own `CF-Connecting-IP`. Docker publishes ports past `ufw`, so the rules go in Docker's `DOCKER-USER` chain:
+   ```bash
+   install -m 755 deploy/cloudflare-firewall.sh /usr/local/sbin/freeframe-cloudflare-firewall
+   install -m 644 deploy/systemd/freeframe-cloudflare-firewall.service /etc/systemd/system/
+   systemctl daemon-reload && systemctl enable --now freeframe-cloudflare-firewall
+   ```
+   It reapplies at boot and whenever Docker restarts, refreshing Cloudflare's published ranges each time (and keeping the last list if that fetch fails). Only ports 80 and 443 are affected.
+5. **Cloudflare:** set SSL/TLS mode to **Full (strict)**. To leave other hostnames in the zone alone, do it with a Configuration Rule for this hostname only.
+
+Uploads and playback go straight between the browser and your S3 storage, so Cloudflare's 100 MB request-body limit does not apply to them.
 
 ### Sub-path Deployments
 

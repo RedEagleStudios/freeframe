@@ -10,6 +10,7 @@ This limits to 5 requests per 60 seconds per IP for "action".
 
 from fastapi import HTTPException, Request, status
 from ..services.redis_service import check_rate_limit
+from .client_ip import client_ip
 
 
 def rate_limit(action: str, max_requests: int, window_seconds: int):
@@ -23,9 +24,7 @@ def rate_limit(action: str, max_requests: int, window_seconds: int):
     """
 
     def _dependency(request: Request):
-        # Use X-Real-Ip (set by trusted reverse proxy like Traefik) or fall back to ASGI client IP
-        # Do NOT use X-Forwarded-For as it can be spoofed by the client
-        ip = request.headers.get("x-real-ip") or (request.client.host if request.client else "unknown")
+        ip = client_ip(request)
 
         allowed, retry_after = check_rate_limit(ip, action, max_requests, window_seconds)
         if not allowed:

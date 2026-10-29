@@ -245,3 +245,53 @@ class TestShortCircuitResponsesCarryCors:
 
         assert resp.status_code == 200
         assert resp.headers.get("access-control-allow-origin") == self.ORIGIN
+
+
+class TestClientIpBehindACdn:
+    """Behind Cloudflare, Traefik's X-Real-Ip is Cloudflare's edge, shared by many visitors."""
+
+    @staticmethod
+    def _request(headers: dict, peer: str = "172.71.0.9"):
+        from starlette.requests import Request
+        return Request({
+            "type": "http",
+            "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+            "client": (peer, 443),
+        })
+
+    def test_configured_header_wins_over_x_real_ip(self, monkeypatch):
+        from apps.api.config import settings
+        from apps.api.middleware.client_ip import client_ip
+        monkeypatch.setattr(settings, "client_ip_header", "cf-connecting-ip")
+
+        req = self._request({"x-real-ip": "172.71.0.9", "CF-Connecting-IP": "203.0.113.7"})
+
+        assert client_ip(req) == "203.0.113.7"
+
+    def test_configured_header_missing_falls_back_to_x_real_ip(self, monkeypatch):
+        from apps.api.config import settings
+        from apps.api.middleware.client_ip import client_ip
+        monkeypatch.setattr(settings, "client_ip_header", "cf-connecting-ip")
+
+        assert client_ip(self._request({"x-real-ip": "198.51.100.4"})) == "198.51.100.4"
+
+    def test_header_is_ignored_unless_configured(self, monkeypatch):
+        """Without the setting a client could pick its own bucket by sending the header."""
+        from apps.api.config import settings
+        from apps.api.middleware.client_ip import client_ip
+        monkeypatch.setattr(settings, "client_ip_header", "")
+
+        req = self._request({"x-real-ip": "198.51.100.4", "cf-connecting-ip": "203.0.113.7"})
+
+        assert client_ip(req) == "198.51.100.4"
+
+    @patch("apps.api.middleware.rate_limit.check_rate_limit")
+    def test_route_limits_key_on_the_visitor_not_the_edge(self, mock_check, monkeypatch):
+        from apps.api.config import settings
+        from apps.api.middleware.rate_limit import rate_limit
+        monkeypatch.setattr(settings, "client_ip_header", "cf-connecting-ip")
+        mock_check.return_value = (True, 0)
+
+        rate_limit("login", 10, 600)(self._request({"x-real-ip": "172.71.0.9", "cf-connecting-ip": "203.0.113.7"}))
+
+        mock_check.assert_called_once_with("203.0.113.7", "login", 10, 600)

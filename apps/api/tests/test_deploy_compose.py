@@ -148,3 +148,23 @@ def test_base_prod_file_unchanged():
         "NEXT_PUBLIC_API_URL": "/api",
         "NEXT_PUBLIC_BASE_PATH": "${NEXT_PUBLIC_BASE_PATH:-}",
     }
+
+
+CLOUDFLARE_COMPOSE = REPO_ROOT / "docker-compose.cloudflare.yml"
+
+
+def test_cloudflare_file_keeps_every_base_traefik_flag():
+    """Compose replaces `command` whole, so a flag added to the base file and not
+    repeated here would silently vanish for anyone behind Cloudflare."""
+    base = _services(PROD_COMPOSE)["traefik"]["command"]
+    over = _services(CLOUDFLARE_COMPOSE)["traefik"]["command"]
+    assert [f for f in base if f not in over] == []
+    assert "--providers.file.filename=/etc/traefik/dynamic/cloudflare-origin.yml" in over
+
+
+def test_cloudflare_file_serves_the_mounted_origin_certificate():
+    volumes = _services(CLOUDFLARE_COMPOSE)["traefik"]["volumes"]
+    assert any(v.endswith(":/certs:ro") for v in volumes)
+    dynamic = yaml.safe_load((REPO_ROOT / "deploy/traefik/cloudflare-origin.yml").read_text())
+    default = dynamic["tls"]["stores"]["default"]["defaultCertificate"]
+    assert default == {"certFile": "/certs/origin.pem", "keyFile": "/certs/origin.key"}
