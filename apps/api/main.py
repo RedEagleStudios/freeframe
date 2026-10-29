@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .config import settings
-from .routers import auth, auth_discord, users, projects, upload, events, assets, me, comments, approvals, share, metadata, branding, instance_branding, notifications, admin, setup, folders, hls_proxy, instance_settings
+from .routers import auth, auth_discord, users, projects, project_join_links, upload, events, assets, me, comments, approvals, share, metadata, branding, instance_branding, notifications, admin, setup, folders, hls_proxy, instance_settings
 from .services.s3_service import run_startup_bucket_setup
 from .services.email_service import mail_is_configured
 from .middleware.global_rate_limit import GlobalRateLimitMiddleware
@@ -109,6 +109,7 @@ app.include_router(auth.router)
 app.include_router(auth_discord.router)
 app.include_router(users.router)
 app.include_router(projects.router)
+app.include_router(project_join_links.router)
 app.include_router(upload.router)
 app.include_router(events.router)
 app.include_router(assets.router)

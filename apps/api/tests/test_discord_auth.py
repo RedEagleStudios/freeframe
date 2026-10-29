@@ -84,8 +84,10 @@ def server_configured(no_env):
         yield row
 
 
-def _user(status=UserStatus.active, email_verified=True, invite_token=None, invite_expires=None):
+def _user(status=UserStatus.active, email_verified=True, invite_token=None, invite_expires=None,
+          discord_gate_exempt=False):
     u = MagicMock()
+    u.discord_gate_exempt = discord_gate_exempt
     u.id = uuid.uuid4()
     u.email = "person@example.com"
     u.name = "Admin Given Name"
@@ -106,8 +108,10 @@ def _profile(**over):
     return p
 
 
-def _start(client, from_path=None):
+def _start(client, from_path=None, join=None):
     params = {"from": from_path} if from_path is not None else {}
+    if join is not None:
+        params["join"] = join
     resp = client.get("/auth/discord/start", params=params, follow_redirects=False)
     assert resp.status_code == 302
     state = parse_qs(urlparse(resp.headers["location"]).query)["state"][0]
@@ -612,3 +616,196 @@ def test_rotated_jwt_secret_reads_as_unset(no_env, monkeypatch):
     monkeypatch.setattr(settings, "jwt_secret", "rotated-secret")
     config = discord_oauth.resolve_discord_config(row)
     assert config.client_secret is None and config.usable is False
+
+
+# ── project join links ────────────────────────────────────────────────────────
+
+from apps.api.models.project import Project, ProjectJoinLink, ProjectMember, ProjectRole  # noqa: E402
+from apps.api.services import project_join_links as join_links  # noqa: E402
+
+JOIN_TOKEN = "join-token-abc"
+
+
+@pytest.fixture
+def join_link(mock_db):
+    """A valid editor link for JOIN_TOKEN. Lookups see its current state, so a
+    test can spend, revoke or expire it between start and callback; the claim
+    (`UPDATE ... WHERE used_at IS NULL`) answers 1 unless a test says otherwise."""
+    creator = uuid.uuid4()
+    project = Project(id=uuid.uuid4(), name="Launch film", created_by=creator)
+    link = ProjectJoinLink(
+        id=uuid.uuid4(), project_id=project.id, token_hash=join_links.hash_token(JOIN_TOKEN),
+        role=ProjectRole.editor, created_by=creator,
+    )
+
+    def fake_find(db, token):
+        if token != JOIN_TOKEN:
+            return None, None, "not_found"
+        reason = join_links._invalid_reason(link, datetime.now(timezone.utc))
+        if reason:
+            return None, project, reason
+        return join_links.ValidLink(link=link, project=project), project, None
+
+    mock_db.with_for_update.return_value = mock_db
+    mock_db.update.return_value = 1
+    with patch("apps.api.services.project_join_links.find_link", side_effect=fake_find):
+        yield link
+
+
+def _added(mock_db, kind):
+    return [c.args[0] for c in mock_db.add.call_args_list if isinstance(c.args[0], kind)]
+
+
+def test_start_stores_a_valid_join_token_in_the_flow(client, server_configured, fake_redis, join_link):
+    resp, state = _start(client, "/ignored", join=JOIN_TOKEN)
+    q = parse_qs(urlparse(resp.headers["location"]).query)
+    assert q["scope"] == ["identify email guilds.members.read"]
+    assert discord_oauth.consume_flow(state) == {"from": "/ignored", "join": JOIN_TOKEN}
+
+
+@pytest.mark.parametrize("spoil", ["revoked", "expired", "used", "unknown"])
+def test_start_refuses_an_unusable_join_link(client, server_configured, fake_redis, join_link, spoil):
+    now = datetime.now(timezone.utc)
+    token = JOIN_TOKEN
+    if spoil == "revoked":
+        join_link.revoked_at = now
+    elif spoil == "expired":
+        join_link.expires_at = now - timedelta(seconds=1)
+    elif spoil == "used":
+        join_link.used_at, join_link.used_by = now, uuid.uuid4()
+    else:
+        token = "someone-elses"
+    resp = client.get("/auth/discord/start", params={"join": token}, follow_redirects=False)
+    assert _error_of(resp) == "join_link_invalid"
+    assert fake_redis.store == {}
+
+
+def test_outsider_with_link_gets_exempt_account_and_membership(client, server_configured, fake_redis, mock_db, join_link):
+    _, state = _start(client, join=JOIN_TOKEN)
+    # Not in the server at all: the link lets them in.
+    resp, _, _ = _callback(client, state, None, profile=_profile(email="Out.Sider@Example.com"), member=None)
+    ticket = _ticket_from(resp)
+
+    [created] = _added(mock_db, User)
+    assert created.email == "out.sider@example.com"
+    assert created.discord_gate_exempt is True
+    assert created.status == UserStatus.active and created.email_verified is True
+    assert created.is_superadmin is False
+    assert created.name == "Pat Global"
+    [membership] = _added(mock_db, ProjectMember)
+    assert membership.project_id == join_link.project_id
+    assert membership.user_id == created.id
+    assert membership.role == ProjectRole.editor
+    assert membership.invited_by == join_link.created_by
+    # The link was claimed by its one conditional UPDATE, for this user.
+    values = mock_db.update.call_args.args[0]
+    assert values[ProjectJoinLink.used_by] == created.id
+    assert discord_oauth.consume_ticket(ticket) == {
+        "user_id": str(created.id), "from": f"/projects/{join_link.project_id}",
+    }
+
+
+def test_newcomer_with_link_gets_account_without_a_server_configured(client, configured, fake_redis, mock_db, join_link):
+    _, state = _start(client, join=JOIN_TOKEN)
+    _ticket_from(_callback(client, state, None)[0])
+    [created] = _added(mock_db, User)
+    # No server check exists to be exempt from.
+    assert created.discord_gate_exempt is False
+    assert len(_added(mock_db, ProjectMember)) == 1
+
+
+def test_server_member_with_allowed_role_joining_by_link_stays_bound_by_the_check(
+    client, server_configured, fake_redis, mock_db, join_link,
+):
+    # They would have got in anyway, so losing the role later must still lock them out.
+    _, state = _start(client, join=JOIN_TOKEN)
+    _ticket_from(_callback(client, state, None, member={"roles": [ROLE_OK]})[0])
+    [created] = _added(mock_db, User)
+    assert created.discord_gate_exempt is False
+    assert len(_added(mock_db, ProjectMember)) == 1
+
+
+@pytest.mark.parametrize("spoil", ["revoked", "expired", "used"])
+def test_link_spoiled_between_start_and_callback_refused(client, server_configured, fake_redis, mock_db, join_link, spoil):
+    _, state = _start(client, join=JOIN_TOKEN)
+    now = datetime.now(timezone.utc)
+    if spoil == "revoked":
+        join_link.revoked_at = now
+    elif spoil == "expired":
+        join_link.expires_at = now - timedelta(seconds=1)
+    else:
+        # Someone else used it first.
+        join_link.used_at, join_link.used_by = now, uuid.uuid4()
+    resp, ex, _ = _callback(client, state, None, member=None)
+    assert _error_of(resp) == "join_link_invalid"
+    ex.assert_not_called()
+    mock_db.add.assert_not_called()
+
+
+def test_link_claimed_by_someone_else_at_the_last_moment_refused(client, server_configured, fake_redis, mock_db, join_link):
+    """The conditional UPDATE matched nothing: the account it was about to make is rolled back."""
+    mock_db.update.return_value = 0
+    _, state = _start(client, join=JOIN_TOKEN)
+    resp, _, _ = _callback(client, state, None, member=None)
+    assert _error_of(resp) == "join_link_invalid"
+    mock_db.rollback.assert_called()
+    mock_db.commit.assert_not_called()
+    assert not any(k.startswith(discord_oauth.TICKET_PREFIX) for k in fake_redis.store)
+
+
+def test_exempt_account_signs_in_later_without_link(client, no_env, fake_redis, mock_db):
+    with _use_row(_row(server_id=SERVER, roles=[ROLE_OK])):
+        _, state = _start(client, "/projects")
+        resp, _, _ = _callback(client, state, _user(discord_gate_exempt=True), member=None)
+    assert discord_oauth.consume_ticket(_ticket_from(resp))["from"] == "/projects"
+    mock_db.add.assert_not_called()
+
+
+@pytest.mark.parametrize("member, error", [
+    (None, "discord_not_in_server"),
+    ({"roles": [ROLE_OTHER]}, "discord_missing_role"),
+])
+def test_regular_member_who_lost_access_still_refused(client, no_env, fake_redis, member, error):
+    with _use_row(_row(server_id=SERVER, roles=[ROLE_OK])):
+        _, state = _start(client)
+        resp, _, _ = _callback(client, state, _user(discord_gate_exempt=False), member=member)
+    assert _error_of(resp) == error
+
+
+def test_deactivated_exempt_account_refused(client, server_configured, fake_redis):
+    _, state = _start(client)
+    resp, _, _ = _callback(
+        client, state, _user(status=UserStatus.deactivated, discord_gate_exempt=True), member={"roles": []},
+    )
+    assert _error_of(resp) == "discord_account_disabled"
+
+
+def test_deactivated_user_with_link_refused_and_link_kept(client, server_configured, fake_redis, mock_db, join_link):
+    _, state = _start(client, join=JOIN_TOKEN)
+    resp, _, _ = _callback(client, state, _user(status=UserStatus.deactivated), member=None)
+    assert _error_of(resp) == "discord_account_disabled"
+    mock_db.update.assert_not_called()
+
+
+def test_existing_member_with_higher_role_keeps_it_and_link_unspent(client, server_configured, fake_redis, mock_db, join_link):
+    user = _user()
+    owner_row = ProjectMember(project_id=join_link.project_id, user_id=user.id, role=ProjectRole.owner)
+    mock_db.first.return_value = owner_row
+    _, state = _start(client, join=JOIN_TOKEN)
+    resp, _, _ = _callback(client, state, user, member=None)
+    ticket = _ticket_from(resp)
+    assert owner_row.role == ProjectRole.owner
+    mock_db.update.assert_not_called()
+    mock_db.add.assert_not_called()
+    # An existing account's exemption is never changed by a link.
+    assert user.discord_gate_exempt is False
+    assert discord_oauth.consume_ticket(ticket)["from"] == f"/projects/{join_link.project_id}"
+
+
+def test_existing_account_with_link_joins_without_becoming_exempt(client, server_configured, fake_redis, mock_db, join_link):
+    user = _user()
+    _, state = _start(client, join=JOIN_TOKEN)
+    _ticket_from(_callback(client, state, user, member=None)[0])
+    [membership] = _added(mock_db, ProjectMember)
+    assert membership.user_id == user.id and membership.role == ProjectRole.editor
+    assert user.discord_gate_exempt is False

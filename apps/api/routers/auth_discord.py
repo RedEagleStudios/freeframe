@@ -8,6 +8,12 @@ Account rules: the Discord email must be verified. With a server ID set, the
 user must be a member of that server (holding an allowed role, when roles are
 set), checked on every sign-in, and a member with no account gets one. With no
 server ID, only existing accounts and pending invitees can sign in.
+
+Project join links (`?join=<token>` on start) are the exception: a valid link
+skips the server check, gives a newcomer an account marked
+`discord_gate_exempt`, and adds the user to that one project. An exempt
+account skips the server check on later sign-ins too; it reaches only the
+projects it was added to.
 """
 import logging
 import secrets
@@ -25,6 +31,7 @@ from ..middleware.rate_limit import rate_limit
 from ..models.user import User, UserStatus
 from ..schemas.discord_auth import AuthProvidersResponse, DiscordExchangeRequest, DiscordExchangeResponse
 from ..services import discord_oauth
+from ..services import project_join_links as join_links
 from ..services.email_service import email_code_login_enabled
 from ..services.auth_service import (
     create_access_token, create_refresh_token, get_email_owner, get_user_by_email, get_user_by_id,
@@ -60,12 +67,18 @@ def auth_providers(db: Session = Depends(get_db)):
 @router.get("/discord/start", dependencies=[Depends(rate_limit("discord_start", 20, 600))])
 def discord_start(
     from_path: Optional[str] = Query(None, alias="from"),
+    join: Optional[str] = Query(None, max_length=256),
     db: Session = Depends(get_db),
 ):
     config = discord_oauth.load_discord_config(db)
     if not config.usable:
         return _login_error("discord_not_configured")
-    state, url = discord_oauth.begin_flow(config, from_path)
+    if join is not None:
+        try:
+            join_links.validate(db, join)
+        except join_links.JoinLinkInvalid:
+            return _login_error("join_link_invalid")
+    state, url = discord_oauth.begin_flow(config, from_path, join)
     resp = RedirectResponse(url, status_code=302)
     resp.set_cookie(
         discord_oauth.STATE_COOKIE,
@@ -102,6 +115,14 @@ def discord_callback(
     if not config.usable:
         return _login_error("discord_not_configured")
 
+    # The link may have been used, revoked or expired since start.
+    link = None
+    if flow.get("join"):
+        try:
+            link = join_links.validate(db, flow["join"])
+        except join_links.JoinLinkInvalid:
+            return _login_error("join_link_invalid")
+
     try:
         access_token = discord_oauth.exchange_code(config, code)
         profile = discord_oauth.fetch_profile(access_token)
@@ -118,19 +139,29 @@ def discord_callback(
         return _login_error("discord_email_unverified")
     email = email.strip()
 
-    # Server membership and roles are checked on every sign-in, so leaving the
-    # server or losing the role locks the account out of Discord sign-in.
-    if config.server_id:
-        if member is None:
-            return _login_error("discord_not_in_server")
-        if config.allowed_role_ids:
-            roles = member.get("roles") or []
-            if not isinstance(roles, list) or not set(map(str, roles)) & set(config.allowed_role_ids):
-                return _login_error("discord_missing_role")
-
     user = get_user_by_email(db, email)
+
+    # Server membership and roles are checked on every sign-in, so leaving the
+    # server or losing the role locks the account out of Discord sign-in. A
+    # join link, or an account created through one, is let past.
+    roles = (member or {}).get("roles") or []
+    passes_gate = not config.server_id or (
+        member is not None
+        and (
+            not config.allowed_role_ids
+            or (isinstance(roles, list) and bool(set(map(str, roles)) & set(config.allowed_role_ids)))
+        )
+    )
+    gate_exempt = link is not None or (
+        user is not None
+        and user.discord_gate_exempt is True
+        and user.status != UserStatus.deactivated
+    )
+    if not passes_gate and not gate_exempt:
+        return _login_error("discord_not_in_server" if member is None else "discord_missing_role")
+
     if user is None:
-        if not config.server_id:
+        if not config.server_id and link is None:
             return _login_error("discord_no_account")
         # A deleted account keeps its address (the unique constraint still
         # covers it), and two live accounts differing only by case make the
@@ -147,15 +178,25 @@ def discord_callback(
             status=UserStatus.active,
             email_verified=True,
             is_superadmin=False,
+            # Exempt only when the link is the sole reason they got in: someone
+            # who passes the server check stays bound by it on later sign-ins.
+            discord_gate_exempt=link is not None and not passes_gate,
         )
         db.add(user)
         try:
-            db.commit()
+            # With a link, the account is committed together with its
+            # membership, so a link spent meanwhile leaves no stray account.
+            if link is None:
+                db.commit()
+            else:
+                db.flush()
         except IntegrityError:
             db.rollback()
             return _login_error("discord_failed")
-        db.refresh(user)
-        logger.info("Discord sign-in created an account for user %s", user.id)
+        logger.info(
+            "Discord sign-in created an account for user %s%s",
+            user.id, " through a project join link" if link is not None else "",
+        )
     elif user.status == UserStatus.deactivated:
         return _login_error("discord_account_disabled")
     elif user.status == UserStatus.pending_invite and not user.email_verified:
@@ -177,7 +218,15 @@ def discord_callback(
             user.status = UserStatus.active
         db.commit()
 
-    ticket = discord_oauth.issue_ticket(str(user.id), flow.get("from") or "/")
+    from_path = flow.get("from") or "/"
+    if link is not None:
+        try:
+            joined = join_links.redeem(db, link, user)
+        except join_links.JoinLinkInvalid:
+            return _login_error("join_link_invalid")
+        from_path = f"/projects/{joined.project_id}"
+
+    ticket = discord_oauth.issue_ticket(str(user.id), from_path)
     resp = RedirectResponse(
         discord_oauth.frontend_url(f"/auth/discord/callback?ticket={ticket}"), status_code=302,
     )

@@ -15,14 +15,25 @@ function DiscordIcon({ className }: { className?: string }) {
  * "Continue with Discord": a plain link, because the flow is a full page load
  * on the API, which redirects to Discord and back.
  */
-export function DiscordSignInButton({ href, className }: { href: string; className?: string }) {
+export function DiscordSignInButton({
+  href,
+  className,
+  divider = true,
+}: {
+  href: string
+  className?: string
+  /** The "or" rule above the button, for when it follows another sign-in method. */
+  divider?: boolean
+}) {
   return (
     <div className={cn('flex flex-col gap-4', className)}>
-      <div className="flex items-center gap-3" aria-hidden="true">
-        <span className="h-px flex-1 bg-border" />
-        <span className="text-xs text-text-tertiary">or</span>
-        <span className="h-px flex-1 bg-border" />
-      </div>
+      {divider && (
+        <div className="flex items-center gap-3" aria-hidden="true">
+          <span className="h-px flex-1 bg-border" />
+          <span className="text-xs text-text-tertiary">or</span>
+          <span className="h-px flex-1 bg-border" />
+        </div>
+      )}
       <Button asChild variant="secondary" size="lg" className="w-full">
         <a href={href}>
           <DiscordIcon className="h-4 w-4" />

@@ -5,7 +5,8 @@ unset falls back to its DISCORD_* env var. Modelled on Outline's Discord
 plugin: with a server (guild) ID configured, only its members (holding one of
 the allowed roles, when roles are set) may sign in, and a member with no
 account is given one. Without a server ID, Discord only signs in existing
-accounts and pending invitees.
+accounts and pending invitees. A project join link, and an account created
+through one, get past the server check (see routers/auth_discord.py).
 """
 import json
 import logging
@@ -138,14 +139,19 @@ def safe_internal_path(value: Optional[str]) -> str:
 
 # ── One-time flow state ───────────────────────────────────────────────────────
 
-def begin_flow(config: DiscordConfig, from_path: Optional[str]) -> tuple[str, str]:
-    """Store a fresh state and return (state nonce, Discord authorization URL)."""
+def begin_flow(
+    config: DiscordConfig, from_path: Optional[str], join_token: Optional[str] = None,
+) -> tuple[str, str]:
+    """Store a fresh state and return (state nonce, Discord authorization URL).
+
+    `join_token` is a project join link the caller has validated; the callback
+    validates it again and redeems it.
+    """
     state = secrets.token_urlsafe(32)
-    get_redis().setex(
-        f"{STATE_PREFIX}{state}",
-        STATE_TTL_SECONDS,
-        json.dumps({"from": safe_internal_path(from_path)}),
-    )
+    flow = {"from": safe_internal_path(from_path)}
+    if join_token:
+        flow["join"] = join_token
+    get_redis().setex(f"{STATE_PREFIX}{state}", STATE_TTL_SECONDS, json.dumps(flow))
     query = urlencode({
         "response_type": "code",
         "client_id": config.client_id,

@@ -46,6 +46,7 @@ beforeEach(() => {
   useAuthStore.setState({ user: { id: 'u1', name: 'Olivia Owner' } as never })
   api.get.mockReset().mockImplementation(async (url: string) => {
     if (url === '/projects/p1/members') return members
+    if (url === '/projects/p1/join-links') return []
     if (url.startsWith('/users?ids=')) return USERS
     if (url.startsWith('/users/search')) return USERS
     throw new Error(`unexpected GET ${url}`)

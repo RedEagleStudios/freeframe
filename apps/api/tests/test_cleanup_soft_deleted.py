@@ -432,6 +432,7 @@ def test_gc_covers_all_inbound_fks_to_purged_tables():
         ("project_brandings", "project_id"), ("watermark_settings", "project_id"),
         ("metadata_fields", "project_id"), ("collections", "project_id"),
         ("project_members", "project_id"), ("activity_logs", "project_id"),
+        ("project_join_links", "project_id"),
         # -> folders.id
         ("assets", "folder_id"), ("share_links", "folder_id"), ("share_link_items", "folder_id"),
         ("asset_shares", "folder_id"), ("folders", "parent_id"),

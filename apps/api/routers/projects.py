@@ -14,6 +14,7 @@ from ..tasks.email_tasks import send_project_added_email
 from ..tasks.celery_app import send_task_safe
 from ..services.s3_service import put_object, generate_presigned_get_url, delete_object
 from ..services.storage import project_storage_used_bytes
+from ..services.project_members import add_or_revive_member
 from ..config import settings
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -240,23 +241,14 @@ def add_project_member(project_id: uuid.UUID, body: AddProjectMemberRequest, db:
     _get_project(db, project_id)
     _require_project_owner(db, project_id, current_user)
     existing = db.query(ProjectMember).filter(ProjectMember.project_id == project_id, ProjectMember.user_id == body.user_id).first()
-    if existing:
-        if existing.deleted_at is None:
-            raise HTTPException(status_code=400, detail="User already a project member")
-        # Reactivate soft-deleted membership. It is a new membership as far as
-        # the member list's joined date and inviter go.
-        existing.deleted_at = None
-        existing.role = body.role
-        existing.invited_by = current_user.id
-        existing.invited_at = func.now()
-        db.commit()
-        db.refresh(existing)
-        member = existing
-    else:
-        member = ProjectMember(project_id=project_id, user_id=body.user_id, role=body.role, invited_by=current_user.id)
-        db.add(member)
-        db.commit()
-        db.refresh(member)
+    if existing and existing.deleted_at is None:
+        raise HTTPException(status_code=400, detail="User already a project member")
+    member = add_or_revive_member(
+        db, project_id=project_id, user_id=body.user_id, role=body.role,
+        invited_by=current_user.id, existing=existing,
+    )
+    db.commit()
+    db.refresh(member)
 
     # Send project added email (for both new and reactivated members)
     project = _get_project(db, project_id)
