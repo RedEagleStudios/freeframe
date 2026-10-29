@@ -71,6 +71,7 @@ beforeEach(() => {
     }
     if (url === '/projects/p1/branding') return BRANDING
     if (url === '/projects/p1/members') return members
+    if (url === '/projects/p1/join-links') return []
     if (url.startsWith('/users?ids=')) return [{ id: 'u1', name: 'Owner', email: 'o@example.com' }]
     throw new Error(`unexpected GET ${url}`)
   })

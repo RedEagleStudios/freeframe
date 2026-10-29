@@ -87,6 +87,16 @@ describe('Login page: Sign in with Discord', () => {
     ).toBeInTheDocument()
   })
 
+  it('explains a join link that could not be used', async () => {
+    window.history.replaceState(null, '', '/login?error=join_link_invalid')
+    answer({ discord: true })
+    render(<LoginPage />)
+
+    expect(
+      await screen.findByText('This invite link is invalid or has expired. Ask the project owner for a new one.'),
+    ).toBeInTheDocument()
+  })
+
   it('ignores an unknown `?error=` value', async () => {
     window.history.replaceState(null, '', '/login?error=<script>')
     answer({ discord: false })

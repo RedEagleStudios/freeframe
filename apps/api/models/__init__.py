@@ -1,5 +1,5 @@
 from .user import User, GuestUser
-from .project import Project, ProjectMember
+from .project import Project, ProjectMember, ProjectJoinLink
 from .folder import Folder
 from .asset import Asset, AssetVersion, MediaFile, CarouselItem
 from .comment import Comment, Annotation, CommentAttachment, CommentReaction

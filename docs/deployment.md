@@ -375,6 +375,16 @@ The Discord account's email must be verified on Discord. A deactivated FreeFrame
 
 The client secret is stored in the database encrypted, with a key derived from `JWT_SECRET`, and the admin settings never show it again. **Changing `JWT_SECRET` makes the stored secret unreadable**: Discord sign-in then reports itself as not configured until you enter the secret again (a secret set with `DISCORD_CLIENT_SECRET` is not affected).
 
+### Project invite links
+
+Without email, invites can't reach anyone, so a project owner can invite people with a link instead: **Project settings > People > Invite link** creates a single-use link (`<FRONTEND_URL>/join/<token>`) for a chosen role (Viewer, Reviewer or Editor) that expires after 1, 7 or 30 days, or never. The URL is shown once; only a hash of it is stored. Each link admits **one** person: the first to use it joins the project and the link is spent (the People tab then shows who used it and when), so make a new link for each person. Revoke an unused link from the same list.
+
+- **Signed out**, the link offers **Continue with Discord**. A valid link lets its holder past the server and role check above, even with a server ID set, and someone with no FreeFrame account gets one (a regular member, never an admin). They are added to that one project and see no other private project.
+- **Signed in**, the link offers **Join project**. This works without Discord too: with Discord sign-in off, the page sends people to password sign-in and back.
+- Someone already in the project with the link's role or a higher one keeps their role and does not use up the link.
+- **Exempt accounts:** an account created through a link is marked `discord_gate_exempt`, so it keeps signing in with Discord without being in the server; it reaches only the projects it has been added to. Accounts created by server membership are not exempt: they still lose Discord sign-in when they leave the server or lose the role. An existing account that uses a link gets the membership, not the exemption.
+- A link checked when sign-in starts is checked again when Discord sends the person back, so a link used, revoked or expired in between is refused with "This invite link is invalid or has expired."
+
 ---
 
 ## Configuration Reference

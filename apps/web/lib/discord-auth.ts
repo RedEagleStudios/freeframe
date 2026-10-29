@@ -58,9 +58,13 @@ export function updateDiscordAuthConfig(update: DiscordAuthConfigUpdate): Promis
  * page load on the API (which answers with a redirect to Discord), so it is the
  * API's own URL: the API stays at the origin root and carries no basePath.
  * `from` must already be a sanitized in-app path; the API checks it again.
+ * `join` is a project join link's token.
  */
-export function discordStartUrl(from: string): string {
-  return `${API_URL}/auth/discord/start?from=${encodeURIComponent(from)}`
+export function discordStartUrl(from: string, join?: string): string {
+  const url = `${API_URL}/auth/discord/start?from=${encodeURIComponent(from)}`
+  // A project join link: the API checks it, lets its holder past the server
+  // check, and adds them to the project.
+  return join ? `${url}&join=${encodeURIComponent(join)}` : url
 }
 
 /** Login-page messages for the `?error=` codes the Discord flow redirects with. */
@@ -73,6 +77,7 @@ export const DISCORD_LOGIN_ERRORS: Record<string, string> = {
   discord_invite_expired: 'Your invitation has expired. Ask an admin to send a new one.',
   discord_not_configured: 'Sign in with Discord is not set up on this instance.',
   discord_failed: 'Signing in with Discord failed. Please try again.',
+  join_link_invalid: 'This invite link is invalid or has expired. Ask the project owner for a new one.',
 }
 
 /** The message for a login `?error=` value, or null when it is not a Discord error code. */

@@ -11,6 +11,7 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Avatar } from '@/components/shared/avatar'
 import { SkeletonList } from '@/components/shared/skeleton'
 import { useAuthStore } from '@/stores/auth-store'
+import { InviteLinkSection } from './invite-link-section'
 import type { ProjectMember, ProjectRole, User } from '@/types'
 
 const ROLES: { value: ProjectRole; label: string; description: string }[] = [
@@ -218,7 +219,8 @@ interface MemberRow extends ProjectMember {
 
 /**
  * The People tab of project settings: who is in the project and with which
- * role, adding people, and removing them. Only the owner reaches it, and the
+ * role, adding people (directly or with a single-use invite link), and
+ * removing them. Only the owner reaches it, and the
  * owner cannot change or remove their own membership here.
  *
  * Shares its SWR key with the project page, so a change here shows there.
@@ -301,6 +303,8 @@ export function ProjectPeopleTab({ projectId }: { projectId: string }) {
   return (
     <div className="space-y-4">
       <AddMember projectId={projectId} memberIds={memberIds} onAdded={() => void mutateMembers()} />
+
+      <InviteLinkSection projectId={projectId} />
 
       {rowError && <p role="alert" className="text-sm text-status-error">{rowError}</p>}
 

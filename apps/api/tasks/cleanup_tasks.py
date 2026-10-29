@@ -14,7 +14,7 @@ from ..models.asset import (
 from ..models.comment import Comment, Annotation, CommentAttachment, CommentReaction
 from ..models.approval import Approval
 from ..models.share import ShareLink, ShareLinkItem, ShareLinkActivity, AssetShare
-from ..models.project import Project, ProjectMember
+from ..models.project import Project, ProjectJoinLink, ProjectMember
 from ..models.folder import Folder
 from ..models.metadata import MetadataField, AssetMetadata, Collection, CollectionShare
 from ..models.branding import ProjectBranding, WatermarkSettings
@@ -232,6 +232,7 @@ def _purge_project(db, project_id, counts: PurgeCounts) -> None:
         db.query(ProjectBranding).filter(ProjectBranding.project_id == project_id).delete(synchronize_session=False)
     db.query(WatermarkSettings).filter(WatermarkSettings.project_id == project_id).delete(synchronize_session=False)
     db.query(ProjectMember).filter(ProjectMember.project_id == project_id).delete(synchronize_session=False)
+    db.query(ProjectJoinLink).filter(ProjectJoinLink.project_id == project_id).delete(synchronize_session=False)
     db.query(ActivityLog).filter(ActivityLog.project_id == project_id).delete(synchronize_session=False)
     if p.poster_s3_key:
         _safe(delete_object, p.poster_s3_key)

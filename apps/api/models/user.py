@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from enum import Enum as PyEnum
 from typing import Optional
-from sqlalchemy import String, Enum, DateTime, JSON, func, Integer
+from sqlalchemy import Boolean, String, Enum, DateTime, JSON, func, Integer
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 try:
@@ -31,6 +31,8 @@ class User(Base):
     invite_token_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     preferences: Mapped[dict] = mapped_column(JSON, nullable=False, server_default='{}')
     token_version: Mapped[int] = mapped_column(Integer, server_default="1", nullable=False)
+    # Created through a project join link: Discord sign-in skips the server/role gate.
+    discord_gate_exempt: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
