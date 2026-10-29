@@ -144,18 +144,21 @@ def discord_callback(
     # Server membership and roles are checked on every sign-in, so leaving the
     # server or losing the role locks the account out of Discord sign-in. A
     # join link, or an account created through one, is let past.
+    roles = (member or {}).get("roles") or []
+    passes_gate = not config.server_id or (
+        member is not None
+        and (
+            not config.allowed_role_ids
+            or (isinstance(roles, list) and bool(set(map(str, roles)) & set(config.allowed_role_ids)))
+        )
+    )
     gate_exempt = link is not None or (
         user is not None
         and user.discord_gate_exempt is True
         and user.status != UserStatus.deactivated
     )
-    if config.server_id and not gate_exempt:
-        if member is None:
-            return _login_error("discord_not_in_server")
-        if config.allowed_role_ids:
-            roles = member.get("roles") or []
-            if not isinstance(roles, list) or not set(map(str, roles)) & set(config.allowed_role_ids):
-                return _login_error("discord_missing_role")
+    if not passes_gate and not gate_exempt:
+        return _login_error("discord_not_in_server" if member is None else "discord_missing_role")
 
     if user is None:
         if not config.server_id and link is None:
@@ -175,7 +178,9 @@ def discord_callback(
             status=UserStatus.active,
             email_verified=True,
             is_superadmin=False,
-            discord_gate_exempt=link is not None,
+            # Exempt only when the link is the sole reason they got in: someone
+            # who passes the server check stays bound by it on later sign-ins.
+            discord_gate_exempt=link is not None and not passes_gate,
         )
         db.add(user)
         try:

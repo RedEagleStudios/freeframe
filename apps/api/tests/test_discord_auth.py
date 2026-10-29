@@ -709,7 +709,19 @@ def test_newcomer_with_link_gets_account_without_a_server_configured(client, con
     _, state = _start(client, join=JOIN_TOKEN)
     _ticket_from(_callback(client, state, None)[0])
     [created] = _added(mock_db, User)
-    assert created.discord_gate_exempt is True
+    # No server check exists to be exempt from.
+    assert created.discord_gate_exempt is False
+    assert len(_added(mock_db, ProjectMember)) == 1
+
+
+def test_server_member_with_allowed_role_joining_by_link_stays_bound_by_the_check(
+    client, server_configured, fake_redis, mock_db, join_link,
+):
+    # They would have got in anyway, so losing the role later must still lock them out.
+    _, state = _start(client, join=JOIN_TOKEN)
+    _ticket_from(_callback(client, state, None, member={"roles": [ROLE_OK]})[0])
+    [created] = _added(mock_db, User)
+    assert created.discord_gate_exempt is False
     assert len(_added(mock_db, ProjectMember)) == 1
 
 
