@@ -79,6 +79,26 @@ describe('buildShareEmbedMetadata', () => {
     expect(md.twitter).not.toHaveProperty('images')
   })
 
+  it('gives a still-processing video its original as og:video, with the original’s type', () => {
+    // What the API answers while the version transcodes: the early poster
+    // frame, the probed portrait size, and the uploaded .mov as the video.
+    const md = buildShareEmbedMetadata(
+      {
+        ...VIDEO,
+        image: { url: '/share/tok/embed.jpg', width: 1080, height: 1920 },
+        video: { ...VIDEO.video!, type: 'video/quicktime', width: 1080, height: 1920 },
+      },
+      API,
+    )
+    expect(md.openGraph).toMatchObject({
+      type: 'video.other',
+      images: [{ url: `${API}/share/tok/embed.jpg`, width: 1080, height: 1920 }],
+      videos: [{ url: `${API}/share/tok/embed.mp4`, type: 'video/quicktime', width: 1080, height: 1920 }],
+    })
+    expect(md.twitter).toMatchObject({ card: 'player', players: [{ width: 1080, height: 1920 }] })
+    expect(md.other).toEqual({ 'twitter:player:stream:content_type': 'video/quicktime' })
+  })
+
   it('gives a link without a web MP4 a website card with its picture', () => {
     const md = buildShareEmbedMetadata(
       { ...VIDEO, title: 'Stills', asset_type: 'image', description: null, video: null },

@@ -39,6 +39,15 @@ class TranscodeJob:
     # Whether to remux the best rendition into one `download.mp4`. Off, nothing
     # extra is stored and downloads fall back to the uploaded original.
     download_mp4: bool = True
+    # Called once, right after the source is probed and before the ladder is
+    # encoded, as early_meta_cb(width, height, duration_seconds, thumbnail_key):
+    # the display size (rotation applied), the duration, and the key of a poster
+    # frame already uploaded to `<output_s3_prefix>/thumbnail.jpg` (None when
+    # that frame could not be made). Any of the numbers is None when the probe
+    # did not establish it. It lets the caller show a still-processing version
+    # with a picture and a size. Best-effort like progress_cb: neither a failing
+    # frame nor a raising callback affects the transcode. None skips the step.
+    early_meta_cb: Optional[Callable[[Optional[int], Optional[int], Optional[float], Optional[str]], None]] = None
 
 @dataclass
 class TranscodeResult:

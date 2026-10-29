@@ -345,6 +345,84 @@ def test_process_asset_reads_the_projects_streaming_mode(real_db, monkeypatch):
     assert v.processing_status == ProcessingStatus.ready and v.ready_at is not None
 
 
+def _process_with_early_meta(real_db, monkeypatch, api, early_meta, *, fail_commit=False):
+    """Run process_asset on a processing video whose fake transcode reports
+    `early_meta` through the job's callback, and return what the share embed
+    said at that moment plus the commits made by then."""
+    from apps.api.tasks import transcode_tasks
+    from packages.transcoder.base import TranscodeResult
+
+    owner = _user(real_db)
+    asset = _asset(real_db, _project(real_db, owner), owner)
+    v, mf = _version(real_db, asset, owner, ProcessingStatus.processing, processed=False)
+    mf.width = mf.height = None
+    real_db.flush()
+    link = _link(real_db, owner, asset=asset)
+    prefix = f"processed/{asset.project_id}/{asset.id}/{v.id}"
+    seen = {"commits": 0}
+
+    def commit():
+        if fail_commit and seen.get("in_early"):
+            raise RuntimeError("database went away")
+        seen["commits"] += 1
+        real_db.flush()
+
+    class FakeTranscoder:
+        def __init__(self, *a, **k):
+            pass
+
+        async def transcode(self, job):
+            seen["in_early"] = True
+            job.early_meta_cb(*early_meta(prefix))
+            seen["in_early"] = False
+            seen["commits_after_early"] = seen["commits"]
+            seen["embed"] = api(None).get(f"/share/{link.token}/embed").json()
+            return TranscodeResult(success=True, hls_prefix=prefix, mp4_key=f"{prefix}/download.mp4",
+                                   thumbnail_keys=[f"{prefix}/thumbnail.jpg"],
+                                   duration_seconds=12.5, width=1920, height=1080, fps=25.0)
+
+    monkeypatch.setattr("packages.transcoder.ffmpeg_transcoder.FFmpegTranscoder", FakeTranscoder)
+    monkeypatch.setattr(transcode_tasks, "SessionLocal", lambda: real_db)
+    monkeypatch.setattr(real_db, "close", lambda: None)
+    monkeypatch.setattr(real_db, "commit", commit)
+    monkeypatch.setattr(real_db, "rollback", lambda: None)
+    monkeypatch.setattr(transcode_tasks, "get_s3_client", MagicMock)
+    monkeypatch.setattr(transcode_tasks, "_publish_event", lambda *a, **k: True)
+
+    transcode_tasks.process_asset.run(str(asset.id), str(v.id))
+    real_db.refresh(v)
+    return v, mf, link, prefix, seen
+
+
+def test_the_early_poster_frame_and_size_are_committed_while_processing(real_db, monkeypatch, api):
+    v, mf, link, prefix, seen = _process_with_early_meta(
+        real_db, monkeypatch, api, lambda prefix: (1080, 1920, 12.5, f"{prefix}/thumbnail.jpg"))
+
+    # process_asset commits `processing` once; the early callback commits again.
+    assert seen["commits_after_early"] == 2
+    assert seen["embed"]["image"] == {"url": f"/share/{link.token}/embed.jpg", "width": 1080, "height": 1920}
+    assert seen["embed"]["video"]["width"] == 1080
+    assert v.processing_status == ProcessingStatus.ready
+    assert mf.s3_key_thumbnail == f"{prefix}/thumbnail.jpg" and mf.duration_seconds == 12.5
+
+
+def test_early_metadata_the_probe_did_not_establish_is_left_alone(real_db, monkeypatch, api):
+    _, _, _, _, seen = _process_with_early_meta(real_db, monkeypatch, api, lambda prefix: (None, None, None, None))
+
+    assert seen["embed"]["image"] is None
+    assert seen["embed"]["video"]["width"] is None and seen["embed"]["video"]["height"] is None
+
+
+def test_a_failing_early_write_does_not_fail_the_transcode(real_db, monkeypatch, api):
+    v, mf, _, prefix, _ = _process_with_early_meta(
+        real_db, monkeypatch, api, lambda prefix: (1080, 1920, 12.5, f"{prefix}/thumbnail.jpg"),
+        fail_commit=True)
+
+    assert v.processing_status == ProcessingStatus.ready
+    assert mf.s3_key_download == f"{prefix}/download.mp4" and (mf.width, mf.height) == (1920, 1080)
+
+
+
 def test_a_version_whose_original_is_gone_is_not_retranscoded(real_db, monkeypatch):
     from apps.api.tasks import transcode_tasks
 
@@ -554,30 +632,97 @@ def test_the_embed_media_redirect_to_fresh_presigned_urls(api, real_db, method):
     assert mp4.headers["cache-control"] == "no-store"
 
 
-@pytest.mark.parametrize("kind", ["password", "secure", "expired", "disabled", "image", "no_mp4", "processing"])
+@pytest.mark.parametrize("kind", [
+    "password", "secure", "expired", "disabled", "image", "no_mp4",
+    "processing_password", "processing_secure", "processing_unplayable", "processing_deleted",
+])
 def test_embed_mp4_is_404_where_a_crawler_may_not_have_it(api, real_db, kind):
     owner = _user(real_db)
     asset = _asset(real_db, _project(real_db, owner), owner,
                    asset_type=AssetType.image if kind == "image" else AssetType.video)
-    status = ProcessingStatus.processing if kind == "processing" else ProcessingStatus.ready
-    _version(real_db, asset, owner, status, download=kind != "no_mp4")
+    processing = kind.startswith("processing")
+    _version(real_db, asset, owner,
+             ProcessingStatus.processing if processing else ProcessingStatus.ready,
+             download=kind != "no_mp4", processed=not processing,
+             mime="video/x-matroska" if kind == "processing_unplayable" else "video/mp4",
+             raw_deleted=kind == "processing_deleted")
     extra = {
         "password": {"password_hash": "x"},
         "secure": {"visibility": "secure"},
         "expired": {"expires_at": datetime.now(timezone.utc) - timedelta(days=1)},
         "disabled": {"is_enabled": False},
-    }.get(kind, {})
+    }.get(kind.removeprefix("processing_"), {})
     link = _link(real_db, owner, asset=asset, **extra)
     client = api(None)
 
     assert client.get(f"/share/{link.token}/embed.mp4", follow_redirects=False).status_code == 404
     assert client.head(f"/share/{link.token}/embed.mp4", follow_redirects=False).status_code == 404
     embed = client.get(f"/share/{link.token}/embed")
-    if kind in ("password", "secure", "expired", "disabled"):
+    if kind.removeprefix("processing_") in ("password", "secure", "expired", "disabled"):
         assert embed.status_code == 404
         assert client.get(f"/share/{link.token}/embed.jpg", follow_redirects=False).status_code == 404
     else:
         assert embed.status_code == 200 and embed.json()["video"] is None
+
+
+def test_a_processing_video_embeds_its_original_until_its_mp4_is_ready(api, real_db):
+    owner = _user(real_db)
+    asset = _asset(real_db, _project(real_db, owner), owner, name="Launch film")
+    v, mf = _version(real_db, asset, owner, ProcessingStatus.processing, processed=False)
+    # What the transcode records at its start (see _on_early_meta).
+    mf.s3_key_thumbnail = f"processed/{asset.project_id}/{asset.id}/{v.id}/thumbnail.jpg"
+    mf.width, mf.height = 1080, 1920
+    real_db.flush()
+    link = _link(real_db, owner, asset=asset)
+    client = api(None)
+
+    body = client.get(f"/share/{link.token}/embed").json()
+    assert body["image"] == {"url": f"/share/{link.token}/embed.jpg", "width": 1080, "height": 1920}
+    assert body["video"] == {"url": f"/share/{link.token}/embed.mp4", "secure_url": f"/share/{link.token}/embed.mp4",
+                             "type": "video/mp4", "width": 1080, "height": 1920}
+    mp4 = client.get(f"/share/{link.token}/embed.mp4", follow_redirects=False)
+    assert mp4.status_code == 302 and mp4.headers["location"] == _sign(mf.s3_key_raw)
+    assert mp4.headers["cache-control"] == "no-store"
+    jpg = client.get(f"/share/{link.token}/embed.jpg", follow_redirects=False)
+    assert jpg.status_code == 302 and jpg.headers["location"] == _sign(mf.s3_key_thumbnail)
+
+    prefix = f"processed/{asset.project_id}/{asset.id}/{v.id}"
+    v.processing_status = ProcessingStatus.ready
+    mf.s3_key_processed, mf.s3_key_download = prefix, f"{prefix}/download.mp4"
+    real_db.flush()
+
+    mp4 = client.get(f"/share/{link.token}/embed.mp4", follow_redirects=False)
+    assert mp4.status_code == 302 and mp4.headers["location"] == _sign(mf.s3_key_download)
+
+
+def test_a_processing_embed_declares_the_originals_type_and_omits_unknown_sizes(api, real_db):
+    owner = _user(real_db)
+    asset = _asset(real_db, _project(real_db, owner), owner)
+    _, mf = _version(real_db, asset, owner, ProcessingStatus.processing, processed=False,
+                     mime="video/quicktime")
+    mf.width = mf.height = None
+    real_db.flush()
+    link = _link(real_db, owner, asset=asset)
+    client = api(None)
+
+    body = client.get(f"/share/{link.token}/embed").json()
+    # No poster frame yet: no image, rather than one that 404s.
+    assert body["image"] is None
+    assert body["video"]["type"] == "video/quicktime"
+    assert body["video"]["width"] is None and body["video"]["height"] is None
+    assert client.get(f"/share/{link.token}/embed.jpg", follow_redirects=False).status_code == 404
+
+
+def test_a_ready_version_without_an_mp4_is_not_replaced_by_a_processing_original(api, real_db):
+    owner = _user(real_db)
+    asset = _asset(real_db, _project(real_db, owner), owner)
+    _version(real_db, asset, owner, ProcessingStatus.ready, n=1, download=False)
+    _version(real_db, asset, owner, ProcessingStatus.processing, n=2, processed=False)
+    link = _link(real_db, owner, asset=asset)
+    client = api(None)
+
+    assert client.get(f"/share/{link.token}/embed").json()["video"] is None
+    assert client.get(f"/share/{link.token}/embed.mp4", follow_redirects=False).status_code == 404
 
 
 def test_a_project_link_embeds_a_title_only(api, real_db):

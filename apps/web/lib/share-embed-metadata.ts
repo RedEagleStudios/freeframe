@@ -9,6 +9,10 @@ import type { Metadata } from 'next'
  * `image.url` / `video.url` are API-relative and stable (`/share/{t}/embed.jpg`,
  * `/share/{t}/embed.mp4`); they redirect to a fresh presigned URL on each
  * request, so a cached embed never points at an expired signature.
+ *
+ * While the video is still processing, `video` is its uploaded original (when
+ * a browser can play it), so `video.type` is that file's type, which is not
+ * always MP4; its sizes are the probe's, or null before the probe has run.
  */
 export interface ShareEmbed {
   title: string
@@ -19,7 +23,7 @@ export interface ShareEmbed {
   video: {
     url: string
     secure_url: string
-    type: 'video/mp4'
+    type: string
     width: number | null
     height: number | null
   } | null
@@ -69,8 +73,9 @@ function absolute(apiBase: string, path: string): string {
 /**
  * Maps a share link's embed description to page metadata.
  *
- * - A single-video link with a web MP4: `og:type=video.other` with og:video
- *   (what Discord plays inline) and a Twitter `player` card.
+ * - A single-video link with a web MP4 (or, while it processes, a playable
+ *   original): `og:type=video.other` with og:video (what Discord plays
+ *   inline) and a Twitter `player` card.
  * - Anything else with a picture: `og:type=website` and a large-image card.
  * - `null` (the link is private, gone, or the API did not answer): the
  *   generic title and nothing else, so a preview never leaks a thumbnail.
@@ -113,7 +118,7 @@ export function buildShareEmbedMetadata(
           {
             url: mp4,
             secureUrl: secureMp4,
-            type: 'video/mp4',
+            type: video.type,
             ...(video.width ? { width: video.width } : {}),
             ...(video.height ? { height: video.height } : {}),
           },
@@ -138,7 +143,7 @@ export function buildShareEmbedMetadata(
       },
       // Next renders every other player tag from `twitter.players`, but not
       // the stream's content type.
-      other: { 'twitter:player:stream:content_type': 'video/mp4' },
+      other: { 'twitter:player:stream:content_type': video.type },
     }
   }
 

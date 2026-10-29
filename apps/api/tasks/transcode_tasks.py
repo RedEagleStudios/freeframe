@@ -177,6 +177,25 @@ def _process_video(
         if delivered is False:
             progress_ok["enabled"] = False
 
+    def _on_early_meta(width, height, duration_seconds, thumbnail_key) -> None:
+        # Committed at once, so the API can show (and a share link unfurl) the
+        # version with a picture and a size while the ladder is still encoding.
+        # The end of the transcode writes these again. Best-effort: a failed
+        # write is rolled back and the transcode carries on as before.
+        try:
+            if thumbnail_key:
+                media_file.s3_key_thumbnail = thumbnail_key
+            if width:
+                media_file.width = width
+            if height:
+                media_file.height = height
+            if duration_seconds:
+                media_file.duration_seconds = duration_seconds
+            db.commit()
+        except Exception:
+            log.exception("transcode: could not record early metadata for version %s", version.id)
+            db.rollback()
+
     job = TranscodeJob(
         media_id=str(asset.id),
         version_id=str(version.id),
@@ -184,6 +203,7 @@ def _process_video(
         output_s3_prefix=output_prefix,
         qualities=parse_qualities(settings.transcoder_qualities),
         progress_cb=_on_progress,
+        early_meta_cb=_on_early_meta,
         final_attempt=final_attempt,
         download_mp4=settings.transcoder_download_mp4 or streaming_mode,
     )
