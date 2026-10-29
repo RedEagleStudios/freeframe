@@ -25,7 +25,7 @@ from packages.transcoder.ffmpeg_transcoder import FFmpegTranscoder
 
 # ─────────────────────────────────── the remux ffmpeg is asked to do
 
-def _run_transcode(qualities: list[str], source=(1920, 1080), remux_fails=False):
+def _run_transcode(qualities: list[str], source=(1920, 1080), remux_fails=False, download_mp4=True):
     """Run a transcode with ffmpeg and S3 mocked out.
 
     Returns (result, ffmpeg commands, s3 mock). Same shape as the ladder tests
@@ -52,7 +52,7 @@ def _run_transcode(qualities: list[str], source=(1920, 1080), remux_fails=False)
     job = TranscodeJob(
         media_id="media-1", version_id="v1",
         input_s3_key="uploads/video.mp4", output_s3_prefix="processed/p/a/v",
-        qualities=qualities,
+        qualities=qualities, download_mp4=download_mp4,
     )
     s3 = MagicMock()
     s3.generate_presigned_url.return_value = "https://s3.example.com/uploads/video.mp4"
@@ -122,6 +122,16 @@ def test_a_failed_remux_does_not_fail_a_good_ladder():
     assert result.hls_prefix == "processed/p/a/v"
     assert result.mp4_key is None
 
+
+def test_switched_off_no_download_rung_is_built_or_stored():
+    # TRANSCODER_DOWNLOAD_MP4=false: the operator would rather not store the top
+    # rung twice, so downloads fall back to the original.
+    result, cmds, s3 = _run_transcode(["1080p", "360p"], download_mp4=False)
+
+    assert result.success is True
+    assert result.mp4_key is None
+    assert not [c for c in cmds if any(str(a).endswith("download.mp4") for a in c)]
+    assert not [c for c in s3.upload_file.call_args_list if str(c[0][2]).endswith(".mp4")]
 
 # ─────────────────────────────────── the key reaching the row
 

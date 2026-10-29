@@ -171,6 +171,7 @@ def _process_video(
         qualities=parse_qualities(settings.transcoder_qualities),
         progress_cb=_on_progress,
         final_attempt=final_attempt,
+        download_mp4=settings.transcoder_download_mp4,
     )
     result = _run_async(transcoder.transcode(job))
 

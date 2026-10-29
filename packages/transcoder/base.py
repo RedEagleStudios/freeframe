@@ -36,6 +36,9 @@ class TranscodeJob:
     # Defaults to False, which is the safe default for a caller that does not
     # know: it refuses, and a caller with no retries would then see the error.
     final_attempt: bool = False
+    # Whether to remux the best rendition into one `download.mp4`. Off, nothing
+    # extra is stored and downloads fall back to the uploaded original.
+    download_mp4: bool = True
 
 @dataclass
 class TranscodeResult:

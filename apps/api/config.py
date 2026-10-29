@@ -95,6 +95,10 @@ class Settings(BaseSettings):
     # ask for more than the source has: a ladder left empty that way builds its
     # smallest rung at the source's own size.
     transcoder_qualities: str = "1080p,720p,360p"
+    # Store a `download.mp4` (the top rendition remuxed into one file) with every
+    # video so Download hands out that instead of the original. It costs about the
+    # size of the top rung again; off, downloads serve the uploaded original.
+    transcoder_download_mp4: bool = True
 
     # Maximum size (bytes) for a single uploaded file. 0 = unlimited (no per-file cap).
     # Note: S3 multipart still caps effective size at ~10,000 parts x chunk size.

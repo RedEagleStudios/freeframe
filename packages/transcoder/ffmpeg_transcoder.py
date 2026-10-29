@@ -2591,7 +2591,9 @@ class FFmpegTranscoder(BaseTranscoder):
             #    Keyed on the backend that actually ran, not on the one the gate
             #    chose: a remux that fell back to the encoder produces an
             #    ordinary ladder and wants the rung like any other.
-            mp4_key = None if backend == "copy" else self._build_download_mp4(
+            #    Off (TRANSCODER_DOWNLOAD_MP4=false) when the operator would rather
+            #    not store a second copy of the top rung and serve the original.
+            mp4_key = None if backend == "copy" or not job.download_mp4 else self._build_download_mp4(
                 hls_dir, qualities, work_dir, job.output_s3_prefix
             )
 
