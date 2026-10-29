@@ -2,9 +2,11 @@ import { api } from './api'
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
-/** Which external sign-in providers the instance offers (`GET /auth/providers`). */
+/** Which sign-in methods the instance offers (`GET /auth/providers`). */
 export interface AuthProviders {
   discord: boolean
+  /** Sign-in codes by email; off when no mailer is configured (EMAIL_CODE_LOGIN). */
+  email_code: boolean
 }
 
 /** What `POST /auth/discord/exchange` answers for a valid one-time ticket. */

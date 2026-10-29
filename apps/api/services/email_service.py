@@ -20,6 +20,15 @@ def mail_is_configured(s=settings) -> bool:
     return provider == "ses"
 
 
+def email_code_login_enabled(s=settings) -> bool:
+    """Whether sign-in codes by email are offered: EMAIL_CODE_LOGIN, where "auto"
+    means "only when a mailer is configured", since a code nobody receives is a
+    sign-in that cannot finish."""
+    if s.email_code_login == "auto":
+        return mail_is_configured(s)
+    return s.email_code_login == "true"
+
+
 class EmailService:
     """
     Email service that supports both AWS SES and standard SMTP.

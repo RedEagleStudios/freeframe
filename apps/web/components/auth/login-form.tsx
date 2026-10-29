@@ -19,12 +19,14 @@ interface LoginFormProps {
   discordHref?: string | null
   /** A message the page arrived with (e.g. a Discord `?error=` code), shown as the form error. */
   notice?: string | null
+  /** False when the server has sign-in codes turned off: password sign-in only. */
+  emailCodeEnabled?: boolean
 }
 
-export function LoginForm({ discordHref, notice }: LoginFormProps = {}) {
+export function LoginForm({ discordHref, notice, emailCodeEnabled = true }: LoginFormProps = {}) {
   const router = useRouter()
   const { defaultLoginMode } = useBranding()
-  const initialStep: Step = defaultLoginMode === 'password' ? 'classic' : 'email'
+  const initialStep: Step = !emailCodeEnabled || defaultLoginMode === 'password' ? 'classic' : 'email'
   const [step, setStep] = useState<Step>(initialStep)
   const choseStep = useRef(false)
   const [email, setEmail] = useState('')
@@ -45,10 +47,12 @@ export function LoginForm({ discordHref, notice }: LoginFormProps = {}) {
   const codeRefs = useRef<(HTMLInputElement | null)[]>([])
 
   useEffect(() => {
+    // Codes switched off server-side: never leave anyone on a code screen.
+    if (!emailCodeEnabled && (step === 'email' || step === 'code')) { setStep('classic'); return }
     if (choseStep.current || email || classicEmail || classicPassword) return
     if (step === 'email' || step === 'classic') setStep(initialStep)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [initialStep])
+  }, [initialStep, emailCodeEnabled])
 
   useEffect(() => {
     if (step === 'code') {
@@ -293,15 +297,17 @@ export function LoginForm({ discordHref, notice }: LoginFormProps = {}) {
 
         {discordHref && <DiscordSignInButton href={discordHref} className="mt-4" />}
 
-        <div className="mt-6 text-center">
-          <button
-            type="button"
-            onClick={() => { choseStep.current = true; setStep('email'); setClassicError('') }}
-            className="text-base text-text-tertiary hover:text-text-secondary transition-colors"
-          >
-            Sign in with magic code instead
-          </button>
-        </div>
+        {emailCodeEnabled && (
+          <div className="mt-6 text-center">
+            <button
+              type="button"
+              onClick={() => { choseStep.current = true; setStep('email'); setClassicError('') }}
+              className="text-base text-text-tertiary hover:text-text-secondary transition-colors"
+            >
+              Sign in with magic code instead
+            </button>
+          </div>
+        )}
       </div>
     )
   }

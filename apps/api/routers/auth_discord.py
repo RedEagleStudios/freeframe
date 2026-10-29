@@ -25,6 +25,7 @@ from ..middleware.rate_limit import rate_limit
 from ..models.user import User, UserStatus
 from ..schemas.discord_auth import AuthProvidersResponse, DiscordExchangeRequest, DiscordExchangeResponse
 from ..services import discord_oauth
+from ..services.email_service import email_code_login_enabled
 from ..services.auth_service import (
     create_access_token, create_refresh_token, get_email_owner, get_user_by_email, get_user_by_id,
 )
@@ -49,8 +50,11 @@ def _display_name(profile: dict, member: Optional[dict]) -> str:
 
 @router.get("/providers", response_model=AuthProvidersResponse)
 def auth_providers(db: Session = Depends(get_db)):
-    """Which sign-in providers the login page should offer."""
-    return AuthProvidersResponse(discord=discord_oauth.load_discord_config(db).usable)
+    """Which sign-in methods the login page should offer."""
+    return AuthProvidersResponse(
+        discord=discord_oauth.load_discord_config(db).usable,
+        email_code=email_code_login_enabled(),
+    )
 
 
 @router.get("/discord/start", dependencies=[Depends(rate_limit("discord_start", 20, 600))])

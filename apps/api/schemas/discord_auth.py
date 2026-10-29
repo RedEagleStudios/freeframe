@@ -8,6 +8,8 @@ from ..services.discord_oauth import SNOWFLAKE_RE, parse_role_ids
 
 class AuthProvidersResponse(BaseModel):
     discord: bool
+    # Sign-in codes by email (EMAIL_CODE_LOGIN); off, the login page offers password sign-in only.
+    email_code: bool
 
 
 class DiscordExchangeRequest(BaseModel):

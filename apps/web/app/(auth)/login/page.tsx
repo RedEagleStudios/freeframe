@@ -15,6 +15,8 @@ export default function LoginPage() {
   const router = useRouter()
   const [discordHref, setDiscordHref] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  // Assume codes are on until the server says otherwise, as before this flag existed.
+  const [emailCodeEnabled, setEmailCodeEnabled] = useState(true)
 
   useEffect(() => {
     async function checkSetup() {
@@ -44,6 +46,7 @@ export default function LoginPage() {
     fetchAuthProviders()
       .then((providers) => {
         if (providers.discord) setDiscordHref(discordStartUrl(from))
+        setEmailCodeEnabled(providers.email_code !== false)
       })
       .catch(() => {
         // No providers answer: just leave the button out.
@@ -53,7 +56,7 @@ export default function LoginPage() {
   return (
     <>
       {/* The branded logo + org name live in the (auth) layout, so every auth screen gets them */}
-      <LoginForm discordHref={discordHref} notice={notice} />
+      <LoginForm discordHref={discordHref} notice={notice} emailCodeEnabled={emailCodeEnabled} />
 
       {/* Powered by FreeFrame */}
       <PoweredByBadge className="mt-6 text-center justify-center w-full" />

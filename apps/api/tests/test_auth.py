@@ -116,6 +116,62 @@ def test_send_magic_code_existing_user_sends_code(client, mock_db):
     mock_send.assert_called_once()
 
 
+@pytest.mark.parametrize("setting, provider, host, expected", [
+    ("auto", "smtp", None, False),            # no mailer: a code nobody receives
+    ("auto", "smtp", "smtp.example.org", True),
+    ("auto", "ses", None, True),
+    ("true", "smtp", None, True),             # forced on
+    ("false", "ses", None, False),            # forced off
+])
+def test_email_code_login_follows_setting_and_mailer(client, monkeypatch, setting, provider, host, expected):
+    from apps.api.config import settings
+    monkeypatch.setattr(settings, "email_code_login", setting)
+    monkeypatch.setattr(settings, "mail_provider", provider)
+    monkeypatch.setattr(settings, "smtp_host", host)
+
+    with patch("apps.api.routers.auth_discord.discord_oauth.load_discord_config") as load:
+        load.return_value.usable = False
+        assert client.get("/auth/providers").json()["email_code"] is expected
+
+
+def test_codes_are_neither_issued_nor_accepted_while_email_code_login_is_off(client, mock_db, monkeypatch):
+    from apps.api.config import settings
+    from apps.api.routers.auth import EMAIL_CODE_LOGIN_OFF_DETAIL
+    monkeypatch.setattr(settings, "email_code_login", "false")
+    user = _mock_user("off@example.com")
+    mock_db.first.return_value = user
+
+    with patch("apps.api.middleware.rate_limit.check_rate_limit", return_value=(True, 0)), \
+         patch("apps.api.routers.auth.store_magic_code") as mock_store, \
+         patch("apps.api.routers.auth.send_task_safe") as mock_send, \
+         patch("apps.api.routers.auth.redis_verify_magic_code", return_value=(True, "")):
+        sent = client.post("/auth/send-magic-code", json={"email": user.email})
+        verified = client.post("/auth/verify-magic-code", json={"email": user.email, "code": "123456"})
+
+    assert sent.status_code == verified.status_code == 403
+    assert sent.json()["detail"] == EMAIL_CODE_LOGIN_OFF_DETAIL
+    mock_store.assert_not_called()
+    mock_send.assert_not_called()
+
+
+def test_password_login_still_works_while_email_code_login_is_off(client, mock_db, monkeypatch):
+    from apps.api.config import settings
+    monkeypatch.setattr(settings, "email_code_login", "false")
+    mock_db.first.return_value = _mock_user("pw@example.com")
+
+    with patch(_VERIFY_PATCH, return_value=True):
+        resp = client.post("/auth/login", json={"email": "pw@example.com", "password": "pw123456"})
+
+    assert resp.status_code == 200
+
+
+def test_email_code_login_setting_rejects_unknown_values():
+    from pydantic import ValidationError
+    from apps.api.config import Settings
+    with pytest.raises(ValidationError):
+        Settings(email_code_login="sometimes")
+
+
 def test_register_endpoint_removed(client):
     """POST /auth/register — endpoint has been removed (was an unauthenticated, un-invite-gated
     account creation path; GHSA-9m78-fww2-p89h). 404, not 405: the route no longer exists."""

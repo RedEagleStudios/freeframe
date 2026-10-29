@@ -16,7 +16,7 @@ import { useBrandingStore } from '@/stores/branding-store'
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
-function answer(providers: { discord: boolean } | Error) {
+function answer(providers: { discord: boolean; email_code?: boolean } | Error) {
   get.mockImplementation((path: string) => {
     if (path === '/setup/status') return Promise.resolve({ needs_setup: false })
     if (path === '/auth/providers') {
@@ -94,5 +94,30 @@ describe('Login page: Sign in with Discord', () => {
 
     await waitFor(() => expect(get).toHaveBeenCalledWith('/auth/providers'))
     expect(screen.queryByText('<script>')).not.toBeInTheDocument()
+  })
+})
+
+describe('Login page: sign-in codes switched off', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    act(() => useBrandingStore.setState({ loaded: true, defaultLoginMode: 'magic_code' }))
+    window.history.replaceState(null, '', '/login')
+  })
+
+  it('opens on password sign-in with no way to request a code, even when codes are the default mode', async () => {
+    answer({ discord: true, email_code: false })
+    render(<LoginPage />)
+
+    await waitFor(() => expect(screen.getByPlaceholderText('Your password')).toBeInTheDocument())
+    expect(screen.queryByRole('button', { name: /magic code/i })).not.toBeInTheDocument()
+    expect(discordLink()).toBeInTheDocument()
+  })
+
+  it('keeps the code screen when the server offers codes', async () => {
+    answer({ discord: false, email_code: true })
+    render(<LoginPage />)
+
+    await waitFor(() => expect(get).toHaveBeenCalledWith('/auth/providers'))
+    expect(screen.getByRole('button', { name: /send magic code/i })).toBeInTheDocument()
   })
 })

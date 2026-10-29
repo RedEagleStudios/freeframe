@@ -23,6 +23,7 @@ from ..services.redis_service import (
     MAGIC_CODE_EXPIRY_SECONDS,
 )
 from ..tasks.email_tasks import send_magic_code_email, send_invite_email
+from ..services.email_service import email_code_login_enabled
 from ..tasks.celery_app import send_task_safe
 from ..models.user import User, UserStatus
 from ..models.instance_branding import InstanceBranding
@@ -43,6 +44,15 @@ INVITE_NOT_ACCEPTED_DETAIL = (
     "You have a pending invite. Open the invite link from your email to accept it, "
     "or ask an admin for a new link."
 )
+EMAIL_CODE_LOGIN_OFF_DETAIL = (
+    "Sign-in codes are turned off on this server. Sign in with your password instead."
+)
+
+
+def _require_email_code_login() -> None:
+    if not email_code_login_enabled():
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=EMAIL_CODE_LOGIN_OFF_DETAIL)
+
 
 MAGIC_CODE_EXPIRY_MINUTES = MAGIC_CODE_EXPIRY_SECONDS // 60
 
@@ -52,7 +62,7 @@ def _generate_invite_token() -> str:
     return secrets.token_urlsafe(48)
 
 
-@router.post("/send-magic-code", response_model=SendMagicCodeResponse, dependencies=[Depends(rate_limit("send_magic_code", 5, 600))])
+@router.post("/send-magic-code", response_model=SendMagicCodeResponse, dependencies=[Depends(_require_email_code_login), Depends(rate_limit("send_magic_code", 5, 600))])
 def send_magic_code(body: SendMagicCodeRequest, db: Session = Depends(get_db)):
     """
     Send magic code to an existing user's email, for login.
@@ -94,7 +104,7 @@ def send_magic_code(body: SendMagicCodeRequest, db: Session = Depends(get_db)):
     )
 
 
-@router.post("/verify-magic-code", response_model=TokenResponse, dependencies=[Depends(rate_limit("verify_magic_code", 10, 600))])
+@router.post("/verify-magic-code", response_model=TokenResponse, dependencies=[Depends(_require_email_code_login), Depends(rate_limit("verify_magic_code", 10, 600))])
 def verify_magic_code(body: VerifyMagicCodeRequest, db: Session = Depends(get_db)):
     """
     Verify magic code and return tokens.

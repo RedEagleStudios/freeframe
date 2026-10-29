@@ -150,13 +150,13 @@ def _error_of(resp) -> str:
 
 def test_providers_reports_discord_only_when_usable(client, no_env, fake_redis):
     with _use_row(None):
-        assert client.get("/auth/providers").json() == {"discord": False}
+        assert client.get("/auth/providers").json()["discord"] is False
     with _use_row(_row(enabled=False)):
-        assert client.get("/auth/providers").json() == {"discord": False}
+        assert client.get("/auth/providers").json()["discord"] is False
     with _use_row(_row(secret=None)):
-        assert client.get("/auth/providers").json() == {"discord": False}
+        assert client.get("/auth/providers").json()["discord"] is False
     with _use_row(_row()):
-        assert client.get("/auth/providers").json() == {"discord": True}
+        assert client.get("/auth/providers").json()["discord"] is True
 
 
 def test_providers_env_fallback(client, no_env, fake_redis, monkeypatch):
@@ -164,7 +164,7 @@ def test_providers_env_fallback(client, no_env, fake_redis, monkeypatch):
     monkeypatch.setattr(settings, "discord_client_secret", "env-secret")
     monkeypatch.setattr(settings, "discord_login_enabled", True)
     with _use_row(None):
-        assert client.get("/auth/providers").json() == {"discord": True}
+        assert client.get("/auth/providers").json()["discord"] is True
 
 
 def test_env_server_and_roles_fallback(no_env, monkeypatch):

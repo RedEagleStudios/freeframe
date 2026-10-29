@@ -325,7 +325,7 @@ That call **replaces** the bucket's whole lifecycle configuration, so if the buc
 
 ### External SMTP
 
-> **⚠️ Email is required for login.** FreeFrame authenticates with emailed **magic codes**, and also sends invites/notifications. If email isn't configured, users **cannot log in** — the send fails and the app logs a warning at startup. Configure SMTP or SES before going live.
+> **⚠️ Email is needed for sign-in codes and invites.** Without a mailer, invites and notifications are not delivered, and sign-in codes are switched off: with `EMAIL_CODE_LOGIN=auto` (the default) the login page offers only password sign-in (and [Sign in with Discord](#sign-in-with-discord), if configured) until `SMTP_HOST` is set or `MAIL_PROVIDER=ses`. Set `EMAIL_CODE_LOGIN=true` or `false` to force it either way. The app logs a warning at startup when email isn't configured.
 
 Works with: **Mailgun, Postmark, SendGrid, Amazon SES, or any SMTP server.**
 

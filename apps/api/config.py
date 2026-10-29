@@ -152,6 +152,11 @@ class Settings(BaseSettings):
     smtp_user: str | None = None
     smtp_password: str | None = None
     smtp_use_tls: bool = True
+    # Sign-in codes by email: "auto" (default) offers them only when a mailer is
+    # configured (see services/email_service.mail_is_configured), "true"/"false"
+    # force it. Off, the login page shows password (and Discord) sign-in only and
+    # /auth/send-magic-code + /auth/verify-magic-code answer 403.
+    email_code_login: str = "auto"
 
     # Sign in with Discord. These are the fallback for the values an admin saves
     # under Settings > Admin > Instance settings; a value saved there wins. The redirect URI
@@ -165,6 +170,14 @@ class Settings(BaseSettings):
     discord_server_id: str | None = None
     discord_server_roles: str | None = None
     discord_oauth_redirect_uri: str | None = None
+
+    @field_validator("email_code_login")
+    @classmethod
+    def _check_email_code_login(cls, value: str) -> str:
+        value = (value or "auto").strip().lower()
+        if value not in ("auto", "true", "false"):
+            raise ValueError(f"EMAIL_CODE_LOGIN must be auto, true or false, not {value!r}")
+        return value
 
     @field_validator("s3_storage_class")
     @classmethod
