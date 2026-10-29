@@ -51,6 +51,10 @@ class OriginalNotAllowed(Exception):
     """The caller asked for the original and may only have the transcode."""
 
 
+class OriginalDeleted(Exception):
+    """The caller asked for the original, which a streaming project has deleted."""
+
+
 def _format_of(key: Optional[str]) -> str:
     return os.path.splitext(key or "")[1].lstrip(".").upper()
 
@@ -95,14 +99,20 @@ def download_choices(
     Without `allow_original` the original is left out, unless the version has no
     transcode file: then it is the only thing a download can be, and is what a
     download served before there was a choice.
+
+    An original a streaming project deleted (`raw_deleted_at`) is never offered.
+    The retention task deletes one only once the version has its web MP4, so the
+    transcode is still there to take its place.
     """
-    choices = [DownloadChoice(
-        id=ORIGINAL,
-        label="Original",
-        format=_format_of(media_file.s3_key_raw) or _format_of(media_file.original_filename),
-        s3_key=media_file.s3_key_raw,
-        size_bytes=media_file.file_size_bytes,
-    )]
+    choices = []
+    if media_file.raw_deleted_at is None:
+        choices.append(DownloadChoice(
+            id=ORIGINAL,
+            label="Original",
+            format=_format_of(media_file.s3_key_raw) or _format_of(media_file.original_filename),
+            s3_key=media_file.s3_key_raw,
+            size_bytes=media_file.file_size_bytes,
+        ))
 
     if asset_type == AssetType.video:
         # No processed prefix means no ladder, and so nothing remuxed from it.
@@ -118,7 +128,7 @@ def download_choices(
             s3_key=transcode,
             size_bytes=None,
         ))
-        if not allow_original:
+        if not allow_original and choices[0].id == ORIGINAL:
             choices = choices[1:]
     return choices
 
@@ -173,11 +183,15 @@ def pick_download(
     caller may only have the transcode, so the caller can say why.
     """
     choices = download_choices(asset_type, media_file, allow_original=allow_original)
+    if not choices:
+        return None
     if rendition is None:
         if prefer_original and choices[0].id == ORIGINAL:
             return choices[0]
         return choices[-1]
     choice = next((c for c in choices if c.id == rendition), None)
+    if choice is None and rendition == ORIGINAL and media_file.raw_deleted_at is not None:
+        raise OriginalDeleted()
     if choice is None and rendition == ORIGINAL and not allow_original:
         raise OriginalNotAllowed()
     return choice
@@ -198,6 +212,8 @@ def pick_or_refuse(
             asset.asset_type, media_file, rendition,
             allow_original=allow_original, prefer_original=prefer_original,
         )
+    except OriginalDeleted:
+        raise HTTPException(status_code=410, detail="The original file was deleted; only the web version is kept")
     except OriginalNotAllowed:
         raise HTTPException(status_code=403, detail="Original downloads are not enabled on this server")
     if not choice:

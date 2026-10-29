@@ -109,6 +109,21 @@ describe('ProjectCard', () => {
     expect(screen.queryByRole('menu')).toBeNull()
     expect(screen.queryByRole('button', { name: 'Season 2 menu' })).toBeNull()
   })
+
+  it('badges a streaming project next to Public, also on a project the viewer is not in', () => {
+    const { unmount } = render(<ProjectCard project={{ ...project, is_public: true, streaming_mode: true }} />)
+    expect(screen.getByText('Public')).toBeInTheDocument()
+    expect(screen.getByText('Streaming')).toBeInTheDocument()
+    unmount()
+
+    render(<ProjectCard project={{ ...project, role: null, streaming_mode: true }} onJoin={() => {}} />)
+    expect(screen.getByText('Streaming')).toBeInTheDocument()
+  })
+
+  it('has no Streaming badge for a normal project', () => {
+    render(<ProjectCard project={{ ...project, streaming_mode: false }} />)
+    expect(screen.queryByText('Streaming')).toBeNull()
+  })
 })
 
 describe('ShareLinksTable', () => {

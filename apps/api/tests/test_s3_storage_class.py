@@ -266,7 +266,8 @@ def test_the_watermark_task_writes_its_render_as_media(monkeypatch):
     asset_id = str(uuid.uuid4())
     asset = SimpleNamespace(id=asset_id, project_id="proj-1")
     version = SimpleNamespace(id="ver-1")
-    source = SimpleNamespace(original_filename="clip.mov", s3_key_raw="raw/p/a/v/original.mov")
+    source = SimpleNamespace(original_filename="clip.mov", s3_key_raw="raw/p/a/v/original.mov",
+                             raw_deleted_at=None)
     by_model = {"Asset": asset, "AssetVersion": version, "MediaFile": source}
 
     db = MagicMock()

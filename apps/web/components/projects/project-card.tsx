@@ -2,7 +2,7 @@
 
 import * as React from 'react'
 import Link from 'next/link'
-import { MoreHorizontal, ImagePlus, Globe, Lock } from 'lucide-react'
+import { MoreHorizontal, ImagePlus, Globe, Lock, Radio } from 'lucide-react'
 import { cn, formatRelativeTime, formatBytes } from '@/lib/utils'
 import { ContextMenuArea, DotsMenu } from '@/components/shared/item-menu'
 import { ProjectPoster } from './project-poster'
@@ -76,6 +76,12 @@ export function ProjectCard({
                 <span className="inline-flex items-center gap-1 rounded-full bg-black/30 backdrop-blur-sm px-2 py-0.5 text-[10px] font-medium text-white/90">
                   <Globe className="h-2.5 w-2.5" />
                   Public
+                </span>
+              )}
+              {project.streaming_mode && (
+                <span className="inline-flex items-center gap-1 rounded-full bg-black/30 backdrop-blur-sm px-2 py-0.5 text-[10px] font-medium text-white/90">
+                  <Radio className="h-2.5 w-2.5" />
+                  Streaming
                 </span>
               )}
               {showRole && project.role && project.role !== 'owner' && (

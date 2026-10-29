@@ -59,6 +59,7 @@ def test_create_project(client, auth_headers, mock_db, test_user):
         obj.description = None
         obj.project_type = ProjectType.personal
         obj.is_public = False
+        obj.streaming_mode = False
         obj.poster_url = None
         obj.created_by = test_user.id
         obj.org_id = org_id

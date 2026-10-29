@@ -30,6 +30,10 @@ class Project(Base):
     poster_s3_key: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     is_public: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # Streaming project: keep a web MP4 (download.mp4) for every video and delete the
+    # uploaded original STREAMING_ORIGINAL_RETENTION_DAYS after the version is ready.
+    # Turning it off stops future deletions; deleted originals stay deleted.
+    streaming_mode: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
 class ProjectMember(Base):

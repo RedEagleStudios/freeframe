@@ -21,6 +21,9 @@ from ..services.downloads import (
     describe_choices, download_choices, download_filename, may_download_original,
     original_allowed_for_download, pick_or_refuse,
 )
+from ..services.streaming import (
+    PREVIEW_URL_EXPIRES_IN, can_preview_processing, progressive_preview_url,
+)
 from .hls_proxy import create_hls_token
 from ..schemas.upload import (
     InitiateUploadRequest, InitiateUploadResponse,
@@ -347,10 +350,10 @@ def list_asset_versions(
     return result
 
 
-def _ready_media_file(
+def _requested_version(
     db: Session, asset_id: uuid.UUID, version_id: Optional[uuid.UUID], current_user: User,
-) -> tuple[Asset, MediaFile]:
-    """The asset and the media file of the version a stream or download serves."""
+) -> tuple[Asset, AssetVersion]:
+    """The asset and the version a stream or download asks for, whatever its status."""
     asset = db.query(Asset).filter(Asset.id == asset_id, Asset.deleted_at.is_(None)).first()
     if not asset:
         raise HTTPException(status_code=404, detail="Asset not found")
@@ -373,13 +376,24 @@ def _ready_media_file(
 
     if not version:
         raise HTTPException(status_code=404, detail="No version found")
-    if version.processing_status != ProcessingStatus.ready:
-        raise HTTPException(status_code=409, detail="Asset version is not ready yet")
+    return asset, version
 
+
+def _media_file_of(db: Session, version: AssetVersion) -> MediaFile:
     media_file = db.query(MediaFile).filter(MediaFile.version_id == version.id).first()
     if not media_file:
         raise HTTPException(status_code=404, detail="Media file not found")
-    return asset, media_file
+    return media_file
+
+
+def _ready_media_file(
+    db: Session, asset_id: uuid.UUID, version_id: Optional[uuid.UUID], current_user: User,
+) -> tuple[Asset, MediaFile]:
+    """The asset and the media file of the version a stream or download serves."""
+    asset, version = _requested_version(db, asset_id, version_id, current_user)
+    if version.processing_status != ProcessingStatus.ready:
+        raise HTTPException(status_code=409, detail="Asset version is not ready yet")
+    return asset, _media_file_of(db, version)
 
 
 @router.get("/assets/{asset_id}/stream", response_model=StreamUrlResponse)
@@ -396,7 +410,23 @@ def get_stream_url(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    asset, media_file = _ready_media_file(db, asset_id, version_id, current_user)
+    asset, version = _requested_version(db, asset_id, version_id, current_user)
+    if version.processing_status != ProcessingStatus.ready:
+        # A video still transcoding can be watched from its original, when the
+        # browser has a chance of playing it. Never for a download, and never
+        # for an upload in flight or one that failed.
+        media_file = None if download else (
+            db.query(MediaFile).filter(MediaFile.version_id == version.id).first()
+        )
+        if media_file is None or not can_preview_processing(asset, version, media_file):
+            raise HTTPException(status_code=409, detail="Asset version is not ready yet")
+        return StreamUrlResponse(
+            url=progressive_preview_url(media_file), asset_type=asset.asset_type,
+            expires_in=PREVIEW_URL_EXPIRES_IN, kind="progressive", processing=True,
+        )
+    media_file = _media_file_of(db, version)
+
+    kind = "file"
 
     if download:
         # A download needs one file, and the ladder is segments. With no choice
@@ -420,10 +450,11 @@ def get_stream_url(
         # presigned URLs — the S3 bucket can stay fully private. (#51)
         token = create_hls_token(media_file.s3_key_processed)
         url = f"/stream/hls/master.m3u8?token={token}"
+        kind = "hls"
     else:
         url = generate_presigned_get_url(media_file.s3_key_processed or media_file.s3_key_raw)
 
-    return StreamUrlResponse(url=url, asset_type=asset.asset_type)
+    return StreamUrlResponse(url=url, asset_type=asset.asset_type, kind=kind)
 
 
 @router.get("/assets/{asset_id}/downloads", response_model=list[DownloadOption])

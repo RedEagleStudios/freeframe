@@ -1,7 +1,8 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import uuid
 from datetime import datetime
 from ..models.project import ProjectType, ProjectRole
+from ..config import settings
 
 class ProjectCreate(BaseModel):
     name: str
@@ -12,6 +13,8 @@ class ProjectUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
     is_public: bool | None = None
+    # Owner-only, like every field here (PATCH /projects/{id}).
+    streaming_mode: bool | None = None
 
 class ProjectResponse(BaseModel):
     id: uuid.UUID
@@ -22,6 +25,12 @@ class ProjectResponse(BaseModel):
     created_at: datetime
     poster_url: str | None = None
     is_public: bool = False
+    streaming_mode: bool = False
+    # Instance-wide STREAMING_ORIGINAL_RETENTION_DAYS, so the settings page can say
+    # when originals go. 0 means the deletion is switched off on this server.
+    streaming_retention_days: int = Field(
+        default_factory=lambda: settings.streaming_original_retention_days
+    )
     asset_count: int = 0
     storage_bytes: int = 0
     member_count: int = 0

@@ -11,7 +11,10 @@ import React, {
 } from "react";
 import { api } from "@/lib/api";
 import { useReviewStore } from "@/stores/review-store";
-import type { AssetResponse, AssetVersion, Comment } from "@/types";
+import type { AssetResponse, AssetVersion, Comment, ShareStreamResponse } from "@/types";
+
+/** How often a share viewer re-asks for the stream of a version still processing. */
+export const SHARE_PROCESSING_POLL_MS = 15_000;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -116,7 +119,7 @@ export function ReviewProvider({
           `${API_URL}/share/${shareToken}/stream/${assetId}?_=1${shareSessionParam}`,
           { headers },
         );
-        const streamData = streamRes.ok ? await streamRes.json() : null;
+        const streamData: ShareStreamResponse | null = streamRes.ok ? await streamRes.json() : null;
         // Build pseudo asset from available data
         data = {
           id: assetId,
@@ -135,13 +138,16 @@ export function ReviewProvider({
           updated_at: "",
           deleted_at: null,
           stream_url: streamData?.url,
+          stream_kind: streamData?.kind,
           thumbnail_url: streamData?.thumbnail_url,
           latest_version: streamData?.version_id
             ? {
                 id: streamData.version_id,
                 asset_id: assetId,
                 version_number: 1,
-                processing_status: "ready",
+                // A link to an asset with no ready version yet previews its
+                // newest processing one (progressive), and says so.
+                processing_status: streamData.processing ? "processing" : "ready",
                 created_by: "",
                 created_at: "",
                 deleted_at: null,
@@ -259,10 +265,18 @@ export function ReviewProvider({
       const allVersions = await api.get<AssetVersion[]>(`/assets/${assetId}/versions`);
       if (!mountedRef.current) return;
       setVersions(allVersions ?? []);
+      // The selected version is a copy held by the store, so a status change
+      // (processing → ready) has to be carried over or the viewer never leaves
+      // the preview for HLS.
+      const selected = useReviewStore.getState().currentVersion;
+      const fresh = selected && (allVersions ?? []).find((v) => v.id === selected.id);
+      if (fresh && fresh.processing_status !== selected.processing_status) {
+        setCurrentVersion(fresh);
+      }
     } catch {
       // ignore
     }
-  }, [assetId, shareToken]);
+  }, [assetId, shareToken, setCurrentVersion]);
 
   useEffect(() => {
     setIsLoading(true);
@@ -303,11 +317,13 @@ export function ReviewProvider({
       { headers },
     )
       .then((r) => (r.ok ? r.json() : null))
-      .then((streamData) => {
+      .then((streamData: ShareStreamResponse | null) => {
         if (cancelled || !mountedRef.current || !streamData?.url) return;
         streamedVersionRef.current = currentVersionId;
         setAsset((prev) =>
-          prev ? ({ ...prev, stream_url: streamData.url } as AssetResponse) : prev,
+          prev
+            ? ({ ...prev, stream_url: streamData.url, stream_kind: streamData.kind } as AssetResponse)
+            : prev,
         );
       })
       .catch(() => {});
@@ -315,6 +331,41 @@ export function ReviewProvider({
       cancelled = true;
     };
   }, [shareToken, assetId, currentVersionId, shareSessionParam]);
+
+  // Share mode has no event stream, so a link previewing a processing version
+  // (or one whose asset has nothing playable yet) asks again on a timer. Once
+  // the answer is no longer a processing preview, the whole share asset is
+  // rebuilt, which swaps the player over to HLS and lists the ready versions.
+  // A still-processing answer is ignored: its presigned URL is new every time
+  // and taking it would restart the preview.
+  const awaitingReady =
+    !!shareToken &&
+    !!asset &&
+    (asset.latest_version === null ||
+      asset.latest_version.processing_status === "processing");
+  useEffect(() => {
+    if (!awaitingReady) return;
+    const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+    const id = setInterval(() => {
+      const headers: Record<string, string> = {};
+      try {
+        const t = localStorage.getItem("ff_access_token");
+        if (t) headers["Authorization"] = `Bearer ${t}`;
+      } catch {}
+      fetch(`${API_URL}/share/${shareToken}/stream/${assetId}?_=1${shareSessionParam}`, { headers })
+        .then((r) => (r.ok ? r.json() : null))
+        .then((streamData: ShareStreamResponse | null) => {
+          if (!mountedRef.current || !streamData?.url) return;
+          const stillPreviewing =
+            streamData.processing === true &&
+            useReviewStore.getState().currentVersion?.processing_status === "processing";
+          if (stillPreviewing) return;
+          void fetchAsset();
+        })
+        .catch(() => {});
+    }, SHARE_PROCESSING_POLL_MS);
+    return () => clearInterval(id);
+  }, [awaitingReady, shareToken, assetId, shareSessionParam, fetchAsset]);
 
   const addComment = useCallback(
     async (payload: CreateCommentPayload): Promise<Comment> => {

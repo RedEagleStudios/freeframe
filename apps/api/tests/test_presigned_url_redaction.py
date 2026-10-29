@@ -281,7 +281,7 @@ def _drive_failing_process_asset(process_video):
     asset = SimpleNamespace(id=uuid.uuid4(), project_id=uuid.uuid4(),
                             asset_type=AssetType.video)
     version = SimpleNamespace(id=uuid.uuid4(), processing_status=ProcessingStatus.uploading)
-    media_file = SimpleNamespace(version_id=version.id, s3_key_raw=_KEY)
+    media_file = SimpleNamespace(version_id=version.id, s3_key_raw=_KEY, raw_deleted_at=None)
     db = MagicMock()
     db.query.return_value = db
     db.filter.return_value = db

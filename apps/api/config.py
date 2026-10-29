@@ -118,6 +118,14 @@ class Settings(BaseSettings):
     # S3 objects reclaimed. Days. 0 (or negative) DISABLES the sweep (matches the reaper convention).
     soft_delete_retention_days: int = 30
 
+    # Streaming projects (Project.streaming_mode) keep the web MP4 and the HLS ladder and
+    # delete each version's uploaded original this many days after the version became ready.
+    # Days. 0 DISABLES the deletion (same convention as the sweeps above). Must be at least
+    # the bucket's object-lock period for raw/ (e.g. an R2 bucket lock rule), or every
+    # delete is refused and simply retried on the next daily run. Deleted originals are
+    # gone for good.
+    streaming_original_retention_days: int = 30
+
     # Orphan S3 sweeper (issue #65 follow-up): reclaim bucket keys under raw/ + processed/ that no
     # MediaFile row owns. 0 = disabled. When > 0, only keys whose S3 LastModified is older than this
     # many hours are considered, so in-flight / just-committed uploads are never mistaken for orphans.
@@ -181,6 +189,15 @@ class Settings(BaseSettings):
         value = (value or "auto").strip().lower()
         if value not in ("auto", "true", "false"):
             raise ValueError(f"EMAIL_CODE_LOGIN must be auto, true or false, not {value!r}")
+        return value
+
+    @field_validator("streaming_original_retention_days")
+    @classmethod
+    def _check_streaming_original_retention_days(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError(
+                f"STREAMING_ORIGINAL_RETENTION_DAYS must be 0 (disabled) or more, not {value}"
+            )
         return value
 
     @field_validator("s3_storage_class")

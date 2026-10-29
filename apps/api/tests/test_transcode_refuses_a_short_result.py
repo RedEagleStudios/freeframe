@@ -1243,7 +1243,7 @@ def test_the_task_passes_its_own_retry_count_down():
                               s3_key_raw="raw/in.mp4", s3_key_processed=None,
                               s3_key_download=None, s3_key_thumbnail=None,
                               processing_status=None, duration_seconds=None,
-                              width=None, height=None, fps=None)
+                              width=None, height=None, fps=None, raw_deleted_at=None)
         db = MagicMock()
         db.query.return_value.filter.return_value.first.return_value = row
         result = TranscodeResult(success=True, hls_prefix="processed/x",

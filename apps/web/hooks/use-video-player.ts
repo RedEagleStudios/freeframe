@@ -4,6 +4,7 @@ import Hls, { type Level } from 'hls.js'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useReviewStore } from '@/stores/review-store'
 import { hlsStartConfig, saveBandwidth } from '@/lib/hls-bandwidth'
+import type { StreamKind } from '@/types'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -52,6 +53,13 @@ export interface UseVideoPlayerReturn extends VideoPlayerControls, VideoPlayerSt
 export interface UseVideoPlayerOptions {
   /** Compare panes: don't touch global review-store signals (seekTarget/playheadTime/activeAnnotation). */
   detached?: boolean
+  /**
+   * How the API said to play `src`. `hls` goes through hls.js (or Safari's
+   * native HLS); anything else is a plain `<video src>`. Without it the choice
+   * falls back to sniffing `.m3u8` in the URL, for callers whose API response
+   * predates `kind`.
+   */
+  kind?: StreamKind
 }
 
 export function useVideoPlayer(
@@ -59,6 +67,7 @@ export function useVideoPlayer(
   options?: UseVideoPlayerOptions,
 ): UseVideoPlayerReturn {
   const detached = options?.detached === true
+  const kind = options?.kind
   const videoRef = useRef<HTMLVideoElement>(null)
   const hlsRef = useRef<Hls | null>(null)
   const syncIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -231,7 +240,7 @@ export function useVideoPlayer(
     video.addEventListener('error', onError)
     video.addEventListener('progress', onProgress)
 
-    const isHlsSource = src.includes('.m3u8')
+    const isHlsSource = kind ? kind === 'hls' : src.includes('.m3u8')
 
     if (isHlsSource && Hls.isSupported()) {
       const hls = new Hls({
@@ -308,7 +317,7 @@ export function useVideoPlayer(
         hlsRef.current = null
       }
     }
-  }, [src, setPlayheadTime, cancelPlayRetry, detached])
+  }, [src, kind, setPlayheadTime, cancelPlayRetry, detached])
 
   // ─── Controls ───────────────────────────────────────────────────────────────
 

@@ -75,6 +75,11 @@ class AssetVersion(Base):
     # ranges. NULL means the row predates this being recorded; callers derive the
     # size from the parts already held rather than assuming today's constant.
     chunk_size_bytes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # When the version last became `ready`. Streaming projects delete the original
+    # a fixed time after this. Rows that were already ready when the column was
+    # added were backfilled with `created_at` (versions have no updated_at), which
+    # is earlier than the real moment by the upload and transcode time.
+    ready_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -101,6 +106,11 @@ class MediaFile(Base):
     # the raw master", never as "this version has no download".
     s3_key_download: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
     s3_key_thumbnail: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
+    # Set once the uploaded original at `s3_key_raw` was deleted by the streaming-
+    # project retention task (tasks/cleanup_tasks.py). The key stays recorded, but
+    # nothing may serve, probe or transcode it any more. Only set after a delete
+    # that succeeded.
+    raw_deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     width: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     height: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     duration_seconds: Mapped[Optional[float]] = mapped_column(Float, nullable=True)

@@ -9,7 +9,7 @@ from .celery_app import celery_app
 from ..database import SessionLocal
 from ..config import settings
 from ..models.asset import (
-    Asset, AssetVersion, MediaFile, CarouselItem, ProcessingStatus,
+    Asset, AssetType, AssetVersion, MediaFile, CarouselItem, ProcessingStatus,
 )
 from ..models.comment import Comment, Annotation, CommentAttachment, CommentReaction
 from ..models.approval import Approval
@@ -551,6 +551,7 @@ def requeue_stuck_processing():
             ).first()
             if done is not None:
                 v.processing_status = ProcessingStatus.ready
+                v.ready_at = datetime.now(timezone.utc)
                 log.info("requeue: version %s already had output; marking ready", v.id)
                 continue
 
@@ -578,6 +579,121 @@ def cleanup_soft_deleted():
         # survives a quiet worker log level. A run that removed nothing stays INFO.
         did_work = any(v for k, v in result.items() if k != "retention_days")
         log.log(logging.WARNING if did_work else logging.INFO, "cleanup: %s", result)
+        return result
+    finally:
+        db.close()
+
+
+_STREAMING_ORIGINALS_LOCK_KEY = 5477652  # the streaming-original retention run (pg advisory lock space)
+
+
+@dataclass
+class StreamingOriginalCounts:
+    """What one streaming-original retention run did. `retention_days` 0 means disabled."""
+    retention_days: int = 0
+    eligible: int = 0
+    deleted: int = 0
+    deleted_bytes: int = 0
+    mp4_queued: int = 0
+    failed: int = 0
+
+
+def _is_object_locked(exc: Exception) -> bool:
+    """An R2 bucket lock rule refusing the delete (409 ObjectLockedByBucketPolicy)."""
+    err = (getattr(exc, "response", None) or {}).get("Error") or {}
+    return err.get("Code") == "ObjectLockedByBucketPolicy"
+
+
+def _delete_streaming_originals(db) -> StreamingOriginalCounts:
+    """Delete the uploaded original of every eligible version in a streaming project.
+
+    Eligible: a live video version (live asset, live project with `streaming_mode`
+    on) that has been `ready` for STREAMING_ORIGINAL_RETENTION_DAYS and still has
+    its original. A version without a web MP4 gets one built first
+    (`build_download_mp4` on the transcoding queue) and keeps its original until
+    a later run finds the MP4 there. `raw_deleted_at` is written only for a
+    delete storage accepted; a refusal -- a bucket lock still holding the object,
+    or any other error -- is logged and left for the next run.
+
+    Videos only: a still's WebP and an audio file's MP3 are lossy stand-ins, and
+    streaming mode promises a web MP4 in place of the original, nothing else.
+    Mutates `db`; the caller commits once, after the run. Should that commit
+    fail, the next run deletes the same keys again -- a delete of an absent key
+    succeeds -- and records them then. Guarded by an advisory xact lock so two
+    overlapping runs do not both work the same rows.
+    """
+    from .celery_app import send_task_safe
+    from .transcode_tasks import build_download_mp4
+
+    days = min(settings.streaming_original_retention_days, _MAX_RETENTION_DAYS)
+    counts = StreamingOriginalCounts(retention_days=days)
+    if days <= 0:
+        log.warning("streaming-originals: disabled (streaming_original_retention_days=%s)", days)
+        return counts
+    got_lock = db.execute(
+        text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": _STREAMING_ORIGINALS_LOCK_KEY}
+    ).scalar()
+    if not got_lock:
+        log.info("streaming-originals: another run holds the advisory lock; skipping")
+        return counts
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    rows = (
+        db.query(MediaFile, AssetVersion)
+        .join(AssetVersion, MediaFile.version_id == AssetVersion.id)
+        .join(Asset, AssetVersion.asset_id == Asset.id)
+        .join(Project, Asset.project_id == Project.id)
+        .filter(
+            Project.streaming_mode.is_(True),
+            Project.deleted_at.is_(None),
+            Asset.deleted_at.is_(None),
+            Asset.asset_type == AssetType.video,
+            AssetVersion.deleted_at.is_(None),
+            AssetVersion.processing_status == ProcessingStatus.ready,
+            AssetVersion.ready_at.isnot(None),
+            AssetVersion.ready_at < cutoff,
+            MediaFile.raw_deleted_at.is_(None),
+        )
+        .all()
+    )
+    counts.eligible = len(rows)
+    for mf, v in rows:
+        if not (mf.s3_key_processed and mf.s3_key_download):
+            # The MP4 is what replaces the original, so it must exist first. A
+            # version without a ladder has nothing to build it from and keeps
+            # its original.
+            if mf.s3_key_processed:
+                send_task_safe(build_download_mp4, str(v.id))
+                counts.mp4_queued += 1
+            continue
+        try:
+            delete_object(mf.s3_key_raw)
+        except Exception as exc:  # noqa: BLE001 - one refusal must not stop the run
+            counts.failed += 1
+            if _is_object_locked(exc):
+                log.warning("streaming-originals: %s is still under the bucket lock (is "
+                            "STREAMING_ORIGINAL_RETENTION_DAYS below the lock period?); retrying next run",
+                            mf.s3_key_raw)
+            else:
+                log.warning("streaming-originals: could not delete %s; retrying next run: %s",
+                            mf.s3_key_raw, exc)
+            continue
+        mf.raw_deleted_at = datetime.now(timezone.utc)
+        counts.deleted += 1
+        counts.deleted_bytes += mf.file_size_bytes or 0
+    return counts
+
+
+@celery_app.task(name="delete_streaming_originals")
+def delete_streaming_originals():
+    """Daily beat task: delete originals in streaming projects past the retention window."""
+    db = SessionLocal()
+    try:
+        counts = _delete_streaming_originals(db)
+        db.commit()
+        result = asdict(counts)
+        # Irreversible: WARNING whenever anything was deleted, like the GC.
+        log.log(logging.WARNING if counts.deleted else logging.INFO, "streaming-originals: %s", result)
         return result
     finally:
         db.close()

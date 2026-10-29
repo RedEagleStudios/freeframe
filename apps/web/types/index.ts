@@ -95,6 +95,10 @@ export interface Project {
   team_id?: string | null;
   poster_url?: string | null;
   is_public?: boolean;
+  /** Streaming project: originals are deleted N days after a version is ready. */
+  streaming_mode?: boolean;
+  /** Instance-wide retention for streaming originals, in days; 0 = deletion disabled. Read-only. */
+  streaming_retention_days?: number;
   created_at: string;
   deleted_at: string | null;
   asset_count?: number;
@@ -160,6 +164,35 @@ export interface AssetVersion {
 export interface AssetResponse extends Asset {
   latest_version: AssetVersion | null;
   thumbnail_url: string | null;
+  /** Share mode only: the pseudo asset carries its stream, fetched with the link's token. */
+  stream_url?: string | null;
+  stream_kind?: StreamKind;
+}
+
+/**
+ * How a stream URL must be played. `hls`: an API-relative master playlist
+ * (hls.js); `progressive`: an absolute presigned GET of the uploaded original,
+ * played with a plain `<video src>` while the version is still processing;
+ * `file`: an absolute presigned single object (audio, image, download).
+ */
+export type StreamKind = "hls" | "progressive" | "file";
+
+/** `GET /assets/{id}/stream` and `GET /share/{token}/stream/{asset_id}`. */
+export interface StreamResponse {
+  url: string;
+  /** Absent from an API that predates it; treat as unknown. */
+  kind?: StreamKind;
+  /** True only with `kind: "progressive"`: a preview of a version still processing. */
+  processing?: boolean;
+}
+
+/** The share stream response also describes the asset it streams. */
+export interface ShareStreamResponse extends StreamResponse {
+  name?: string;
+  version_id?: string;
+  thumbnail_url?: string | null;
+  duration_seconds?: number | null;
+  asset_type?: AssetType;
 }
 
 export interface MediaFile {

@@ -5,6 +5,7 @@ import { useRouter, usePathname, useSearchParams } from 'next/navigation'
 import useSWR from 'swr'
 import { ReviewProvider, useReview } from '@/components/review/review-provider'
 import { VideoPlayer } from '@/components/review/video-player'
+import { ProcessingPlaceholder } from '@/components/review/processing-placeholder'
 import { AudioPlayer } from '@/components/review/audio-player'
 import { MobileCommentSheet, PEEK_PX, type SheetState } from '@/components/review/mobile-comment-sheet'
 import { useMediaQuery } from '@/hooks/use-media-query'
@@ -35,7 +36,6 @@ import {
   ChevronLeft,
   ChevronRight,
   Info,
-  Loader2,
   Columns2,
   Upload,
   GitCompareArrows,
@@ -209,8 +209,17 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
   const refetchIfThisAsset = (eventAssetId: string) => {
     if (eventAssetId === asset?.id) refetchVersions()
   }
+  // The last progress heard for a version of this asset, shown by the
+  // processing placeholder when the version cannot be previewed. A worker that
+  // predates `version_id` is taken to be reporting the selected version.
+  const [transcodeProgress, setTranscodeProgress] = useState<{ versionId: string; percent: number } | null>(null)
   useSSE(asset?.project_id, {
-    onTranscodeProgress: (d) => refetchIfThisAsset(d.asset_id),
+    onTranscodeProgress: (d) => {
+      if (d.asset_id !== asset?.id) return
+      const versionId = d.version_id ?? useReviewStore.getState().currentVersion?.id
+      if (versionId) setTranscodeProgress({ versionId, percent: d.percent })
+      refetchIfThisAsset(d.asset_id)
+    },
     onTranscodeComplete: (d) => refetchIfThisAsset(d.asset_id),
     onTranscodeFailed: (d) => refetchIfThisAsset(d.asset_id),
   })
@@ -355,25 +364,19 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
   const versionProcessing =
     currentVersion?.processing_status === 'processing' ||
     currentVersion?.processing_status === 'uploading'
+  // A processing video plays a preview of its original when the browser can;
+  // the player itself falls back to the placeholder when it cannot.
+  const videoPreview = asset?.asset_type === 'video' && currentVersion?.processing_status === 'processing'
+  const processingPercent =
+    currentVersion && transcodeProgress?.versionId === currentVersion.id ? transcodeProgress.percent : null
 
   const renderMediaViewer = () => {
-    if (!currentVersion || !versionReady) {
+    if (!currentVersion || (!versionReady && !videoPreview)) {
+      if (versionProcessing) return <ProcessingPlaceholder percent={processingPercent} />
       return (
         <div className="flex-1 flex items-center justify-center">
           <div className="flex flex-col items-center gap-4 text-center px-6">
-            {versionProcessing ? (
-              <>
-                <div className="h-12 w-12 rounded-full bg-accent/10 flex items-center justify-center">
-                  <Loader2 className="h-6 w-6 animate-spin text-accent" />
-                </div>
-                <div>
-                  <p className="text-sm font-medium text-text-primary">Processing asset</p>
-                  <p className="text-xs text-text-tertiary mt-1">
-                    This may take a few minutes depending on file size.
-                  </p>
-                </div>
-              </>
-            ) : currentVersion?.processing_status === 'failed' ? (
+            {currentVersion?.processing_status === 'failed' ? (
               <>
                 <div className="h-12 w-12 rounded-full bg-status-error/10 flex items-center justify-center">
                   <Info className="h-6 w-6 text-status-error" />
@@ -410,6 +413,7 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
             assetId={asset.id}
             comments={comments}
             className="flex-1 min-h-0"
+            processingPercent={processingPercent}
             overlay={
               <>
                 <AnnotationOverlay key={focusedCommentId ?? 'none'} />

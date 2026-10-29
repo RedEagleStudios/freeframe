@@ -32,7 +32,7 @@ def _drive_process_asset(retries: int, retry_raises: BaseException):
                             asset_type=transcode_tasks.AssetType.video)
     version = SimpleNamespace(id=uuid.uuid4(),
                               processing_status=ProcessingStatus.uploading)
-    media_file = SimpleNamespace(version_id=version.id, s3_key_raw="raw/x")
+    media_file = SimpleNamespace(version_id=version.id, s3_key_raw="raw/x", raw_deleted_at=None)
 
     db = MagicMock()
     db.query.return_value = db

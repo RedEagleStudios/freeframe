@@ -173,6 +173,41 @@ describe('project details', () => {
     expect(screen.getByText('All users in the system can view this project.')).toBeInTheDocument()
   })
 
+  it('warns what a streaming project deletes, with the instance retention', async () => {
+    renderTab({ ...PROJECT, streaming_mode: false, streaming_retention_days: 14 })
+    await loaded()
+    const toggle = screen.getByRole('switch', { name: 'Streaming project' })
+    expect(toggle).toHaveAttribute('aria-checked', 'false')
+    expect(toggle).toHaveAccessibleDescription(
+      'Keeps a web MP4 for playback and download and deletes each uploaded original 14 days after it\u2019s ready. Originals can\u2019t be recovered.',
+    )
+  })
+
+  it('says deletion is off when the server keeps originals (retention 0)', async () => {
+    renderTab({ ...PROJECT, streaming_mode: true, streaming_retention_days: 0 })
+    await loaded()
+    const toggle = screen.getByRole('switch', { name: 'Streaming project' })
+    expect(toggle).toHaveAttribute('aria-checked', 'true')
+    expect(toggle).toHaveAccessibleDescription(/currently disabled on this server/)
+    expect(toggle).not.toHaveAccessibleDescription(/0 days/)
+  })
+
+  it('saves streaming_mode through the project PATCH, only when it changed', async () => {
+    renderTab({ ...PROJECT, streaming_mode: false, streaming_retention_days: 7 })
+    await loaded()
+
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Launch film v2' } })
+    await save()
+    expect(api.patch).toHaveBeenLastCalledWith('/projects/p1', { name: 'Launch film v2' })
+
+    fireEvent.click(screen.getByRole('switch', { name: 'Streaming project' }))
+    expect(within(saveBar()).getByText('Unsaved changes')).toBeInTheDocument()
+    await save()
+    expect(api.patch).toHaveBeenLastCalledWith('/projects/p1', { streaming_mode: true })
+    expect(api.patch).toHaveBeenCalledTimes(2)
+    expect(saveButton()).toBeDisabled()
+  })
+
   it('will not save without a name', async () => {
     renderTab()
     await loaded()

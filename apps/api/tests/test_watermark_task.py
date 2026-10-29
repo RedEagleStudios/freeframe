@@ -32,7 +32,8 @@ def _mock_db(filename="clip.mp4"):
     asset = SimpleNamespace(id="00000000-0000-0000-0000-000000000001",
                             project_id="00000000-0000-0000-0000-000000000002")
     version = SimpleNamespace(id="00000000-0000-0000-0000-000000000003")
-    source = SimpleNamespace(original_filename=filename, s3_key_raw="raw/clip.mp4")
+    source = SimpleNamespace(original_filename=filename, s3_key_raw="raw/clip.mp4",
+                             raw_deleted_at=None)
     rows = {Asset: asset, AssetVersion: version, MediaFile: source}
 
     def query(model):

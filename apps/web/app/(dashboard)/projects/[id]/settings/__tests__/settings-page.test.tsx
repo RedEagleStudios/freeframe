@@ -99,6 +99,22 @@ describe('who sees the settings', () => {
     expect(screen.queryByLabelText('Name')).toBeNull()
   })
 
+  it('offers the Streaming project switch to the owner only', async () => {
+    project = { ...PROJECT, streaming_mode: false, streaming_retention_days: 30 }
+    const { unmount } = renderPage()
+    expect(await screen.findByRole('switch', { name: 'Streaming project' })).toBeInTheDocument()
+    expect(screen.getByText(/deletes each uploaded original 30 days after/)).toBeInTheDocument()
+    unmount()
+
+    for (const role of ['editor', 'reviewer', 'viewer']) {
+      project = { ...PROJECT, role, streaming_mode: true, streaming_retention_days: 30 }
+      const view = renderPage()
+      expect(await screen.findByText('Only the project owner can change settings.')).toBeInTheDocument()
+      expect(screen.queryByRole('switch', { name: 'Streaming project' })).toBeNull()
+      view.unmount()
+    }
+  })
+
   it('falls back to the member list when the project names no role', async () => {
     project = { ...PROJECT, role: null }
     renderPage()
