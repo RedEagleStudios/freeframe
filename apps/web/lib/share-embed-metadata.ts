@@ -29,8 +29,27 @@ export interface ShareEmbed {
   } | null
 }
 
-/** Twitter's player card needs a size; Discord sizes from og:video:* instead. */
-const FALLBACK_PLAYER = { width: 1280, height: 720 }
+/**
+ * The video tags a share page renders itself (see the share layout): Next's
+ * `openGraph.videos` always writes `og:video` + `og:video:type` + the Twitter
+ * player tags, and with those Discord sizes the file and refuses anything over
+ * its embed limit (a 272 MB MP4 got no player). The minimal set below --
+ * `og:video:url` plus its size, beside `og:type=video.other` and `og:image` --
+ * is what large-file embedders use, and Discord plays it inline whatever the
+ * size. Verified against Discord with the same 272 MB file.
+ */
+export function shareEmbedVideoTags(
+  embed: ShareEmbed | null,
+  publicApiUrl: string | null,
+): { property: string; content: string }[] {
+  const video = embed?.video
+  if (!video || !publicApiUrl) return []
+  return [
+    { property: 'og:video:url', content: absolute(publicApiUrl, video.url) },
+    ...(video.width ? [{ property: 'og:video:width', content: String(video.width) }] : []),
+    ...(video.height ? [{ property: 'og:video:height', content: String(video.height) }] : []),
+  ]
+}
 
 const ABSOLUTE_HTTP_URL = /^https?:\/\//i
 
@@ -74,8 +93,8 @@ function absolute(apiBase: string, path: string): string {
  * Maps a share link's embed description to page metadata.
  *
  * - A single-video link with a web MP4 (or, while it processes, a playable
- *   original): `og:type=video.other` with og:video (what Discord plays
- *   inline) and a Twitter `player` card.
+ *   original): `og:type=video.other` and a `player` card; the video itself is
+ *   in the tags from `shareEmbedVideoTags`, which the share layout renders.
  * - Anything else with a picture: `og:type=website` and a large-image card.
  * - `null` (the link is private, gone, or the API did not answer): the
  *   generic title and nothing else, so a preview never leaks a thumbnail.
@@ -103,8 +122,6 @@ export function buildShareEmbedMetadata(
   const video = embed.video && publicApiUrl ? embed.video : null
 
   if (video && publicApiUrl) {
-    const mp4 = absolute(publicApiUrl, video.url)
-    const secureMp4 = absolute(publicApiUrl, video.secure_url || video.url)
     return {
       title,
       description,
@@ -114,36 +131,8 @@ export function buildShareEmbedMetadata(
         siteName: embed.site_name,
         ...(description ? { description } : {}),
         ...(image ? { images: [image] } : {}),
-        videos: [
-          {
-            url: mp4,
-            secureUrl: secureMp4,
-            type: video.type,
-            ...(video.width ? { width: video.width } : {}),
-            ...(video.height ? { height: video.height } : {}),
-          },
-        ],
       },
-      twitter: {
-        card: 'player',
-        title,
-        ...(description ? { description } : {}),
-        ...(image ? { images: [image.url] } : {}),
-        // The MP4 itself rather than an HTML player page: Discord reads
-        // og:video and ignores this, and a bare file is what other consumers
-        // of twitter:player:stream expect.
-        players: [
-          {
-            playerUrl: secureMp4,
-            streamUrl: mp4,
-            width: video.width || FALLBACK_PLAYER.width,
-            height: video.height || FALLBACK_PLAYER.height,
-          },
-        ],
-      },
-      // Next renders every other player tag from `twitter.players`, but not
-      // the stream's content type.
-      other: { 'twitter:player:stream:content_type': video.type },
+      other: { 'twitter:card': 'player' },
     }
   }
 

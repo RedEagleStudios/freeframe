@@ -2,13 +2,15 @@ import { describe, it, expect } from 'vitest'
 import {
   buildShareEmbedMetadata,
   resolvePublicApiUrl,
+  shareEmbedVideoTags,
   type ShareEmbed,
 } from '../share-embed-metadata'
 
-// Link previews (Discord, Slack, X…) for a share link. Discord plays og:video
-// inline; the Twitter player tags are there for everything that reads those
-// instead. Every URL is absolute against the API's PUBLIC address and is the
-// API's stable redirecting path, never a presigned one that expires.
+// Link previews (Discord, Slack, X…) for a share link. Discord plays the video
+// inline from og:video:url; with og:video:type / twitter:player:* present it
+// refuses files over its embed size limit instead. Every URL is absolute
+// against the API's PUBLIC address and is the API's stable redirecting path,
+// never a presigned one that expires.
 
 const API = 'https://review.example.com/api'
 
@@ -28,8 +30,9 @@ const VIDEO: ShareEmbed = {
 }
 
 describe('buildShareEmbedMetadata', () => {
-  it('gives a single-video link the full og:video and twitter player tags', () => {
-    expect(buildShareEmbedMetadata(VIDEO, API)).toEqual({
+  it('marks a single-video link as a video player card without Next writing any og:video tag', () => {
+    const md = buildShareEmbedMetadata(VIDEO, API)
+    expect(md).toEqual({
       title: 'Launch film — final',
       description: 'Cut 7 for client review',
       openGraph: {
@@ -38,65 +41,34 @@ describe('buildShareEmbedMetadata', () => {
         siteName: 'Acme Review',
         description: 'Cut 7 for client review',
         images: [{ url: `${API}/share/tok/embed.jpg`, width: 1280, height: 720 }],
-        videos: [{
-          url: `${API}/share/tok/embed.mp4`,
-          secureUrl: `${API}/share/tok/embed.mp4`,
-          type: 'video/mp4',
-          width: 1920,
-          height: 1080,
-        }],
       },
-      twitter: {
-        card: 'player',
-        title: 'Launch film — final',
-        description: 'Cut 7 for client review',
-        images: [`${API}/share/tok/embed.jpg`],
-        players: [{
-          playerUrl: `${API}/share/tok/embed.mp4`,
-          streamUrl: `${API}/share/tok/embed.mp4`,
-          width: 1920,
-          height: 1080,
-        }],
-      },
-      other: { 'twitter:player:stream:content_type': 'video/mp4' },
+      other: { 'twitter:card': 'player' },
     })
   })
 
-  it('leaves out sizes it does not know, but always sizes the twitter player', () => {
-    const md = buildShareEmbedMetadata(
-      { ...VIDEO, description: null, image: null, video: { ...VIDEO.video!, width: null, height: null } },
-      API,
-    )
-    expect(md.openGraph).toMatchObject({
-      videos: [{ url: `${API}/share/tok/embed.mp4`, secureUrl: `${API}/share/tok/embed.mp4`, type: 'video/mp4' }],
-    })
-    expect(md.openGraph).not.toHaveProperty('videos.0.width')
+  it('gives the layout only og:video:url and its size: no type, secure_url or twitter player', () => {
+    expect(shareEmbedVideoTags(VIDEO, API)).toEqual([
+      { property: 'og:video:url', content: `${API}/share/tok/embed.mp4` },
+      { property: 'og:video:width', content: '1920' },
+      { property: 'og:video:height', content: '1080' },
+    ])
+  })
+
+  it('leaves out sizes it does not know', () => {
+    const embed = { ...VIDEO, video: { ...VIDEO.video!, width: null, height: null } }
+    expect(shareEmbedVideoTags(embed, API)).toEqual([
+      { property: 'og:video:url', content: `${API}/share/tok/embed.mp4` },
+    ])
+    const md = buildShareEmbedMetadata({ ...embed, description: null, image: null }, API)
     expect(md.openGraph).not.toHaveProperty('images')
-    expect(md.openGraph).not.toHaveProperty('description')
     // Null clears the root layout's description instead of inheriting it.
     expect(md.description).toBeNull()
-    expect(md.twitter).toMatchObject({ players: [{ width: 1280, height: 720 }] })
-    expect(md.twitter).not.toHaveProperty('images')
   })
 
-  it('gives a still-processing video its original as og:video, with the original’s type', () => {
-    // What the API answers while the version transcodes: the early poster
-    // frame, the probed portrait size, and the uploaded .mov as the video.
-    const md = buildShareEmbedMetadata(
-      {
-        ...VIDEO,
-        image: { url: '/share/tok/embed.jpg', width: 1080, height: 1920 },
-        video: { ...VIDEO.video!, type: 'video/quicktime', width: 1080, height: 1920 },
-      },
-      API,
-    )
-    expect(md.openGraph).toMatchObject({
-      type: 'video.other',
-      images: [{ url: `${API}/share/tok/embed.jpg`, width: 1080, height: 1920 }],
-      videos: [{ url: `${API}/share/tok/embed.mp4`, type: 'video/quicktime', width: 1080, height: 1920 }],
-    })
-    expect(md.twitter).toMatchObject({ card: 'player', players: [{ width: 1080, height: 1920 }] })
-    expect(md.other).toEqual({ 'twitter:player:stream:content_type': 'video/quicktime' })
+  it('emits no video tags without a video or without a public API address', () => {
+    expect(shareEmbedVideoTags({ ...VIDEO, video: null }, API)).toEqual([])
+    expect(shareEmbedVideoTags(VIDEO, null)).toEqual([])
+    expect(shareEmbedVideoTags(null, API)).toEqual([])
   })
 
   it('gives a link without a web MP4 a website card with its picture', () => {
