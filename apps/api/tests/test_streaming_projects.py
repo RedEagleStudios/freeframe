@@ -25,6 +25,10 @@ def _sign(key, *a, **k):
     return f"https://s3.test/{key}?sig=1"
 
 
+def _sign_head(key, *a, **k):
+    return f"https://s3.test/{key}?sig=head"
+
+
 @pytest.fixture
 def api(real_db, monkeypatch):
     from fastapi.testclient import TestClient
@@ -38,6 +42,7 @@ def api(real_db, monkeypatch):
         "apps.api.services.streaming.generate_presigned_get_url",
     ):
         monkeypatch.setattr(target, _sign)
+    monkeypatch.setattr("apps.api.routers.share.generate_presigned_head_url", _sign_head)
     # Every caller here shares one IP; the share limits are not under test.
     monkeypatch.setattr("apps.api.middleware.rate_limit.client_ip", lambda r: str(uuid.uuid4()))
     who = {"user": None}
@@ -623,12 +628,15 @@ def test_the_embed_media_redirect_to_fresh_presigned_urls(api, real_db, method):
     _, mf = _version(real_db, asset, owner, ProcessingStatus.ready)
     link = _link(real_db, owner, asset=asset)
     client = api(None)
+    # A redirect is followed with the same method, and storage checks the signature
+    # against it: a HEAD sent to a GET-signed URL is refused (403).
+    signed = _sign_head if method == "head" else _sign
 
     mp4 = getattr(client, method)(f"/share/{link.token}/embed.mp4", follow_redirects=False)
     jpg = getattr(client, method)(f"/share/{link.token}/embed.jpg", follow_redirects=False)
 
-    assert mp4.status_code == 302 and mp4.headers["location"] == _sign(mf.s3_key_download)
-    assert jpg.status_code == 302 and jpg.headers["location"] == _sign(mf.s3_key_thumbnail)
+    assert mp4.status_code == 302 and mp4.headers["location"] == signed(mf.s3_key_download)
+    assert jpg.status_code == 302 and jpg.headers["location"] == signed(mf.s3_key_thumbnail)
     assert mp4.headers["cache-control"] == "no-store"
 
 

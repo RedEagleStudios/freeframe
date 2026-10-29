@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from typing import NamedTuple, Optional
 import bcrypt
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import RedirectResponse
 import sqlalchemy
 from sqlalchemy import func as sa_func, case
@@ -50,7 +50,7 @@ from ..services.redis_service import create_share_session
 from ..services.search import escape_like
 from ..services.owned_keys import is_project_logo_key, sign_if_owned
 from ..services.avatar_keys import sign_avatar
-from ..services.s3_service import generate_presigned_get_url, build_download_filename
+from ..services.s3_service import generate_presigned_get_url, generate_presigned_head_url, build_download_filename
 from ..schemas.asset import DownloadOption
 from ..services.downloads import (
     describe_choices, download_choices, download_filename, may_download_original,
@@ -1915,16 +1915,21 @@ def get_share_embed(token: str, db: Session = Depends(get_db)):
     methods=["GET", "HEAD"],
     dependencies=[Depends(rate_limit("share_embed_media", 120, 60))],
 )
-def get_share_embed_video(token: str, db: Session = Depends(get_db)):
+def get_share_embed_video(token: str, request: Request, db: Session = Depends(get_db)):
     """Public. 302 to a fresh presigned GET of the shared video: its web MP4, or
     while it is still processing, its uploaded original (see above)."""
     link = _embed_link(db, token)
     embed_video = _embed_video(_embed_media(db, link))
     if not embed_video:
         raise HTTPException(status_code=404, detail="Not found")
-    return RedirectResponse(
-        generate_presigned_get_url(embed_video[0]), status_code=302, headers=_EMBED_REDIRECT_HEADERS,
-    )
+    return RedirectResponse(_embed_target(request, embed_video[0]), status_code=302, headers=_EMBED_REDIRECT_HEADERS)
+
+
+def _embed_target(request: Request, s3_key: str) -> str:
+    # A HEAD follows the redirect as a HEAD, and a URL signed for GET refuses it.
+    if request.method == "HEAD":
+        return generate_presigned_head_url(s3_key)
+    return generate_presigned_get_url(s3_key)
 
 
 @router.api_route(
@@ -1932,7 +1937,7 @@ def get_share_embed_video(token: str, db: Session = Depends(get_db)):
     methods=["GET", "HEAD"],
     dependencies=[Depends(rate_limit("share_embed_media", 120, 60))],
 )
-def get_share_embed_image(token: str, db: Session = Depends(get_db)):
+def get_share_embed_image(token: str, request: Request, db: Session = Depends(get_db)):
     """Public. 302 to a fresh presigned GET of the shared asset's thumbnail."""
     link = _embed_link(db, token)
     asset, media_file, _ = _embed_media(db, link)
@@ -1942,6 +1947,6 @@ def get_share_embed_image(token: str, db: Session = Depends(get_db)):
     ):
         raise HTTPException(status_code=404, detail="Not found")
     return RedirectResponse(
-        generate_presigned_get_url(media_file.s3_key_thumbnail), status_code=302,
+        _embed_target(request, media_file.s3_key_thumbnail), status_code=302,
         headers=_EMBED_REDIRECT_HEADERS,
     )

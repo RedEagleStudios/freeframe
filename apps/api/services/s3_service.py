@@ -606,6 +606,16 @@ def generate_presigned_get_url(s3_key: str, expires_in: int = 3600, download_fil
         ExpiresIn=expires_in,
     )
 
+def generate_presigned_head_url(s3_key: str, expires_in: int = 3600) -> str:
+    """A presigned HEAD URL. A presigned GET is signed for GET only: following a
+    redirect to one with HEAD (link-preview bots size a video this way) gets 403."""
+    s3 = _get_presign_client()
+    return s3.generate_presigned_url(
+        "head_object",
+        Params={"Bucket": settings.s3_bucket, "Key": s3_key},
+        ExpiresIn=expires_in,
+    )
+
 def generate_internal_presigned_get_url(s3_key: str, expires_in: int = 3600) -> str:
     """Generate a presigned GET URL using the API's configured S3 endpoint.
 
