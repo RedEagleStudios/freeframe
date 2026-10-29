@@ -45,6 +45,27 @@ def test_backfill_updates_video_row():
     db.commit.assert_called()
 
 
+def test_backfill_stores_a_turned_videos_display_size():
+    """Same as the transcode: a phone clip recorded on its side is stored portrait."""
+    from apps.api.tasks.transcode_tasks import backfill_media_metadata
+
+    media_file = MagicMock(duration_seconds=None, s3_key_raw="raw/key.mov")
+    db = _mock_db([(media_file, AssetType.video)])
+    probe = MagicMock(returncode=0, stdout=json.dumps({
+        "streams": [{"r_frame_rate": "30/1", "width": 1920, "height": 1080, "duration": "12.0",
+                     "side_data_list": [{"side_data_type": "Display Matrix", "rotation": 90}]}],
+        "format": {"duration": "12.0"},
+    }))
+
+    with patch("apps.api.tasks.transcode_tasks.SessionLocal", return_value=db), \
+         patch("apps.api.tasks.transcode_tasks.get_s3_client") as s3, \
+         patch("subprocess.run", return_value=probe):
+        s3.return_value.generate_presigned_url.return_value = "https://example/presigned"
+        backfill_media_metadata.apply().get()
+
+    assert (media_file.width, media_file.height) == (1080, 1920)
+
+
 def test_backfill_skips_failed_probe():
     from apps.api.tasks.transcode_tasks import backfill_media_metadata
 

@@ -80,10 +80,20 @@ def test_the_poster_frame_and_size_are_reported_right_after_the_probe():
     assert result.thumbnail_keys == [f"{PREFIX}/thumbnail.jpg"]
 
 
-def test_a_turned_source_reports_its_display_size():
-    _, _, reported, _ = _transcode({"side_data_list": [{"side_data_type": "Display Matrix", "rotation": -90}]})
+def test_a_turned_source_reports_and_stores_its_display_size():
+    result, _, reported, _ = _transcode({"side_data_list": [{"side_data_type": "Display Matrix", "rotation": -90}]})
 
     assert reported[0][0][:2] == (1080, 1920)
+    # The size persisted at the end agrees with the early one.
+    assert result.success, result.error
+    assert (result.width, result.height) == (1080, 1920)
+
+
+def test_an_upright_or_half_turned_source_keeps_its_storage_size():
+    for extra in ({}, {"side_data_list": [{"side_data_type": "Display Matrix", "rotation": 180}]}):
+        result, _, reported, _ = _transcode(extra)
+        assert reported[0][0][:2] == (1920, 1080)
+        assert (result.width, result.height) == (1920, 1080)
 
 
 def test_a_failing_early_frame_reports_the_size_and_keeps_transcoding():

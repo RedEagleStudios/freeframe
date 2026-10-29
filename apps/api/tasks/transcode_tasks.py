@@ -306,6 +306,7 @@ def backfill_media_metadata(self):
     import subprocess
     from packages.transcoder.ffmpeg_transcoder import (
         _PRIMARY_VIDEO_STREAM,
+        display_size,
         parse_probe_metadata,
     )
     from packages.transcoder.redact import redact_presigned_urls
@@ -341,8 +342,7 @@ def backfill_media_metadata(self):
                         skipped += 1
                         continue
                     media_file.duration_seconds = meta.duration_seconds or None
-                    media_file.width = meta.width or None
-                    media_file.height = meta.height or None
+                    media_file.width, media_file.height = display_size(meta, data["streams"][0])
                     media_file.fps = meta.fps or None
                 else:
                     duration = float((data.get("format") or {}).get("duration") or 0)
