@@ -8,6 +8,7 @@ import { Avatar } from '@/components/shared/avatar'
 import { EmptyState } from '@/components/shared/empty-state'
 import { ContextMenuArea, DotsMenu } from '@/components/shared/item-menu'
 import { AssetCard } from './asset-card'
+import { ProcessingBadge } from '@/components/shared/processing-badge'
 import { FolderCard } from './folder-card'
 import { AssetMenuItems } from './menus/asset-menu'
 import { WithFolderMenu } from './menus/folder-menu'
@@ -47,6 +48,8 @@ interface AssetGridProps {
   versionCounts?: Record<string, number>
   authorNames?: Record<string, string>
   fileSizes?: Record<string, number>
+  /** Assets whose latest version is still being transcoded. */
+  processingAssetIds?: ReadonlySet<string>
   selectedAssetId?: string | null
   onUpload?: () => void
   onAssetSelect?: (asset: Asset, e?: React.MouseEvent) => void
@@ -117,6 +120,7 @@ export function AssetGrid({
   versionCounts = {},
   authorNames = {},
   fileSizes = {},
+  processingAssetIds,
   selectedAssetId,
   onUpload,
   onAssetSelect,
@@ -514,6 +518,7 @@ export function AssetGrid({
                 assignee={asset.assignee_id ? assignees[asset.assignee_id] : null}
                 authorName={authorNames[asset.created_by]}
                 thumbnailUrl={thumbnails[asset.id]}
+                processing={processingAssetIds?.has(asset.id)}
                 fileSize={fileSizes[asset.id] ?? null}
                 selected={selectedAssetIds.has(asset.id)}
                 onSelect={(e) => handleAssetCheckbox(asset.id, e)}
@@ -707,8 +712,9 @@ export function AssetGrid({
                   </button>
                 </div>
                 {/* Name + status */}
-                <div className="flex-1 min-w-0">
+                <div className="flex-1 min-w-0 flex items-center gap-2">
                   <p className="text-sm font-medium text-text-primary truncate leading-snug">{asset.name}</p>
+                  {processingAssetIds?.has(asset.id) && <ProcessingBadge className="shrink-0" />}
                 </div>
                 {/* Uploader */}
                 {showUploader && (

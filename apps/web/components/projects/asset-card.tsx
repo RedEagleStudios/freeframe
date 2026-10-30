@@ -6,6 +6,7 @@ import { cn, formatRelativeTime, formatBytes } from '@/lib/utils'
 import type { Asset, AssetType, DownloadOption, User } from '@/types'
 import { ContextMenuArea, DotsMenu } from '@/components/shared/item-menu'
 import { CommentCountBadge } from '@/components/shared/comment-count-badge'
+import { ProcessingBadge } from '@/components/shared/processing-badge'
 import { AssetMenuItems } from './menus/asset-menu'
 import type { AspectRatio, ThumbnailScale, TitleLines } from '@/stores/view-store'
 
@@ -31,6 +32,8 @@ interface AssetCardProps {
   thumbnailUrl?: string | null
   commentCount?: number
   duration?: number | null
+  /** The latest version is still being transcoded. */
+  processing?: boolean
   selected?: boolean
   onSelect?: (e: React.MouseEvent) => void
   onDragStart?: (e: React.DragEvent) => void
@@ -75,6 +78,7 @@ export function AssetCard({
   thumbnailUrl,
   commentCount,
   duration,
+  processing = false,
   selected = false,
   onSelect,
   onDragStart,
@@ -160,6 +164,11 @@ export function AssetCard({
           >
             <Check className="h-3.5 w-3.5" />
           </button>
+        )}
+
+        {/* Processing badge — top-right, until the latest version is ready */}
+        {processing && (
+          <ProcessingBadge className="absolute top-2 right-2 bg-bg-primary/80 backdrop-blur-sm" />
         )}
 
         {/* Duration badge — bottom-right (for video/audio) */}

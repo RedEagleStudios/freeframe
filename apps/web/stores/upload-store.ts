@@ -1459,6 +1459,12 @@ export interface UploadFile {
   holdReason?: 'connection' | 'storage'
   /** An `interrupted` row the user resumed, waiting for its turn. Never saved. */
   queuedResume?: true
+  /**
+   * The only file of its drop or pick, going up as a new asset rather than a
+   * new version. A streaming project's page opens Create Share Link for it once
+   * it lands. Never saved: a reload has no pick to answer.
+   */
+  soloNewAsset?: true
   /** A `starting` row that is a resume rather than a new upload. Never saved. */
   resuming?: true
   /** Refused before anything was created on the server. */
@@ -3241,6 +3247,7 @@ function enqueueNew(
       ownerId: owner,
       dropSeq,
       ...(target.kind === 'version' ? { assetId: target.assetId } : {}),
+      ...(items.length === 1 && target.kind === 'asset' ? { soloNewAsset: true as const } : {}),
     }
   })
   queue.enqueue(rows.map((r) => queueEntry(r, 'new')), 'back')
@@ -3866,6 +3873,7 @@ function savedRow(f: UploadFile): UploadFile | null {
   delete kept.queuedResume
   delete kept.resuming
   delete kept.holdReason
+  delete kept.soloNewAsset
   // Sequence numbers are counters of this page load: a saved one would outrank
   // the first drop of the next load, which counts from 1 again.
   delete kept.dropSeq

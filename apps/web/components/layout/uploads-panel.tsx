@@ -1,6 +1,7 @@
 'use client'
 
 import * as React from 'react'
+import Link from 'next/link'
 import {
   X,
   CheckCircle,
@@ -12,11 +13,11 @@ import {
   FileIcon,
   RotateCcw,
   Ban,
-  Cog,
   PauseCircle,
   Trash2,
   MonitorUp,
   Pencil,
+  ArrowUpRight,
 } from 'lucide-react'
 import { cn, formatBytes, formatRelativeTime, formatTimeLeft } from '@/lib/utils'
 import { useShallow } from 'zustand/react/shallow'
@@ -26,6 +27,7 @@ import {
 import { useUploadSpeedStore } from '@/stores/upload-speed-store'
 import { carriesFiles } from '@/lib/drag'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { ProcessingBadge } from '@/components/shared/processing-badge'
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -200,7 +202,7 @@ function StatusBadge({ upload }: { upload: UploadFile }) {
     case 'uploading':
       return <span className="inline-flex items-center gap-1 rounded-full bg-accent/10 px-2 py-0.5 text-[10px] font-medium text-accent"><Loader2 className="h-2.5 w-2.5 animate-spin" />{finalizing ? 'Finalizing' : 'Uploading'}</span>
     case 'processing':
-      return <span className="inline-flex items-center gap-1 rounded-full bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium text-amber-400"><Cog className="h-2.5 w-2.5 animate-spin" />Processing</span>
+      return <ProcessingBadge />
     case 'complete':
       return <span className="inline-flex items-center gap-1 rounded-full bg-status-success/10 px-2 py-0.5 text-[10px] font-medium text-status-success"><CheckCircle className="h-2.5 w-2.5" />Ready</span>
     case 'failed':
@@ -437,6 +439,7 @@ function UploadRow({ upload }: { upload: UploadFile }) {
   const cancelUpload = useUploadStore((s) => s.cancelUpload)
   const removeFile = useUploadStore((s) => s.removeFile)
   const resumeUpload = useUploadStore((s) => s.resumeUpload)
+  const setPanelOpen = useUploadStore((s) => s.setPanelOpen)
   const discardUpload = useUploadStore((s) => s.discardUpload)
   const retryUpload = useUploadStore((s) => s.retryUpload)
   // Asked of the store rather than guessed from the row: both depend on what
@@ -664,6 +667,19 @@ function UploadRow({ upload }: { upload: UploadFile }) {
             }
           }}
         />
+        {/* The asset exists from here on, and a processing MP4, MOV or WebM
+            already plays its original in the viewer. */}
+        {(isProcessing || upload.status === 'complete') && upload.assetId && (
+          <Link
+            href={`/projects/${upload.projectId}/assets/${upload.assetId}`}
+            onClick={() => setPanelOpen(false)}
+            className="h-6 w-6 flex items-center justify-center rounded text-text-tertiary hover:text-accent hover:bg-bg-hover transition-colors"
+            title="Open"
+            aria-label={`Open ${upload.assetName}`}
+          >
+            <ArrowUpRight className="h-3.5 w-3.5" />
+          </Link>
+        )}
         {isUploading && !isFinalizing && (
           <button
             onClick={() => cancelUpload(upload.id)}

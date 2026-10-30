@@ -35,6 +35,7 @@ import { useFileDropRegion } from "@/components/projects/use-file-drop-region";
 import { startDrop } from "@/lib/upload-drop";
 import { currentSubject } from "@/lib/upload-owner";
 import type { Collected } from "@/lib/upload-folder-walk";
+import type { UploadFile } from "@/stores/upload-store";
 import { useToast } from "@/components/shared/toast";
 import { useBranding } from "@/components/shared/branding-provider";
 import { useAuthStore } from "@/stores/auth-store";
@@ -56,6 +57,7 @@ import { ShareCreateDialog } from "@/components/projects/share-create-dialog";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { usePageTitle } from "@/hooks/use-page-title";
 import { useRefetchOnUploadStatus } from "@/hooks/use-upload-refetch";
+import { useSoloUploadLanded } from "@/hooks/use-solo-upload-landed";
 import type {
   Project,
   AssetResponse,
@@ -94,6 +96,11 @@ export default function ProjectDetailPage() {
     string | null
   >(null);
   const [shareDialogOpen, setShareDialogOpen] = React.useState(false);
+  // Read by the upload watcher below, which lives outside React's render.
+  const shareDialogOpenRef = React.useRef(false);
+  React.useEffect(() => {
+    shareDialogOpenRef.current = shareDialogOpen;
+  }, [shareDialogOpen]);
   const [shareDialogPreselect, setShareDialogPreselect] = React.useState<{
     type: "folder" | "asset";
     id: string;
@@ -256,6 +263,16 @@ export default function ProjectDetailPage() {
     return map;
   }, [assets]);
 
+  const processingAssetIds = React.useMemo(
+    () =>
+      new Set(
+        (assets ?? [])
+          .filter((a) => a.latest_version?.processing_status === "processing")
+          .map((a) => a.id),
+      ),
+    [assets],
+  );
+
   // Fetch user info for asset authors
   const authorIds = React.useMemo(() => {
     if (!assets) return [];
@@ -385,6 +402,21 @@ export default function ProjectDetailPage() {
     mutateSubfolders();
   }, [mutateAssets, mutateSubfolders]);
   useRefetchOnUploadStatus(projectId, refetchGrid);
+
+  // A streaming project's uploads are there to be shared, so a single new file
+  // opens Create Share Link as soon as it is up, without waiting for the
+  // transcode: a link to a processing MP4, MOV or WebM plays its original until
+  // the stream is ready. A drop of several files, or a new version, opens
+  // nothing. Neither does a landing while the dialog is already open, which
+  // would swap out what the user is sharing.
+  const openShareForLanded = React.useCallback((row: UploadFile) => {
+    if (shareDialogOpenRef.current || !row.assetId) return;
+    setShareDialogPreselect({ type: "asset", id: row.assetId, name: row.assetName });
+    setShareDialogPreselectedItems([]);
+    setShareDialogResult(null);
+    setShareDialogOpen(true);
+  }, []);
+  useSoloUploadLanded(projectId, !!project?.streaming_mode && canShare, openShareForLanded);
 
   // ─── Drop files onto the asset area ─────────────────────────────────────
   //
@@ -821,6 +853,7 @@ export default function ProjectDetailPage() {
               versionCounts={versionCounts}
               authorNames={authorNames}
               fileSizes={fileSizes}
+              processingAssetIds={processingAssetIds}
               selectedAssetId={selectedAsset?.id}
               selectionShortcuts
               onDeselectAll={() => setSelectedAsset(null)}
