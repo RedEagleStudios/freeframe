@@ -99,6 +99,19 @@ describe('useRefetchOnUploadStatus', () => {
     expect(refetch).toHaveBeenCalledTimes(1)
   })
 
+  it('refetches when the first upload of a project starts processing', () => {
+    // The asset list includes a processing version, so the grid shows the new
+    // asset, with its Processing badge, without waiting for the transcode.
+    useUploadStore.setState({ files: [{ ...row('up', 'uploading'), assetId: 'a-up' }] })
+    const refetch = vi.fn()
+    renderHook(() => useRefetchOnUploadStatus('p', refetch))
+    expect(refetch).not.toHaveBeenCalled()
+
+    patch('up', { progress: 100, status: 'processing' })
+
+    expect(refetch).toHaveBeenCalledTimes(1)
+  })
+
   it('refetches on any status change while one of its uploads is complete', () => {
     useUploadStore.setState({ files: [row('done', 'complete'), row('up', 'uploading')] })
     const refetch = vi.fn()
@@ -265,11 +278,13 @@ describe('useRefetchOnUploadStatus', () => {
   })
 
   it("does not count another project's finished upload as this one's", () => {
-    useUploadStore.setState({ files: [row('done', 'complete', 'q'), row('up', 'uploading')] })
+    useUploadStore.setState({ files: [row('done', 'complete', 'q'), row('up', 'starting')] })
     const refetch = vi.fn()
     renderHook(() => useRefetchOnUploadStatus('p', refetch))
 
-    patch('up', { progress: 100, status: 'processing' })
+    // Sending with an asset is a state the grid can see, but only once one of
+    // this project's uploads has landed.
+    patch('up', { status: 'uploading', assetId: 'a-up' })
 
     expect(refetch).not.toHaveBeenCalled()
   })

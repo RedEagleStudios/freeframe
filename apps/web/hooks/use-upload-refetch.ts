@@ -51,9 +51,10 @@ function onItsWay(f: UploadFile): boolean {
 
 /**
  * Calls `refetch` when one of this project's uploads changes what the asset
- * grid shows while one of them is complete, which is when the grid can be out
- * of date. A row leaving one of those states (a cancel, an interruption)
- * changes it too.
+ * grid shows while one of them is processing or complete, which is when the
+ * grid can be out of date: the project's asset list includes a version from
+ * the moment it is processing. A row leaving one of those states (a cancel, an
+ * interruption) changes it too.
  *
  * At most once per `GRID_REFETCH_GAP_MS`: the first change after a quiet spell
  * refetches at once, and changes inside the gap are folded into one refetch at
@@ -103,20 +104,20 @@ export function useRefetchOnUploadStatus(projectId: string, refetch: () => void)
     const look = (files: UploadFile[]) => {
       if (files === seenFiles) return
       seenFiles = files
-      let anyComplete = false
+      let anyLanded = false
       let anyOnItsWay = false
       const parts: string[] = []
       for (const f of files) {
         if (f.projectId !== projectId) continue
-        if (f.status === 'complete') anyComplete = true
+        if (f.status === 'processing' || f.status === 'complete') anyLanded = true
         if (onItsWay(f)) anyOnItsWay = true
         const state = gridState(f)
         if (state) parts.push(`${f.id}:${state}`)
       }
-      const key = `${anyComplete}\n${parts.join('\n')}`
+      const key = `${anyLanded}\n${parts.join('\n')}`
       if (key === seenKey) return
       seenKey = key
-      if (!anyComplete) return
+      if (!anyLanded) return
       // Settled: nothing is left to fold in, so the grid need not wait for the gap.
       if (!anyOnItsWay && Date.now() - lastAt >= GRID_SETTLE_GAP_MS) {
         refetchNow()
