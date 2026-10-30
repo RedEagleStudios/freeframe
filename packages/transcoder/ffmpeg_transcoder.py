@@ -2151,26 +2151,33 @@ class FFmpegTranscoder(BaseTranscoder):
 
             # A rung is named for the short side, whichever way up the source
             # is, and rotation does not change which side that is (#452).
-            qualities = [q for q in requested
-                         if rung_height(q) <= min(source_width, source_height)]
+            short_side = min(source_width, source_height)
+            qualities = [q for q in requested if rung_height(q) <= short_side]
             # What each rung scales to. Its own nominal size, except for the one
-            # kept below; either is turned to the frame's shape by rung_box().
+            # clamped below; either is turned to the frame's shape by rung_box().
             scale_targets = {q: QUALITY_MAP[q][0] for q in requested}
-            if not qualities and requested:
-                # Never emit an empty ladder: keep the smallest requested rung,
-                # clamped to the source instead of scaled up to its nominal
-                # size. Restoring it unchanged is what made
-                # `TRANSCODER_QUALITIES=1080p` turn a 640x360 upload into a
-                # single upscaled 1920x1080 rendition -- more encode time and
-                # more storage than the source itself, and #201 re-entering
-                # through configuration. Clamped, a one-rung ladder above the
-                # source means "source size", which is the only useful reading
-                # of it. Without probed dimensions there is nothing to clamp
-                # against, so the rung stands as before.
-                smallest = min(requested, key=rung_height)
-                qualities = [smallest]
+            # A source that falls between rungs, or under all of them, also gets
+            # the next rung up, its box clamped to the source so nothing is
+            # scaled up: the top rendition is then the source's own size, or
+            # that rung's box where the source is wider. Dropping the rung left a 900p
+            # upload under `TRANSCODER_QUALITIES=1080p,360p` with a 360p
+            # rendition only. Scaling it to its nominal size instead is what
+            # made `TRANSCODER_QUALITIES=1080p` turn a 640x360 upload into one
+            # upscaled 1920x1080 rendition -- more encode time and more storage
+            # than the source itself, and #201 re-entering through
+            # configuration. A source that matches a rung exactly needs nothing
+            # more. Without probed dimensions there is nothing to clamp against:
+            # the smallest rung stands at its nominal size, so the ladder is
+            # never empty.
+            next_up = min((q for q in requested if rung_height(q) > short_side),
+                          key=rung_height, default=None)
+            if next_up and (not qualities or short_side > max(map(rung_height, qualities))):
+                qualities = [q for q in requested if q in qualities or q == next_up]
                 if source_width and source_height:
-                    scale_targets[smallest] = f"{source_width}:{source_height}"
+                    # Landscape, as QUALITY_MAP's boxes are; rung_box() turns it.
+                    box_w, box_h = (int(v) for v in QUALITY_MAP[next_up][0].split(":"))
+                    long_side = max(source_width, source_height)
+                    scale_targets[next_up] = f"{min(box_w, long_side)}:{min(box_h, short_side)}"
 
             # 3b. Can this source be shipped as it is, rather than encoded?
             #

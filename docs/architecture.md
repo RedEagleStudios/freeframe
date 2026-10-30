@@ -126,7 +126,8 @@ Reviewer approves / rejects ──▶ SSE: approval_updated
      through `TRANSCODER_QUALITIES` but not built unless configured
    - 2-second segments with forced keyframes
    - The ladder is trimmed against the source resolution, so a small source never gets
-     upscaled renditions. If every rung is above the source, the smallest is kept.
+     upscaled renditions. When the source falls between rungs, or under all of them, the
+     next rung up is built at the source's own size, so the top rendition matches the source.
    - An optional NVENC/VAAPI hardware backend is selected at runtime when available, using
      `-global_quality` in place of `-crf`, and falls back to software on failure. A source
      the GPU can't decode (ProRes, 4:2:2, 10-bit H.264) is decoded on the CPU and uploaded,

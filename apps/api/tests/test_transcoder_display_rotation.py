@@ -228,10 +228,10 @@ def test_a_narrow_rotated_clip_is_sized_upright_on_the_first_attempt():
     assert result.success is True
     nvdec, cpu_decode = calls
     assert _decodes_into_memory_on_nvdec(nvdec)
-    assert _boxes(nvdec) == {"360p": "146:702"}
+    assert _boxes(nvdec) == {"720p": "400:1280", "360p": "146:702"}
     assert "-hwaccel" not in cpu_decode
     assert _graph(cpu_decode).startswith("[0:V:0]format=nv12,hwupload_cuda[up];")
-    assert _boxes(cpu_decode) == {"360p": "146:702"}
+    assert _boxes(cpu_decode) == {"720p": "400:1280", "360p": "146:702"}
 
 
 def test_a_hardware_frame_is_sized_as_it_is_stored():

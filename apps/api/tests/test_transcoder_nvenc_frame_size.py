@@ -280,13 +280,13 @@ def test_a_very_tall_portrait_keeps_the_gpu_with_a_larger_360p_rung():
     assert result.success is True
     assert len(calls) == 1
     assert "-hwaccel" in calls[0] and "h264_nvenc" in calls[0]
-    assert _boxes(calls[0]) == {"360p": "146:702"}
+    assert _boxes(calls[0]) == {"720p": "400:1280", "360p": "146:702"}
 
 
 def test_a_very_wide_source_keeps_the_gpu_with_a_taller_360p_rung():
     _, calls = _transcode(8000, 480)
 
-    assert _boxes(calls[0]) == {"360p": "834:50"}
+    assert _boxes(calls[0]) == {"720p": "1280:480", "360p": "834:50"}
 
 
 def test_a_source_nvenc_takes_as_it_is_keeps_every_box():
@@ -356,9 +356,9 @@ def test_a_rotated_source_is_sized_as_the_scaler_sees_it():
     assert result.success is True
     gpu_decode, cpu_decode = calls
     assert "-hwaccel" in gpu_decode and "-hwaccel_output_format" not in gpu_decode
-    assert _boxes(gpu_decode) == {"360p": "146:702"}
+    assert _boxes(gpu_decode) == {"720p": "400:1280", "360p": "146:702"}
     assert "hwupload_cuda" in cpu_decode[cpu_decode.index("-filter_complex") + 1]
-    assert _boxes(cpu_decode) == {"360p": "146:702"}
+    assert _boxes(cpu_decode) == {"720p": "400:1280", "360p": "146:702"}
 
 
 def test_a_rotated_source_the_gpu_cannot_decode_is_sized_upright():

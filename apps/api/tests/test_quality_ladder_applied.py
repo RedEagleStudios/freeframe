@@ -157,6 +157,32 @@ def test_rungs_below_the_source_are_untouched_by_the_clamp():
     assert "scale=640:360" in graph
 
 
+def test_a_source_between_rungs_gets_the_next_rung_up_at_its_own_size():
+    # `1080p,360p` on a 900p upload used to drop 1080p and stream it at 360p
+    # only. The top rendition is now the source's quality, capped at 1080p.
+    cmd = _ffmpeg_cmd_for(["1080p", "360p"], source=(1600, 900))
+
+    assert _boxes(cmd) == {"1080p": "1600:900", "360p": "640:360"}
+
+
+def test_only_the_next_rung_up_is_clamped():
+    cmd = _ffmpeg_cmd_for(["2160p", "1080p", "720p", "360p"], source=(1600, 900))
+
+    assert _boxes(cmd) == {"1080p": "1600:900", "720p": "1280:720", "360p": "640:360"}
+
+
+def test_a_source_that_matches_a_rung_gets_no_extra_rendition():
+    cmd = _ffmpeg_cmd_for(["1080p", "720p", "360p"], source=(1280, 720))
+
+    assert _boxes(cmd) == {"720p": "1280:720", "360p": "640:360"}
+
+
+def test_a_portrait_source_between_rungs_is_clamped_upright():
+    cmd = _ffmpeg_cmd_for(["1080p", "360p"], source=(900, 1600))
+
+    assert _boxes(cmd) == {"1080p": "900:1600", "360p": "360:640"}
+
+
 def test_junk_reaching_the_transcoder_still_produces_a_ladder():
     # A TranscodeJob can be built by any caller and `qualities` is a plain list,
     # so the guard at the filtering site is what stops `split=0` and the empty
