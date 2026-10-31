@@ -6,13 +6,12 @@ import type { Metadata } from 'next'
  * must not learn anything about (password, `secure`, expired, disabled,
  * missing), which arrives here as `null`.
  *
- * `image.url` / `video.url` are API-relative and stable (`/share/{t}/embed.jpg`,
- * `/share/{t}/embed.mp4`); they redirect to a fresh presigned URL on each
- * request, so a cached embed never points at an expired signature.
- *
- * While the video is still processing, `video` is its uploaded original (when
- * a browser can play it), so `video.type` is that file's type, which is not
- * always MP4; its sizes are the probe's, or null before the probe has run.
+ * `image.url` is API-relative and stable (`/share/{t}/embed.jpg`). For a video
+ * it is a frame of the video with a play button drawn on it, made by the API
+ * (also while the video is still processing); for an image, a redirect to a
+ * fresh presigned URL of its thumbnail, so a cached embed never points at an
+ * expired signature. A video is never embedded as a player: the preview is
+ * that picture, and the link opens the share page in the browser.
  */
 export interface ShareEmbed {
   title: string
@@ -20,35 +19,6 @@ export interface ShareEmbed {
   site_name: string
   asset_type: 'video' | 'audio' | 'image' | 'image_carousel' | null
   image: { url: string; width: number | null; height: number | null } | null
-  video: {
-    url: string
-    secure_url: string
-    type: string
-    width: number | null
-    height: number | null
-  } | null
-}
-
-/**
- * The video tags a share page renders itself (see the share layout): Next's
- * `openGraph.videos` always writes `og:video` + `og:video:type` + the Twitter
- * player tags, and with those Discord sizes the file and refuses anything over
- * its embed limit (a 272 MB MP4 got no player). The minimal set below --
- * `og:video:url` plus its size, beside `og:type=video.other` and `og:image` --
- * is what large-file embedders use, and Discord plays it inline whatever the
- * size. Verified against Discord with the same 272 MB file.
- */
-export function shareEmbedVideoTags(
-  embed: ShareEmbed | null,
-  publicApiUrl: string | null,
-): { property: string; content: string }[] {
-  const video = embed?.video
-  if (!video || !publicApiUrl) return []
-  return [
-    { property: 'og:video:url', content: absolute(publicApiUrl, video.url) },
-    ...(video.width ? [{ property: 'og:video:width', content: String(video.width) }] : []),
-    ...(video.height ? [{ property: 'og:video:height', content: String(video.height) }] : []),
-  ]
 }
 
 const ABSOLUTE_HTTP_URL = /^https?:\/\//i
@@ -92,15 +62,13 @@ function absolute(apiBase: string, path: string): string {
 /**
  * Maps a share link's embed description to page metadata.
  *
- * - A single-video link with a web MP4 (or, while it processes, a playable
- *   original): `og:type=video.other` and a `player` card; the video itself is
- *   in the tags from `shareEmbedVideoTags`, which the share layout renders.
- * - Anything else with a picture: `og:type=website` and a large-image card.
+ * - With a picture: a large-image card (`summary_large_image`).
+ * - Without one: a plain summary card.
  * - `null` (the link is private, gone, or the API did not answer): the
  *   generic title and nothing else, so a preview never leaks a thumbnail.
  *
- * Every URL is absolute against the PUBLIC API address; without one (`null`)
- * the media tags are dropped rather than emitted relative.
+ * The picture URL is absolute against the PUBLIC API address; without one
+ * (`null`) it is dropped rather than emitted relative.
  */
 export function buildShareEmbedMetadata(
   embed: ShareEmbed | null,
@@ -119,22 +87,6 @@ export function buildShareEmbedMetadata(
           ...(embed.image.height ? { height: embed.image.height } : {}),
         }
       : null
-  const video = embed.video && publicApiUrl ? embed.video : null
-
-  if (video && publicApiUrl) {
-    return {
-      title,
-      description,
-      openGraph: {
-        type: 'video.other',
-        title,
-        siteName: embed.site_name,
-        ...(description ? { description } : {}),
-        ...(image ? { images: [image] } : {}),
-      },
-      other: { 'twitter:card': 'player' },
-    }
-  }
 
   return {
     title,

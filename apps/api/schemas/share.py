@@ -225,17 +225,9 @@ class DirectShareResponse(BaseModel):
 
 
 class ShareEmbedImage(BaseModel):
-    """A stable, API-relative image URL for a link preview (redirects to storage)."""
+    """A stable, API-relative image URL for a link preview (a video's play-button
+    card, or a redirect to an image's thumbnail)."""
     url: str
-    width: Optional[int] = None
-    height: Optional[int] = None
-
-
-class ShareEmbedVideo(BaseModel):
-    """A stable, API-relative MP4 URL for a link preview (redirects to storage)."""
-    url: str
-    secure_url: str
-    type: str = "video/mp4"
     width: Optional[int] = None
     height: Optional[int] = None
 
@@ -247,4 +239,3 @@ class ShareEmbedResponse(BaseModel):
     site_name: str
     asset_type: Optional[str] = None
     image: Optional[ShareEmbedImage] = None
-    video: Optional[ShareEmbedVideo] = None

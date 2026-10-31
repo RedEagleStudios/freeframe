@@ -1,11 +1,11 @@
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import NamedTuple, Optional
+from typing import Optional
 import bcrypt
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, Response
 import sqlalchemy
 from sqlalchemy import func as sa_func, case
 from sqlalchemy.orm import Session
@@ -34,7 +34,6 @@ from ..schemas.share import (
     ShareLinkCreate,
     ShareEmbedImage,
     ShareEmbedResponse,
-    ShareEmbedVideo,
     ShareLinkListItem,
     ShareLinkResponse,
     ShareLinkUpdate,
@@ -51,6 +50,7 @@ from ..services.search import escape_like
 from ..services.owned_keys import is_project_logo_key, sign_if_owned
 from ..services.avatar_keys import sign_avatar
 from ..services.s3_service import generate_presigned_get_url, generate_presigned_head_url, build_download_filename
+from ..services.embed_card import card_source, video_card
 from ..schemas.asset import DownloadOption
 from ..services.downloads import (
     describe_choices, download_choices, download_filename, may_download_original,
@@ -1563,18 +1563,10 @@ def _share_media_file(db: Session, link, asset, version_id: Optional[uuid.UUID])
     return media_file
 
 
-def _share_processing_preview(db: Session, asset: Asset) -> Optional[tuple[AssetVersion, MediaFile]]:
-    """The version a share link may preview from its original while it transcodes.
-
-    The rule: only when the asset has no ready version at all (a share link
-    otherwise keeps serving its latest ready version, exactly as before), and
-    then only the newest live `processing` version -- the one the link will
-    select as soon as it is ready, since an `uploading` or `failed` version
-    above it is never selected. `version_id` plays no part, so a link that hides
-    version history cannot be used to reach any other version. Called only
-    after `_share_media_file` (or the link-preview embed) found no ready
-    version, and only for streaming, never for a download.
-    """
+def _newest_processing_version(db: Session, asset: Asset) -> Optional[tuple[AssetVersion, Optional[MediaFile]]]:
+    """The newest live `processing` version and its media file: the one a share
+    link will select as soon as it is ready, since an `uploading` or `failed`
+    version above it is never selected."""
     version = db.query(AssetVersion).filter(
         AssetVersion.asset_id == asset.id,
         AssetVersion.deleted_at.is_(None),
@@ -1582,10 +1574,23 @@ def _share_processing_preview(db: Session, asset: Asset) -> Optional[tuple[Asset
     ).order_by(AssetVersion.version_number.desc()).first()
     if version is None:
         return None
-    media_file = db.query(MediaFile).filter(MediaFile.version_id == version.id).first()
-    if not can_preview_processing(asset, version, media_file):
+    return version, db.query(MediaFile).filter(MediaFile.version_id == version.id).first()
+
+
+def _share_processing_preview(db: Session, asset: Asset) -> Optional[tuple[AssetVersion, MediaFile]]:
+    """The version a share link may preview from its original while it transcodes.
+
+    The rule: only when the asset has no ready version at all (a share link
+    otherwise keeps serving its latest ready version, exactly as before), and
+    then only `_newest_processing_version`. `version_id` plays no part, so a
+    link that hides version history cannot be used to reach any other version.
+    Called only after `_share_media_file` found no ready version, and only for
+    streaming, never for a download.
+    """
+    found = _newest_processing_version(db, asset)
+    if found is None or not can_preview_processing(asset, *found):
         return None
-    return version, media_file
+    return found
 
 
 @router.get(
@@ -1794,26 +1799,27 @@ def get_share_asset_versions(
 
 # ── Link previews (Discord / OpenGraph) ──────────────────────────────────────
 #
-# A pasted share link unfurls into a playable video in Discord (and other
-# OpenGraph consumers) when the page carries og:video pointing at an MP4. The
-# share page renders those tags server-side from GET /share/{token}/embed; the
-# URLs in them must outlive the cache of whoever unfurls the link, so they are
-# these stable endpoints, which redirect to a fresh presigned URL on every
-# fetch, never a presigned URL itself.
+# The share page renders its preview tags server-side from GET
+# /share/{token}/embed. A video is never embedded as a player: its preview is a
+# large image card, a frame of the video with a play button drawn on it
+# (services/embed_card.py), and the link opens the video in the browser. The
+# image URL must outlive the cache of whoever unfurls the link, so it is the
+# stable /share/{token}/embed.jpg, never a presigned URL.
 #
 # Only links anyone holding them can open qualify: a password or a `secure`
 # (sign-in) link, a disabled, expired or missing one all answer 404, so an
-# unfurl reveals nothing those links would not. The MP4 is the version's web MP4
-# (`s3_key_download`); without one there is no video embed. Streaming projects
-# always have one; elsewhere it depends on TRANSCODER_DOWNLOAD_MP4.
+# unfurl reveals nothing those links would not.
 #
-# While the video has no ready version, the version `_share_processing_preview`
-# would stream (the share page's own preview-while-processing rule) is embedded
-# from its uploaded original instead, with the poster frame and size the
-# transcode records at its start. Discord caches an unfurl from its first
-# crawl, so a link pasted during processing would otherwise never get a player.
+# While the video has no ready version, the card is made from the version the
+# link will show once it is ready (`_newest_processing_version`): its poster
+# frame once the transcode has extracted one, before that a frame of the
+# uploaded original. Discord caches an unfurl from its first crawl, so a link
+# pasted during processing would otherwise never get a picture.
 
 _EMBED_REDIRECT_HEADERS = {"Cache-Control": "no-store"}
+# The card is computed per request (FFmpeg, before a poster frame exists);
+# crawlers often fetch it more than once in a row.
+_EMBED_CARD_HEADERS = {"Cache-Control": "public, max-age=300"}
 
 
 def _embed_link(db: Session, token: str) -> ShareLink:
@@ -1827,43 +1833,29 @@ def _embed_link(db: Session, token: str) -> ShareLink:
     return link
 
 
-class _EmbedMedia(NamedTuple):
-    asset: Optional[Asset]
-    media_file: Optional[MediaFile]
-    # True when `media_file` belongs to a still-processing version that is
-    # embedded from its original (see above).
-    from_original: bool = False
-
-
-def _embed_media(db: Session, link: ShareLink) -> _EmbedMedia:
-    """The asset a single-asset link shows and the media an unfurl of it uses:
-    its latest ready version's, else the processing version previewed from its original."""
+def _embed_media(db: Session, link: ShareLink) -> tuple[Optional[Asset], Optional[MediaFile]]:
+    """The asset a single-asset link shows and the media its preview uses: its
+    latest ready version's, else (a video only) its processing version's."""
     if not link.asset_id:
-        return _EmbedMedia(None, None)
+        return None, None
     asset = db.query(Asset).filter(Asset.id == link.asset_id, Asset.deleted_at.is_(None)).first()
     if asset is None:
-        return _EmbedMedia(None, None)
+        return None, None
     validate_asset_in_share(db, link, asset)
     media_file = _get_latest_media_file(db, asset.id)
-    if media_file is not None:
-        return _EmbedMedia(asset, media_file)
-    preview = _share_processing_preview(db, asset)
-    if preview is None:
-        return _EmbedMedia(asset, None)
-    return _EmbedMedia(asset, preview[1], from_original=True)
+    if media_file is None and asset.asset_type == AssetType.video:
+        processing = _newest_processing_version(db, asset)
+        media_file = processing[1] if processing else None
+    return asset, media_file
 
 
-def _embed_video(media: _EmbedMedia) -> Optional[tuple[str, str]]:
-    """The storage key and content type of the video an unfurl plays, if any."""
-    asset, media_file = media.asset, media.media_file
-    if asset is None or media_file is None or asset.asset_type != AssetType.video:
-        return None
-    if media.from_original:
-        # `_share_processing_preview` already required a live, playable original.
-        return media_file.s3_key_raw, media_file.mime_type.lower()
-    if not media_file.s3_key_processed or not media_file.s3_key_download:
-        return None
-    return media_file.s3_key_download, "video/mp4"
+def _has_embed_image(asset: Optional[Asset], media_file: Optional[MediaFile]) -> bool:
+    if asset is None or media_file is None:
+        return False
+    if asset.asset_type == AssetType.video:
+        return card_source(media_file) is not None
+    # An audio "thumbnail" is waveform JSON.
+    return asset.asset_type != AssetType.audio and bool(media_file.s3_key_thumbnail)
 
 
 @router.get(
@@ -1876,8 +1868,7 @@ def get_share_embed(token: str, db: Session = Depends(get_db)):
     from ..services.branding_service import resolve_org_name
 
     link = _embed_link(db, token)
-    media = _embed_media(db, link)
-    asset, media_file = media.asset, media.media_file
+    asset, media_file = _embed_media(db, link)
 
     title = link.title
     if not title and asset is not None:
@@ -1889,16 +1880,9 @@ def get_share_embed(token: str, db: Session = Depends(get_db)):
         project = db.query(Project).filter(Project.id == link.project_id, Project.deleted_at.is_(None)).first()
         title = project.name if project else None
 
-    width = media_file.width if media_file else None
-    height = media_file.height if media_file else None
     image = None
-    if media_file is not None and media_file.s3_key_thumbnail and asset.asset_type != AssetType.audio:
-        image = ShareEmbedImage(url=f"/share/{token}/embed.jpg", width=width, height=height)
-    video = None
-    embed_video = _embed_video(media)
-    if embed_video:
-        url = f"/share/{token}/embed.mp4"
-        video = ShareEmbedVideo(url=url, secure_url=url, type=embed_video[1], width=width, height=height)
+    if _has_embed_image(asset, media_file):
+        image = ShareEmbedImage(url=f"/share/{token}/embed.jpg", width=media_file.width, height=media_file.height)
 
     return ShareEmbedResponse(
         title=title or "Shared media",
@@ -1906,23 +1890,7 @@ def get_share_embed(token: str, db: Session = Depends(get_db)):
         site_name=resolve_org_name(),
         asset_type=asset.asset_type.value if asset is not None else None,
         image=image,
-        video=video,
     )
-
-
-@router.api_route(
-    "/share/{token}/embed.mp4",
-    methods=["GET", "HEAD"],
-    dependencies=[Depends(rate_limit("share_embed_media", 120, 60))],
-)
-def get_share_embed_video(token: str, request: Request, db: Session = Depends(get_db)):
-    """Public. 302 to a fresh presigned GET of the shared video: its web MP4, or
-    while it is still processing, its uploaded original (see above)."""
-    link = _embed_link(db, token)
-    embed_video = _embed_video(_embed_media(db, link))
-    if not embed_video:
-        raise HTTPException(status_code=404, detail="Not found")
-    return RedirectResponse(_embed_target(request, embed_video[0]), status_code=302, headers=_EMBED_REDIRECT_HEADERS)
 
 
 def _embed_target(request: Request, s3_key: str) -> str:
@@ -1938,15 +1906,18 @@ def _embed_target(request: Request, s3_key: str) -> str:
     dependencies=[Depends(rate_limit("share_embed_media", 120, 60))],
 )
 def get_share_embed_image(token: str, request: Request, db: Session = Depends(get_db)):
-    """Public. 302 to a fresh presigned GET of the shared asset's thumbnail."""
+    """Public. A video's play-button card (see above); for an image, a 302 to a
+    fresh presigned GET of its thumbnail."""
     link = _embed_link(db, token)
-    asset, media_file, _ = _embed_media(db, link)
-    if (
-        media_file is None or not media_file.s3_key_thumbnail
-        or asset.asset_type == AssetType.audio  # its "thumbnail" is waveform JSON
-    ):
+    asset, media_file = _embed_media(db, link)
+    if not _has_embed_image(asset, media_file):
         raise HTTPException(status_code=404, detail="Not found")
-    return RedirectResponse(
-        _embed_target(request, media_file.s3_key_thumbnail), status_code=302,
-        headers=_EMBED_REDIRECT_HEADERS,
-    )
+    if asset.asset_type != AssetType.video:
+        return RedirectResponse(
+            _embed_target(request, media_file.s3_key_thumbnail), status_code=302,
+            headers=_EMBED_REDIRECT_HEADERS,
+        )
+    card = video_card(media_file)
+    if card is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    return Response(content=card, media_type="image/jpeg", headers=_EMBED_CARD_HEADERS)
