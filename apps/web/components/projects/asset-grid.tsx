@@ -1,7 +1,7 @@
 'use client'
 
 import * as React from 'react'
-import { X, Download, MoreHorizontal, Layers, Share2, Trash2, FolderInput, FolderIcon, Check, Film, Music, Image as ImageIcon, Images } from 'lucide-react'
+import { X, Download, MoreHorizontal, Layers, Share2, Trash2, FolderInput, FolderIcon, Check, Film, Music, Image as ImageIcon, Images, Link2 } from 'lucide-react'
 import { cn, formatBytes } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Avatar } from '@/components/shared/avatar'
@@ -9,6 +9,8 @@ import { EmptyState } from '@/components/shared/empty-state'
 import { ContextMenuArea, DotsMenu } from '@/components/shared/item-menu'
 import { AssetCard } from './asset-card'
 import { FolderCard } from './folder-card'
+import { LinkCard, linkHost } from './link-card'
+import { LinkMenuItems } from './menus/link-menu'
 import { AssetMenuItems } from './menus/asset-menu'
 import { WithFolderMenu } from './menus/folder-menu'
 import { SelectionMenuItems, type SelectionActions } from './menus/selection-menu'
@@ -17,7 +19,7 @@ import { SortPopover } from './sort-popover'
 import { MoveToDialog } from './move-to-dialog'
 import { useViewStore } from '@/stores/view-store'
 import { sortAssets } from '@/lib/sort-assets'
-import type { Asset, DownloadOption, User, Folder, FolderTreeNode } from '@/types'
+import type { Asset, DownloadOption, User, Folder, FolderTreeNode, ProjectLink } from '@/types'
 import type { Collected } from '@/lib/upload-folder-walk'
 
 function isCoarsePointer(): boolean {
@@ -55,6 +57,8 @@ interface AssetGridProps {
   currentFolderId?: string | null
   onFolderOpen?: (folder: Folder) => void
   onFolderRename?: (folderId: string, name: string) => Promise<void>
+  /** Duplicate in a folder's menu. Absent = not offered. */
+  onFolderDuplicate?: (folderId: string) => Promise<void>
   onFolderDelete?: (folderId: string) => Promise<void>
   /** Create Share Link in a folder's menu. Absent = not offered. */
   onFolderShare?: (folderId: string, folderName: string) => void
@@ -92,6 +96,12 @@ interface AssetGridProps {
   /** Esc with `selectionShortcuts`: clear what the page itself has selected
    *  (the asset in the side panel), alongside the grid's own selection. */
   onDeselectAll?: () => void
+  /** Links to outside pages in the folder shown, after its folders. Opened in
+   *  a new tab; never selected, moved or dragged. */
+  links?: ProjectLink[]
+  /** Edit and Delete in a link's menu. Absent = not offered. */
+  onLinkEdit?: (link: ProjectLink) => void
+  onLinkDelete?: (link: ProjectLink) => Promise<void>
 }
 
 // Grid column classes based on card size
@@ -125,6 +135,7 @@ export function AssetGrid({
   currentFolderId,
   onFolderOpen,
   onFolderRename,
+  onFolderDuplicate,
   onFolderDelete,
   onFolderShare,
   onFolderNewSubfolder,
@@ -148,6 +159,9 @@ export function AssetGrid({
   actions,
   selectionShortcuts = false,
   onDeselectAll,
+  links,
+  onLinkEdit,
+  onLinkDelete,
 }: AssetGridProps) {
   const [selectedAssetIds, setSelectedAssetIds] = React.useState<Set<string>>(new Set())
   const [selectedFolderIds, setSelectedFolderIds] = React.useState<Set<string>>(new Set())
@@ -255,6 +269,8 @@ export function AssetGrid({
   )
 
   const showFolders = !flattenFolders && folders && folders.length > 0
+  const shownLinks = flattenFolders || shareMode ? [] : (links ?? [])
+  const showLinks = shownLinks.length > 0
 
   /** Add every folder and asset between the anchor and this item, in the
    *  order shown: folders first, then assets. */
@@ -418,15 +434,18 @@ export function AssetGrid({
       )}
 
       {/* ─── Grid view: folders section ──────────────────────────────── */}
-      {showFolders && layout === 'grid' && (
+      {(showFolders || showLinks) && layout === 'grid' && (
         <>
           <div className="flex items-center gap-2">
             <span className="text-xs text-text-tertiary font-medium uppercase tracking-wider">
-              {folders!.length} {folders!.length === 1 ? 'Folder' : 'Folders'}
+              {[
+                showFolders && `${folders!.length} ${folders!.length === 1 ? 'Folder' : 'Folders'}`,
+                showLinks && `${shownLinks.length} ${shownLinks.length === 1 ? 'Link' : 'Links'}`,
+              ].filter(Boolean).join(' · ')}
             </span>
           </div>
           <div className={cn('grid gap-3', gridColsMap[cardSize])}>
-            {folders!.map((folder) => {
+            {showFolders && folders!.map((folder) => {
               const isFolderSelected = selectedFolderIds.has(folder.id)
               return (
                 <div
@@ -460,6 +479,7 @@ export function AssetGrid({
                     folder={folder}
                     onOpen={shareMode ? () => {} : onFolderOpen!}
                     onRename={shareMode ? undefined : onFolderRename}
+                    onDuplicate={shareMode ? undefined : onFolderDuplicate}
                     onDelete={shareMode ? undefined : onFolderDelete}
                     onShare={shareMode ? undefined : onFolderShare}
                     onNewSubfolder={shareMode ? undefined : onFolderNewSubfolder}
@@ -472,6 +492,9 @@ export function AssetGrid({
                 </div>
               )
             })}
+            {shownLinks.map((link) => (
+              <LinkCard key={link.id} link={link} onEdit={onLinkEdit} onDelete={onLinkDelete} />
+            ))}
           </div>
           {filtered.length > 0 && (
             <div className="flex items-center gap-2 mt-2">
@@ -484,7 +507,7 @@ export function AssetGrid({
       )}
 
       {/* ─── Assets (grid) ───────────────────────────────────────────── */}
-      {filtered.length === 0 && !showFolders ? (
+      {filtered.length === 0 && !showFolders && !showLinks ? (
         <div className="rounded-lg border border-border bg-bg-secondary">
           <EmptyState
             icon={Layers}
@@ -543,7 +566,7 @@ export function AssetGrid({
             </div>
           ))}
         </div>
-      ) : layout === 'list' && (showFolders || filtered.length > 0) ? (
+      ) : layout === 'list' && (showFolders || showLinks || filtered.length > 0) ? (
         /* ─── Unified list view (folders + assets) ─────────────────── */
         <div className="rounded-lg border border-border overflow-hidden">
           {/* Column headers */}
@@ -569,6 +592,7 @@ export function AssetGrid({
                   onShare: onFolderShare,
                   onNewSubfolder: onFolderNewSubfolder,
                   onRename: onFolderRename,
+                  onDuplicate: onFolderDuplicate,
                   onDelete: onFolderDelete,
                 }}
               >
@@ -577,7 +601,7 @@ export function AssetGrid({
               <div
                 className={cn(
                   'group flex items-center gap-4 px-3 py-2.5 transition-colors hover:bg-bg-hover cursor-pointer',
-                  i !== folders!.length - 1 || filtered.length > 0 ? 'border-b border-border' : '',
+                  i !== folders!.length - 1 || showLinks || filtered.length > 0 ? 'border-b border-border' : '',
                   isFolderSelected && 'bg-accent/5',
                 )}
                 onClick={(e) => {
@@ -650,6 +674,49 @@ export function AssetGrid({
               </ContextMenuArea>
                 )}
               </WithFolderMenu>
+            )
+          })}
+          {/* Link rows */}
+          {shownLinks.map((link, i) => {
+            const linkMenu = <LinkMenuItems link={link} onEdit={onLinkEdit} onDelete={onLinkDelete} />
+            return (
+              <ContextMenuArea key={link.id} items={linkMenu}>
+                <div
+                  role="link"
+                  title={link.url}
+                  className={cn(
+                    'group flex items-center gap-4 px-3 py-2.5 transition-colors hover:bg-bg-hover cursor-pointer',
+                    i !== shownLinks.length - 1 || filtered.length > 0 ? 'border-b border-border' : '',
+                  )}
+                  onClick={() => window.open(link.url, '_blank', 'noopener,noreferrer')}
+                >
+                  <div className="h-10 w-10 shrink-0 rounded-md bg-bg-tertiary flex items-center justify-center">
+                    <Link2 className="h-5 w-5 text-text-tertiary/60" />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium text-text-primary truncate leading-snug">{link.name}</p>
+                    <p className="text-xs text-text-tertiary mt-0.5 truncate">{linkHost(link.url)}</p>
+                  </div>
+                  {showUploader && <div className="hidden md:block w-32 text-xs text-text-tertiary">—</div>}
+                  {showFileSize && <div className="hidden sm:block w-24 text-right text-sm text-text-tertiary">—</div>}
+                  <div className="hidden md:block w-10 text-center text-xs text-text-tertiary">—</div>
+                  <div className="hidden sm:block w-28 text-xs text-text-tertiary shrink-0">
+                    {new Date(link.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}
+                  </div>
+                  <div className="w-8 shrink-0" />
+                  <div className="w-8 shrink-0 flex justify-center opacity-0 group-hover:opacity-100 has-[[data-state=open]]:opacity-100 transition-opacity">
+                    <DotsMenu items={linkMenu}>
+                      <button
+                        aria-label={`${link.name} menu`}
+                        onClick={(e) => e.stopPropagation()}
+                        className="flex h-6 w-6 items-center justify-center rounded hover:bg-bg-hover text-text-tertiary hover:text-text-primary transition-colors outline-none"
+                      >
+                        <MoreHorizontal className="h-3.5 w-3.5" />
+                      </button>
+                    </DotsMenu>
+                  </div>
+                </div>
+              </ContextMenuArea>
             )
           })}
           {filtered.map((asset, i) => {

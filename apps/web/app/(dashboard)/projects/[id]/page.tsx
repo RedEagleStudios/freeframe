@@ -14,7 +14,6 @@ import {
   Plus,
   ChevronDown,
   MessageSquare,
-  FolderPlus,
   Folder as FolderIcon,
   FileText,
   MoreHorizontal,
@@ -52,6 +51,8 @@ import {
   ShareLinkSettingsPanel,
 } from "@/components/projects/share-link-detail";
 import { NameDialog } from "@/components/projects/name-dialog";
+import { LinkDialog } from "@/components/projects/link-dialog";
+import { AddMenu } from "@/components/projects/add-menu";
 import { ShareCreateDialog } from "@/components/projects/share-create-dialog";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { usePageTitle } from "@/hooks/use-page-title";
@@ -63,6 +64,7 @@ import type {
   User,
   Folder,
   ShareLink,
+  ProjectLink,
 } from "@/types";
 
 export default function ProjectDetailPage() {
@@ -118,6 +120,10 @@ export default function ProjectDetailPage() {
   } | null>(null);
   const [assetToRename, setAssetToRename] = React.useState<AssetResponse | null>(null);
   const [assetToDelete, setAssetToDelete] = React.useState<AssetResponse | null>(null);
+  // The New Link / Edit Link dialog: where a new link goes, or the link edited.
+  const [linkDialog, setLinkDialog] = React.useState<
+    { mode: "create"; folderId: string | null } | { mode: "edit"; link: ProjectLink } | null
+  >(null);
 
   const toast = useToast();
   const { user, userFetched } = useAuthStore();
@@ -139,6 +145,11 @@ export default function ProjectDetailPage() {
     renameFolder,
     moveFolder,
     deleteFolder,
+    duplicateFolder,
+    links,
+    createLink,
+    updateLink,
+    deleteLink,
     moveAsset,
     bulkMove,
     restoreAsset,
@@ -308,6 +319,39 @@ export default function ProjectDetailPage() {
   const canManageMembers = currentRole === "owner";
   const canSeeShareLinks = currentRole === "owner" || currentRole === "editor";
   const canComment = currentRole !== "viewer";
+
+  // Duplicate sits beside the original, so the open view may need the new
+  // folder; the tree is refreshed by the hook.
+  const handleDuplicateFolder = async (id: string) => {
+    try {
+      const { folder, assets_skipped } = await duplicateFolder(id);
+      toast.success(
+        assets_skipped > 0
+          ? `Created "${folder.name}". ${assets_skipped} unfinished ${assets_skipped === 1 ? "file was" : "files were"} not copied.`
+          : `Created "${folder.name}"`,
+      );
+    } catch (err) {
+      reportRefusal(err, "Could not duplicate the folder");
+    }
+    mutateSubfolders();
+  };
+
+  const openFolderDialog = (parentId: string | null) => {
+    setFolderDialogParentId(parentId);
+    setFolderDialogOpen(true);
+  };
+  const openLinkDialog = (folderId: string | null) => setLinkDialog({ mode: "create", folderId });
+  const editLink = (link: ProjectLink) => setLinkDialog({ mode: "edit", link });
+  // A link counts as one of its folder's items, so the cards' counts follow.
+  const handleDeleteLink = async (link: ProjectLink) => {
+    try {
+      await deleteLink(link.id);
+    } catch (err) {
+      reportRefusal(err, "Could not delete the link");
+    }
+    mutateSubfolders();
+  };
+
   // Until the members and the signed-in user have both answered, the role
   // above reads "viewer" without anyone being one. A file dropped then is held
   // rather than refused, and decided once they answer. A 403 from the members
@@ -515,16 +559,19 @@ export default function ProjectDetailPage() {
               Assets
             </span>
             {canCreateFolder && (
-              <button
-                className="text-text-tertiary hover:text-text-primary transition-colors"
-                onClick={() => {
-                  setFolderDialogParentId(currentFolderId);
-                  setFolderDialogOpen(true);
-                }}
-                title="New folder"
-              >
-                <Plus className="h-3.5 w-3.5" />
-              </button>
+              <AddMenu
+                onNewFolder={() => openFolderDialog(currentFolderId)}
+                onNewLink={() => openLinkDialog(currentFolderId)}
+                trigger={
+                  <button
+                    className="text-text-tertiary hover:text-text-primary transition-colors"
+                    title="Add"
+                    aria-label="Add folder or link"
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                  </button>
+                }
+              />
             )}
           </div>
 
@@ -542,12 +589,7 @@ export default function ProjectDetailPage() {
               setSelectedShareLink(null);
             }}
             onCreateFolder={
-              canCreateFolder
-                ? async (_name, parentId) => {
-                    setFolderDialogParentId(parentId);
-                    setFolderDialogOpen(true);
-                  }
-                : undefined
+              canCreateFolder ? async (_name, parentId) => openFolderDialog(parentId) : undefined
             }
             onRenameFolder={async (id, name) => {
               try {
@@ -557,6 +599,7 @@ export default function ProjectDetailPage() {
               }
               mutateSubfolders();
             }}
+            onDuplicateFolder={canCreateFolder ? handleDuplicateFolder : undefined}
             onDeleteFolder={async (id) => {
               await deleteFolder(id);
               if (currentFolderId === id) handleSelectFolder(null);
@@ -564,6 +607,10 @@ export default function ProjectDetailPage() {
               mutateSubfolders();
             }}
             onShareFolder={canShare ? openFolderShareDialog : undefined}
+            links={links}
+            onCreateLink={canCreateFolder ? openLinkDialog : undefined}
+            onEditLink={canCreateFolder ? editLink : undefined}
+            onDeleteLink={canCreateFolder ? handleDeleteLink : undefined}
             // `mayDropFiles`, not `canDropFiles`. What the main pane is showing
             // says nothing about the sidebar: a folder row means "upload into
             // this folder" while the trash or the share-link list is open just
@@ -843,6 +890,7 @@ export default function ProjectDetailPage() {
                 }
                 mutateSubfolders();
               }}
+              onFolderDuplicate={canCreateFolder ? handleDuplicateFolder : undefined}
               onFolderDelete={async (id) => {
                 await deleteFolder(id);
                 mutateAssets();
@@ -851,14 +899,10 @@ export default function ProjectDetailPage() {
               // Gated as in the tree and the toolbar, so a folder's menu is the
               // same everywhere for every role.
               onFolderShare={canShare ? openFolderShareDialog : undefined}
-              onFolderNewSubfolder={
-                canCreateFolder
-                  ? (parentId) => {
-                      setFolderDialogParentId(parentId);
-                      setFolderDialogOpen(true);
-                    }
-                  : undefined
-              }
+              onFolderNewSubfolder={canCreateFolder ? openFolderDialog : undefined}
+              links={links.filter((l) => l.folder_id === currentFolderId)}
+              onLinkEdit={canCreateFolder ? editLink : undefined}
+              onLinkDelete={canCreateFolder ? handleDeleteLink : undefined}
               onDropFilesToFolder={canDropFiles ? handleDropFilesToFolder : undefined}
               onFileDragOverFolder={canDropFiles ? setFolderTarget : undefined}
               fileDragTarget={fileDragFolderId}
@@ -969,16 +1013,17 @@ export default function ProjectDetailPage() {
                     </Button>
                   )}
                   {canCreateFolder && (
-                    <button
-                      className="flex items-center gap-1.5 h-8 px-3 rounded-lg border border-border text-text-secondary hover:text-text-primary hover:bg-bg-hover text-[13px] transition-colors"
-                      onClick={() => {
-                        setFolderDialogParentId(currentFolderId);
-                        setFolderDialogOpen(true);
-                      }}
-                    >
-                      <FolderPlus className="h-4 w-4" />
-                      New Folder
-                    </button>
+                    <AddMenu
+                      onNewFolder={() => openFolderDialog(currentFolderId)}
+                      onNewLink={() => openLinkDialog(currentFolderId)}
+                      trigger={
+                        <button className="flex items-center gap-1.5 h-8 px-3 rounded-lg border border-border text-text-secondary hover:text-text-primary hover:bg-bg-hover text-[13px] transition-colors">
+                          <Plus className="h-4 w-4" />
+                          Add
+                          <ChevronDown className="h-3.5 w-3.5" />
+                        </button>
+                      }
+                    />
                   )}
                   {canUpload && (
                     <UploadMenu
@@ -1286,6 +1331,22 @@ export default function ProjectDetailPage() {
             reportRefusal(err, "Could not create the folder");
           }
           mutateAssets();
+          mutateSubfolders();
+        }}
+      />
+
+      {/* New / edit link dialog */}
+      <LinkDialog
+        open={linkDialog !== null}
+        onOpenChange={(open) => { if (!open) setLinkDialog(null); }}
+        title={linkDialog?.mode === "edit" ? "Edit Link" : "New Link"}
+        submitLabel={linkDialog?.mode === "edit" ? "Save" : "Create"}
+        defaultName={linkDialog?.mode === "edit" ? linkDialog.link.name : ""}
+        defaultUrl={linkDialog?.mode === "edit" ? linkDialog.link.url : ""}
+        onSubmit={async (name, url) => {
+          if (!linkDialog) return;
+          if (linkDialog.mode === "edit") await updateLink(linkDialog.link.id, { name, url });
+          else await createLink(name, url, linkDialog.folderId);
           mutateSubfolders();
         }}
       />

@@ -56,7 +56,7 @@ vi.mock('@/hooks/use-comments', () => ({
 vi.mock('@/hooks/use-folders', () => ({
   useFolders: () => ({
     tree: [], mutateTree: vi.fn(), createFolder: vi.fn(), renameFolder: vi.fn(), moveFolder: vi.fn(),
-    deleteFolder: vi.fn(), moveAsset: vi.fn(), bulkMove: vi.fn(), restoreAsset: vi.fn(), restoreFolder: vi.fn(),
+    deleteFolder: vi.fn(), moveAsset: vi.fn(), bulkMove: vi.fn(), restoreAsset: vi.fn(), restoreFolder: vi.fn(), links: [],
   }),
   useTrash: () => ({ trash: undefined, mutateTrash: vi.fn() }),
 }))

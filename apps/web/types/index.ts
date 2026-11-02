@@ -504,6 +504,27 @@ export interface Folder {
   item_count: number
 }
 
+export interface FolderDuplicateResponse {
+  folder: Folder
+  folders_copied: number
+  assets_copied: number
+  /** Assets with no finished version (still uploading or processing, or failed): not copied. */
+  assets_skipped: number
+}
+
+/** A named link to an outside page (an Outline doc, say) in the folder tree. */
+export interface ProjectLink {
+  id: string
+  project_id: string
+  /** null = the project root */
+  folder_id: string | null
+  name: string
+  url: string
+  created_by: string
+  created_at: string
+  updated_at: string
+}
+
 export interface FolderTreeNode {
   id: string
   name: string
