@@ -622,3 +622,35 @@ export interface AuthTokens {
   refresh_token: string;
   token_type: string;
 }
+
+// ─── AI access (MCP over OAuth) ──────────────────────────────────────────────
+
+export interface OAuthScope {
+  name: string;
+  description: string;
+}
+
+export interface OAuthConsentRequest {
+  client_name: string;
+  client_uri: string | null;
+  redirect_uri: string;
+  scopes: OAuthScope[];
+}
+
+export interface OAuthConsentRedirect {
+  redirect_url: string;
+}
+
+export interface McpServerInfo {
+  mcp_url: string;
+  enabled: boolean;
+  disabled_reason: string | null;
+}
+
+export interface ConnectedApp {
+  id: string;
+  client_name: string;
+  scopes: string[];
+  created_at: string;
+  last_used_at: string | null;
+}

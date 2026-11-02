@@ -131,8 +131,8 @@ Read this section before writing backend code or tests.
   `routers/share.py`, `services/permissions.py`, key `apps/web` files) goes missing. If a
   test is genuinely obsolete, replace it — don't remove coverage.
 
-- **Soft delete is common but not universal, and it is not automatic.** 14 of the 32 models
-  carry a `deleted_at` column; 18 do not, including `MediaFile`, `Annotation`,
+- **Soft delete is common but not universal, and it is not automatic.** 13 of the 34 models
+  carry a `deleted_at` column; 21 do not, including `MediaFile`, `Annotation`,
   `CommentAttachment`, `CommentReaction`, `Notification`, `ActivityLog` and `ProjectLink`. Check the model
   before assuming. Where the column exists, prefer setting it over deleting the row, and
   filter `deleted_at.is_(None)` **by hand in every query** — nothing filters it for you,

@@ -4,18 +4,21 @@ import re
 import threading
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from starlette.routing import Route
 from fastapi.middleware.cors import CORSMiddleware
 from .config import settings
-from .routers import auth, auth_discord, users, projects, project_join_links, upload, events, assets, me, comments, approvals, share, metadata, branding, instance_branding, notifications, admin, setup, folders, links, hls_proxy, instance_settings
+from .routers import auth, auth_discord, users, projects, project_join_links, upload, events, assets, me, comments, approvals, share, metadata, branding, instance_branding, notifications, admin, setup, folders, links, hls_proxy, instance_settings, oauth
 from .services.s3_service import run_startup_bucket_setup
 from .services.email_service import mail_is_configured
+from .services.mcp_server import McpEndpoint, mcp_disabled_reason
 from .middleware.global_rate_limit import GlobalRateLimitMiddleware
 from .middleware.setup_guard import SetupGuardMiddleware
 
 
 # Paths whose next segment is a credential: an invite token sets the account's
-# password, and a share token opens the link.
-_TOKEN_IN_PATH = re.compile(r"^(/auth/invite/|/share/)[^/]+")
+# password, a share token opens the link, and an OAuth request id is what the
+# consent page approves.
+_TOKEN_IN_PATH = re.compile(r"^(/auth/invite/|/share/|/oauth/requests/)[^/]+")
 
 
 class _DropQueryStringFilter(logging.Filter):
@@ -38,6 +41,12 @@ class _DropQueryStringFilter(logging.Filter):
 # logger's handlers with its own (--access-logfile) but leaves its filters alone.
 logging.getLogger("uvicorn.access").addFilter(_DropQueryStringFilter())
 
+# The MCP server for AI agents, with its OAuth endpoints (services/mcp_server.py).
+# Off, with a warning, when PUBLIC_API_URL cannot be an OAuth issuer.
+_mcp_disabled_reason = mcp_disabled_reason()
+mcp_endpoint = None if _mcp_disabled_reason else McpEndpoint()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Run bucket setup off the request path (daemon thread) so a slow or unreachable
@@ -49,7 +58,12 @@ async def lifespan(app: FastAPI):
             "will FAIL until you configure SMTP or SES. See docs/deployment.md.",
             settings.mail_provider,
         )
-    yield
+    if mcp_endpoint is None:
+        logging.getLogger("apps.api.startup").warning("MCP server is off. %s", _mcp_disabled_reason)
+        yield
+        return
+    async with mcp_endpoint.running():
+        yield
 
 _disable_docs = os.getenv("DISABLE_DOCS", "").lower() in ("true", "1", "yes")
 
@@ -127,8 +141,15 @@ app.include_router(links.router)
 app.include_router(hls_proxy.router)
 app.include_router(instance_settings.router)
 app.include_router(instance_branding.router)
+app.include_router(oauth.router)
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+# /mcp, the OAuth endpoints and their /.well-known metadata, path by path: a
+# catch-all mount would shadow FastAPI's trailing-slash redirects.
+if mcp_endpoint is not None:
+    for _path in mcp_endpoint.paths:
+        app.router.routes.append(Route(_path, endpoint=mcp_endpoint))
 

@@ -3,7 +3,8 @@ import type { NextRequest } from 'next/server'
 import { withBasePath } from './lib/base-path'
 
 const PUBLIC_ROUTES = ['/login', '/setup', '/auth/discord/callback']
-const PUBLIC_PREFIXES = ['/invite/', '/share/', '/join/']
+// /.well-known/: OAuth discovery for AI apps (lib/oauth-metadata.ts), read before any sign-in.
+const PUBLIC_PREFIXES = ['/invite/', '/share/', '/join/', '/.well-known/']
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
@@ -50,7 +51,8 @@ export async function proxy(request: NextRequest) {
 
   if (!accessToken && !refreshToken) {
     const loginUrl = new URL(withBasePath('/login'), request.url)
-    loginUrl.searchParams.set('from', pathname)
+    // With the query: an AI app's connection request is /oauth/consent?request=…
+    loginUrl.searchParams.set('from', pathname + request.nextUrl.search)
     return NextResponse.redirect(loginUrl)
   }
 

@@ -2,7 +2,8 @@ import { describe, expect, it, vi, beforeEach } from 'vitest'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 
 const push = vi.fn()
-vi.mock('next/navigation', () => ({ useRouter: () => ({ push, replace: vi.fn() }) }))
+const replace = vi.fn()
+vi.mock('next/navigation', () => ({ useRouter: () => ({ push, replace }) }))
 
 const sendMagicCode = vi.fn()
 vi.mock('@/lib/api', () => ({
@@ -19,6 +20,7 @@ vi.mock('@/lib/auth', () => ({ setTokens: vi.fn() }))
 
 import { LoginForm } from '../login-form'
 import { useBrandingStore, type LoginMode } from '@/stores/branding-store'
+import { useAuthStore } from '@/stores/auth-store'
 
 // The form reads branding through the real useBranding, with no provider
 // mounted, so the store is what decides the sign-in method.
@@ -144,5 +146,27 @@ describe('LoginForm when branding loads after mount', () => {
     setBranding({ loaded: true, defaultLoginMode: 'password' })
 
     expect(screen.getByRole('button', { name: /send magic code/i })).toBeInTheDocument()
+  })
+})
+
+describe('LoginForm after signing in', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    setBranding({ loaded: true, defaultLoginMode: 'password' })
+    act(() => useAuthStore.setState({ fetchUser: vi.fn().mockResolvedValue(undefined) }))
+    sendMagicCode.mockResolvedValue({ access_token: 'a', refresh_token: 'r', token_type: 'bearer' })
+  })
+
+  it('goes back to the page that sent the visitor to sign in, query included', async () => {
+    // An AI app's connection request lands on /oauth/consent?request=…; signing
+    // in on the way must not drop the user on the projects list instead.
+    window.history.pushState({}, '', `/login?from=${encodeURIComponent('/oauth/consent?request=abc')}`)
+    render(<LoginForm />)
+    fireEvent.change(screen.getByLabelText(/email address/i), { target: { value: 'me@example.com' } })
+    fireEvent.change(screen.getByLabelText(/^password/i), { target: { value: 'secret-password' } })
+    fireEvent.click(screen.getByRole('button', { name: /^sign in$/i }))
+
+    await waitFor(() => expect(replace).toHaveBeenCalledWith('/oauth/consent?request=abc'))
+    window.history.pushState({}, '', '/')
   })
 })

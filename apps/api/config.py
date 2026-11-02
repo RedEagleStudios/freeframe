@@ -83,6 +83,18 @@ class Settings(BaseSettings):
     # Traefik, else the socket peer. Only set it when the origin accepts
     # connections from that CDN alone: any other client can send the header.
     client_ip_header: str = ""
+    # The API's public base URL, as an MCP client outside the server reaches it.
+    # The MCP endpoint is {base}/mcp and the OAuth issuer is {base}. Unset, it is
+    # the frontend's origin + /api: the production layout, where the proxy sends
+    # /api to this service and strips the prefix. Dev compose sets it to
+    # NEXT_PUBLIC_API_URL (the API on its own port).
+    public_api_url: str = ""
+    # MCP connections (AI agents signed in through OAuth). The access token is
+    # short; the refresh token is renewed (and rotated) on every refresh, so an
+    # agent stays connected as long as it is used at least once per
+    # MCP_REFRESH_TOKEN_EXPIRE_DAYS. Revoke one from Settings → AI access.
+    mcp_access_token_expire_minutes: int = Field(60, gt=0)
+    mcp_refresh_token_expire_days: int = Field(90, gt=0)
     transcoder_engine: str = "ffmpeg"
     # Which rungs of the quality ladder to build, comma-separated. Valid names
     # are the keys of packages.transcoder.ffmpeg_transcoder.QUALITY_MAP; the
@@ -284,6 +296,16 @@ class Settings(BaseSettings):
         if not parsed.scheme or not parsed.netloc:
             return raw
         return f"{parsed.scheme}://{parsed.netloc}"
+
+    @property
+    def api_base_url(self) -> str:
+        """The API's public base URL, without a trailing slash (see `public_api_url`)."""
+        return (self.public_api_url.strip() or f"{self.frontend_origin}/api").rstrip("/")
+
+    @property
+    def mcp_url(self) -> str:
+        """The MCP endpoint's public URL: the OAuth protected resource."""
+        return f"{self.api_base_url}/mcp"
 
     @property
     def cors_allows_any_origin(self) -> bool:

@@ -210,6 +210,23 @@ location /api/ {
 
 Traefik in the bundled Compose already routes the sub-path to the web app and `/api` to the API, so forwarding both to FreeFrame's port 80 is enough; only a proxy that terminates the sub-path itself has to name the API separately. Leave `NEXT_PUBLIC_BASE_PATH` empty for a root deployment (the default).
 
+### AI Access (MCP)
+
+AI assistants connect to FreeFrame's MCP server at `https://<your domain>/api/mcp` (Settings → AI access shows the exact URL and setup snippets for Claude, Cursor and VS Code). They sign in through OAuth: the first time, the user's browser opens a FreeFrame page to approve the connection, and it then stays connected while in use. Nothing needs to be turned on, but three things must hold:
+
+- **HTTPS.** OAuth refuses a plain-HTTP authorization server except on `localhost`. Over `http://<IP>` the MCP server stays off and the API logs `MCP server is off` with the reason; the rest of FreeFrame is unaffected.
+- **The right public address.** The server URL and OAuth issuer come from `PUBLIC_API_URL`, which defaults to `FRONTEND_URL`'s origin + `/api`, the layout the bundled Traefik serves. Set it only if the API is reachable somewhere else.
+- **Discovery at the origin root.** Clients read `/.well-known/oauth-authorization-server/api` and `/.well-known/oauth-protected-resource/api/mcp` from the domain root. In a root deployment the web app passes these to the API, so the bundled Compose needs nothing. In a sub-path deployment the web app does not serve the root, so forward them to the API yourself, keeping the path and adding the `/api` prefix:
+
+  ```nginx
+  location /.well-known/oauth- {
+      rewrite ^ /api$uri break;
+      proxy_pass http://127.0.0.1:80;
+  }
+  ```
+
+Connections are listed, and can be disconnected, under Settings → AI access. A connection ends by itself when its user is deactivated or changes their password, and after `MCP_REFRESH_TOKEN_EXPIRE_DAYS` (default 90) without use.
+
 ---
 
 ## Bring Your Own Infrastructure
@@ -417,6 +434,7 @@ All environment variables are documented in [`.env.example`](../.env.example). K
 | `CORS_ALLOW_ORIGINS` | Extra browser origins, comma-separated, allowed by the API and (non-AWS) the bucket | (empty) |
 | `JWT_SECRET` | Auth token signing key | (required, generate with `openssl rand -hex 64`) |
 | `FRONTEND_URL` | Your FreeFrame URL (with https://) | (required) |
+| `PUBLIC_API_URL` | The API's public address, used for the MCP server (`{PUBLIC_API_URL}/mcp`) and its OAuth issuer; must be `https://` or `http://localhost` for the MCP server to run (see "AI Access (MCP)") | (empty = `FRONTEND_URL` origin + `/api`) |
 | `DOMAIN` | Your domain; required with `docker-compose.https.yml`, which requests the certificate | (optional) |
 | `ACME_EMAIL` | Email for Let's Encrypt notifications; required with `docker-compose.https.yml` | (optional) |
 | `DISCORD_LOGIN_ENABLED`, `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET` | Sign in with Discord, as a fallback for the values saved under Settings > Admin > Instance settings (see [Sign in with Discord](#sign-in-with-discord)) | (empty = off) |

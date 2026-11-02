@@ -82,6 +82,8 @@ services:
       S3_BUCKET: ${S3_BUCKET:-freeframe}
       S3_REGION: ${S3_REGION:-us-east-1}
       S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-http://localhost:9000}
+      # The MCP server's address (/mcp); the API is on its own port in dev.
+      PUBLIC_API_URL: ${PUBLIC_API_URL:-${NEXT_PUBLIC_API_URL:-http://localhost:8000}}
     depends_on:
       postgres:
         condition: service_healthy

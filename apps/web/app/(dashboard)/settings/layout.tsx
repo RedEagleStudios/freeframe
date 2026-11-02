@@ -3,7 +3,7 @@
 import * as React from 'react'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { User, Bell, Shield, Palette } from 'lucide-react'
+import { User, Bell, Shield, Palette, Bot } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/stores/auth-store'
 
@@ -18,6 +18,7 @@ const settingsNavItems: SettingsNavItem[] = [
   { href: '/settings/profile', label: 'Profile', icon: User },
   { href: '/settings/appearance', label: 'Appearance', icon: Palette },
   { href: '/settings/notifications', label: 'Notifications', icon: Bell },
+  { href: '/settings/ai', label: 'AI access', icon: Bot },
   { href: '/settings/admin', label: 'Admin', icon: Shield, adminOnly: true },
 ]
 

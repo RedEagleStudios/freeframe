@@ -10,6 +10,7 @@ import { DiscordSignInButton } from '@/components/auth/discord-sign-in-button'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { cn } from '@/lib/utils'
+import { safeInternalPath } from '@/lib/safe-redirect'
 import type { VerifyCodeResponse, AuthTokens } from '@/types'
 
 type Step = 'email' | 'code' | 'password' | 'classic'
@@ -65,6 +66,11 @@ export function LoginForm({ discordHref, notice, emailCodeEnabled = true }: Logi
     setGeneralError(notice)
     setClassicError(notice)
   }, [notice])
+  // Back to the page that sent the visitor here (the proxy's `from`), such as
+  // an AI app's connection request, or to the projects list.
+  function goToNextPage() {
+    router.replace(safeInternalPath(new URLSearchParams(window.location.search).get('from')))
+  }
 
   // ─── Step 1: Send magic code ──────────────────────────────────────────────
 
@@ -156,7 +162,7 @@ export function LoginForm({ discordHref, notice, emailCodeEnabled = true }: Logi
         setStep('password')
       } else {
         await completeSignIn(res)
-        router.replace('/projects')
+        goToNextPage()
       }
     } catch (err) {
       if (err instanceof ApiError) {
@@ -209,7 +215,7 @@ export function LoginForm({ discordHref, notice, emailCodeEnabled = true }: Logi
         password,
       })
       await completeSignIn(res)
-      router.replace('/projects')
+      goToNextPage()
     } catch (err) {
       if (err instanceof ApiError) {
         setGeneralError(err.detail)
@@ -243,7 +249,7 @@ export function LoginForm({ discordHref, notice, emailCodeEnabled = true }: Logi
         password: classicPassword,
       })
       await completeSignIn(res)
-      router.replace('/projects')
+      goToNextPage()
     } catch (err) {
       if (err instanceof ApiError) {
         setClassicError(err.detail)

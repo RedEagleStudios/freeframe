@@ -18,6 +18,19 @@ const nextConfig = {
       },
     ],
   },
+  // One click on the consent page gives an AI app access to the account, so no
+  // other site may frame it (clickjacking).
+  async headers() {
+    return [
+      {
+        source: '/oauth/:path*',
+        headers: [
+          { key: 'X-Frame-Options', value: 'DENY' },
+          { key: 'Content-Security-Policy', value: "frame-ancestors 'none'" },
+        ],
+      },
+    ]
+  },
 }
 
 module.exports = nextConfig

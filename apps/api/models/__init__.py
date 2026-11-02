@@ -12,3 +12,4 @@ from .instance_settings import InstanceSettings
 from .instance_branding import InstanceBranding
 from .instance_auth_settings import InstanceAuthSettings
 from .activity import Mention, ActivityLog, Notification
+from .oauth import OAuthClient, OAuthGrant

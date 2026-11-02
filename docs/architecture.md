@@ -251,10 +251,57 @@ review workflow.
 
 ---
 
+## AI Access (MCP)
+
+AI assistants (Claude, Cursor, VS Code and any other MCP client) connect to the API's MCP
+server over Streamable HTTP at `{PUBLIC_API_URL}/mcp`. `services/mcp_server.py` builds it with
+the official MCP Python SDK, stateless so any API worker can answer any request.
+
+**Sign-in is OAuth 2.1, with FreeFrame as its own authorization server.** There are no API keys.
+
+```
+AI app ── POST /mcp ───────────────────────────────▶ 401 + WWW-Authenticate (resource metadata)
+       ── GET /.well-known/oauth-protected-resource/… and /.well-known/oauth-authorization-server
+       ── POST /register   (Dynamic Client Registration)
+       ── browser → GET /authorize ─▶ web /oauth/consent?request=…  (user signs in, approves)
+       ◀─ redirect_uri?code=…&state=…&iss=…
+       ── POST /token      (code + PKCE verifier) ─▶ access token (1 h) + refresh token (90 days)
+       ── POST /mcp with Bearer token ─▶ tools
+```
+
+The SDK runs the protocol endpoints and checks clients, redirect URIs, PKCE and expiry;
+`services/mcp_auth.py` supplies storage and policy, backed by `services/oauth_service.py`.
+Parked consent requests (10 minutes) and one-time codes (5 minutes) live in Redis. Registered
+clients (`oauth_clients`) and each user's approval of a client (`oauth_grants`) live in
+Postgres. A grant stores only SHA-256 hashes of its current access and refresh token. Every
+refresh replaces both tokens with a compare-and-set, so a refresh token works once even when two
+refreshes race, and renews the refresh token's lifetime. A connection in use therefore never
+expires, and an unused one lapses after `MCP_REFRESH_TOKEN_EXPIRE_DAYS`. A grant ends when the
+user disconnects it (Settings → AI access, `DELETE /oauth/grants/{id}`), when the client
+revokes it, and when the account is deleted, deactivated or changes its password
+(`token_version`).
+
+Scopes: `freeframe:read` (browse, download, read comments) is always granted; `freeframe:write`
+(post comments, approve or reject) only if the user leaves "Allow changes" on at consent. The
+consent page decides because clients request what the protected-resource metadata advertises.
+
+**Tools act as the user through the web app's own code.** Each tool calls the router function
+the matching web request would reach (`list_projects`, `list_assets`, `get_stream_url`,
+`create_comment`, …) with the token's user, so the permission model above, the `deleted_at`
+filters and the download policy apply unchanged. `get_download_url` returns the same presigned
+link the web app's download button gets.
+
+Discovery lives at the origin root, which the production proxy hands to the web app, so
+`app/.well-known/oauth-*` route handlers pass those requests to the API (`lib/oauth-metadata.ts`).
+OAuth requires an HTTPS issuer (plain HTTP only on localhost); with any other `PUBLIC_API_URL`
+the MCP server stays off and the API logs why.
+
+---
+
 ## Database
 
-**Soft delete is common but not universal.** 14 of the 32 models carry a `deleted_at` column;
-18 do not, including `MediaFile`, `Annotation`, `CommentAttachment`, `CommentReaction`,
+**Soft delete is common but not universal.** 13 of the 34 models carry a `deleted_at` column;
+21 do not, including `MediaFile`, `Annotation`, `CommentAttachment`, `CommentReaction`,
 `Notification`, `ActivityLog` and `ProjectLink`. Nothing filters the column automatically — every query does
 it by hand. Soft deletion is also not permanent: `tasks/cleanup_tasks.py` hard-deletes
 soft-deleted rows and reclaims their S3 objects after `SOFT_DELETE_RETENTION_DAYS`

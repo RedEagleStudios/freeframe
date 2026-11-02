@@ -18,6 +18,7 @@ const LABEL_MAP: Record<string, string> = {
   settings: 'Settings',
   new: 'New',
   upload: 'Upload',
+  ai: 'AI access',
 }
 
 /** Looks like a UUID (8-4-4-4-12 hex) */

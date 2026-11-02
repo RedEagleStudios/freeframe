@@ -36,6 +36,9 @@ kombu==5.6.2
 # Draws the play button on a shared video's link-preview picture
 # (services/embed_card.py).
 pillow==13.0.0
+# The MCP server for AI agents and its OAuth endpoints (services/mcp_server.py).
+# Resolves against the starlette/pydantic/PyJWT pins above.
+mcp==2.3.0
 # Used by test_celery_queue_topology.py to parse the compose files. It was
 # already present transitively, but nothing declared it, so a clean rebuild
 # could have dropped it and silently skipped the queue-topology guard.
