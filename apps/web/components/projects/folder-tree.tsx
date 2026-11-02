@@ -1,10 +1,12 @@
 'use client'
 
-import React, { useState, useCallback, useMemo, useRef } from 'react'
+import React, { useState, useCallback, useContext, useMemo, useRef } from 'react'
 import {
   ChevronRight,
+  ExternalLink,
   FolderOpen,
   Folder as FolderIcon,
+  Link2,
   Plus,
   Trash2,
   MoreHorizontal,
@@ -12,7 +14,8 @@ import {
 import { cn } from '@/lib/utils'
 import { ContextMenuArea, DotsMenu } from '@/components/shared/item-menu'
 import { FolderMenuItems } from './menus/folder-menu'
-import type { FolderTreeNode } from '@/types'
+import { LinkMenuItems } from './menus/link-menu'
+import type { FolderTreeNode, ProjectLink } from '@/types'
 import { carriesFiles } from '@/lib/drag'
 import { collectDataTransfer, type Collected } from '@/lib/upload-folder-walk'
 
@@ -26,6 +29,8 @@ interface FolderTreeProps {
   /** New Subfolder in a folder's menu. Absent = not offered. */
   onCreateFolder?: (name: string, parentId: string | null) => Promise<void>
   onRenameFolder: (folderId: string, name: string) => Promise<void>
+  /** Duplicate in a folder's menu. Absent = not offered. */
+  onDuplicateFolder?: (folderId: string) => Promise<void>
   onDeleteFolder: (folderId: string) => Promise<void>
   /** Create Share Link in a folder's menu. Absent = not offered. */
   onShareFolder?: (folderId: string, folderName: string) => void
@@ -39,6 +44,61 @@ interface FolderTreeProps {
   /** Which folder currently holds the file-drag marking, so exactly one row can
    *  be lit. See FolderCard. */
   fileDragTarget?: string | null
+  /** Links to outside pages (an Outline doc, say), shown in their folder. */
+  links?: ProjectLink[]
+  /** New Link in a folder's menu, `null` being the project root. Absent = not offered. */
+  onCreateLink?: (folderId: string | null) => void
+  /** Edit and Delete in a link's menu. Absent = not offered. */
+  onEditLink?: (link: ProjectLink) => void
+  onDeleteLink?: (link: ProjectLink) => Promise<void>
+}
+
+interface TreeLinks {
+  byFolder: Map<string | null, ProjectLink[]>
+  onCreate?: (folderId: string | null) => void
+  onEdit?: (link: ProjectLink) => void
+  onDelete?: (link: ProjectLink) => Promise<void>
+}
+
+// Links hang off every folder at any depth, so they reach the rows through
+// context rather than through each level's props.
+const TreeLinksContext = React.createContext<TreeLinks>({ byFolder: new Map() })
+
+/** A link row: the name opens the page in a new tab. Never selected, never a
+ *  drop target, because it holds nothing. */
+function LinkRow({ link, depth }: { link: ProjectLink; depth: number }) {
+  const { onEdit, onDelete } = useContext(TreeLinksContext)
+  const items = <LinkMenuItems link={link} onEdit={onEdit} onDelete={onDelete} />
+
+  return (
+    <ContextMenuArea items={items}>
+      <div
+        className="group flex items-center gap-1 px-2 py-1 rounded-md text-[13px] text-text-secondary hover:text-text-primary hover:bg-bg-hover transition-colors"
+        style={{ paddingLeft: `${8 + depth * 16}px` }}
+      >
+        <span className="w-3 shrink-0" />
+        <a
+          href={link.url}
+          target="_blank"
+          rel="noopener noreferrer"
+          title={link.url}
+          className="flex flex-1 min-w-0 items-center gap-1"
+        >
+          <Link2 className="h-3.5 w-3.5 shrink-0" />
+          <span className="truncate">{link.name}</span>
+          <ExternalLink className="h-3 w-3 shrink-0 opacity-0 group-hover:opacity-60" />
+        </a>
+        <DotsMenu items={items}>
+          <button
+            aria-label={`${link.name} menu`}
+            className="opacity-0 group-hover:opacity-100 data-[state=open]:opacity-100 shrink-0 h-5 w-5 flex items-center justify-center rounded hover:bg-bg-hover transition-opacity"
+          >
+            <MoreHorizontal className="h-3 w-3" />
+          </button>
+        </DotsMenu>
+      </div>
+    </ContextMenuArea>
+  )
 }
 
 /**
@@ -191,6 +251,7 @@ interface FolderNodeProps {
   onSelectFolder: (folderId: string | null) => void
   onCreateFolder?: (name: string, parentId: string | null) => Promise<void>
   onRenameFolder: (folderId: string, name: string) => Promise<void>
+  onDuplicateFolder?: (folderId: string) => Promise<void>
   onDeleteFolder: (folderId: string) => Promise<void>
   onShareFolder?: (folderId: string, folderName: string) => void
   onDropItems?: (targetFolderId: string | null, assetIds: string[], folderIds: string[]) => void
@@ -209,6 +270,7 @@ function FolderNode({
   onSelectFolder,
   onCreateFolder,
   onRenameFolder,
+  onDuplicateFolder,
   onDeleteFolder,
   onShareFolder,
   onDropItems,
@@ -221,7 +283,9 @@ function FolderNode({
   const [renameName, setRenameName] = useState(node.name)
   const isActive = currentFolderId === node.id
 
-  const hasChildren = node.children.length > 0
+  const { byFolder, onCreate: onCreateLink } = useContext(TreeLinksContext)
+  const folderLinks = byFolder.get(node.id) ?? []
+  const hasChildren = node.children.length > 0 || folderLinks.length > 0
 
   const handleClick = useCallback(() => {
     onSelectFolder(node.id)
@@ -255,12 +319,21 @@ function FolderNode({
     <FolderMenuItems
       onShare={onShareFolder ? () => onShareFolder(node.id, node.name) : undefined}
       onNewSubfolder={onCreateFolder ? () => onCreateFolder('', node.id) : undefined}
+      onNewLink={
+        onCreateLink
+          ? () => {
+              onCreateLink(node.id)
+              setExpanded(true)
+            }
+          : undefined
+      }
       // Runs once the menu has closed (see item-menu), so the field that
       // appears keeps focus: blur would end the rename.
       onRename={() => {
         setRenameName(node.name)
         setRenaming(true)
       }}
+      onDuplicate={onDuplicateFolder ? () => onDuplicateFolder(node.id) : undefined}
       onDelete={async () => {
         if (confirm(`Delete folder "${node.name}" and all its contents?`)) {
           await onDeleteFolder(node.id)
@@ -351,6 +424,7 @@ function FolderNode({
               onSelectFolder={onSelectFolder}
               onCreateFolder={onCreateFolder}
               onRenameFolder={onRenameFolder}
+              onDuplicateFolder={onDuplicateFolder}
               onDeleteFolder={onDeleteFolder}
               onShareFolder={onShareFolder}
               onDropItems={onDropItems}
@@ -358,6 +432,9 @@ function FolderNode({
               onFileDragOverFolder={onFileDragOverFolder}
               fileDragTarget={fileDragTarget}
             />
+          ))}
+          {folderLinks.map((link) => (
+            <LinkRow key={link.id} link={link} depth={depth + 1} />
           ))}
         </div>
       )}
@@ -374,13 +451,28 @@ export function FolderTree({
   onShowTrash,
   onCreateFolder,
   onRenameFolder,
+  onDuplicateFolder,
   onDeleteFolder,
   onShareFolder,
   onDropItems,
   onDropFiles,
   onFileDragOverFolder,
   fileDragTarget,
+  links,
+  onCreateLink,
+  onEditLink,
+  onDeleteLink,
 }: FolderTreeProps) {
+  const treeLinks = useMemo<TreeLinks>(() => {
+    const byFolder = new Map<string | null, ProjectLink[]>()
+    for (const link of links ?? []) {
+      const list = byFolder.get(link.folder_id)
+      if (list) list.push(link)
+      else byFolder.set(link.folder_id, [link])
+    }
+    return { byFolder, onCreate: onCreateLink, onEdit: onEditLink, onDelete: onDeleteLink }
+  }, [links, onCreateLink, onEditLink, onDeleteLink])
+
   // The root row is a row like any other: same hook, same reporting, so the
   // page's "exactly one frame is lit" holds here too rather than stopping at
   // the folders. `null` as the drop target is what this row means by itself.
@@ -400,6 +492,7 @@ export function FolderTree({
     })
 
   return (
+    <TreeLinksContext.Provider value={treeLinks}>
     <div className="space-y-0.5">
       {/* Project root */}
       <div
@@ -428,6 +521,7 @@ export function FolderTree({
           onSelectFolder={onSelectFolder}
           onCreateFolder={onCreateFolder}
           onRenameFolder={onRenameFolder}
+          onDuplicateFolder={onDuplicateFolder}
           onDeleteFolder={onDeleteFolder}
           onShareFolder={onShareFolder}
           onDropItems={onDropItems}
@@ -435,6 +529,11 @@ export function FolderTree({
           onFileDragOverFolder={onFileDragOverFolder}
           fileDragTarget={fileDragTarget}
         />
+      ))}
+
+      {/* Links at the project root */}
+      {(treeLinks.byFolder.get(null) ?? []).map((link) => (
+        <LinkRow key={link.id} link={link} depth={1} />
       ))}
 
       {/* Recently Deleted */}
@@ -451,5 +550,6 @@ export function FolderTree({
         <span>Recently Deleted</span>
       </div>
     </div>
+    </TreeLinksContext.Provider>
   )
 }

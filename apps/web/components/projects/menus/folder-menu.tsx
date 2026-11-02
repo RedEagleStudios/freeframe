@@ -1,7 +1,7 @@
 'use client'
 
 import * as React from 'react'
-import { FolderPlus, Pencil, Share2, Trash2 } from 'lucide-react'
+import { Copy, FolderPlus, Link2, Pencil, Share2, Trash2 } from 'lucide-react'
 import { MenuAction, MenuSeparator } from '@/components/shared/item-menu'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { NameDialog } from '../name-dialog'
@@ -10,12 +10,18 @@ import type { Folder } from '@/types'
 export interface FolderMenuHandlers {
   onShare?: () => void
   onNewSubfolder?: () => void
+  /** New Link inside this folder (the tree only). */
+  onNewLink?: () => void
   onRename?: () => void
+  onDuplicate?: () => void
   onDelete?: () => void
 }
 
 function hasAny(handlers: { [K in keyof FolderMenuHandlers]?: unknown }) {
-  return !!(handlers.onShare || handlers.onNewSubfolder || handlers.onRename || handlers.onDelete)
+  return !!(
+    handlers.onShare || handlers.onNewSubfolder || handlers.onNewLink ||
+    handlers.onRename || handlers.onDuplicate || handlers.onDelete
+  )
 }
 
 /**
@@ -24,7 +30,7 @@ function hasAny(handlers: { [K in keyof FolderMenuHandlers]?: unknown }) {
  * when its action is, so share mode can leave them all out. Null when none is.
  */
 export function FolderMenuItems(handlers: FolderMenuHandlers) {
-  const { onShare, onNewSubfolder, onRename, onDelete } = handlers
+  const { onShare, onNewSubfolder, onNewLink, onRename, onDuplicate, onDelete } = handlers
   if (!hasAny(handlers)) return null
   return (
     <>
@@ -38,10 +44,20 @@ export function FolderMenuItems(handlers: FolderMenuHandlers) {
           New Subfolder
         </MenuAction>
       )}
-      {(onShare || onNewSubfolder) && (onRename || onDelete) && <MenuSeparator />}
+      {onNewLink && (
+        <MenuAction icon={Link2} onSelect={onNewLink}>
+          New Link
+        </MenuAction>
+      )}
+      {(onShare || onNewSubfolder || onNewLink) && (onRename || onDuplicate || onDelete) && <MenuSeparator />}
       {onRename && (
         <MenuAction icon={Pencil} onSelect={onRename}>
           Rename
+        </MenuAction>
+      )}
+      {onDuplicate && (
+        <MenuAction icon={Copy} onSelect={onDuplicate}>
+          Duplicate
         </MenuAction>
       )}
       {onDelete && (
@@ -64,22 +80,24 @@ export function useFolderMenu(
     onShare?: (folderId: string, folderName: string) => void
     onNewSubfolder?: (parentId: string) => void
     onRename?: (folderId: string, name: string) => Promise<void> | void
+    onDuplicate?: (folderId: string) => Promise<void> | void
     onDelete?: (folderId: string) => Promise<void> | void
   },
 ) {
   const [renameOpen, setRenameOpen] = React.useState(false)
   const [deleteOpen, setDeleteOpen] = React.useState(false)
-  const { onShare, onNewSubfolder, onRename, onDelete } = actions
+  const { onShare, onNewSubfolder, onRename, onDuplicate, onDelete } = actions
 
   const items = (
     <FolderMenuItems
       onShare={onShare ? () => onShare(folder.id, folder.name) : undefined}
       onNewSubfolder={onNewSubfolder ? () => onNewSubfolder(folder.id) : undefined}
       onRename={onRename ? () => setRenameOpen(true) : undefined}
+      onDuplicate={onDuplicate ? () => onDuplicate(folder.id) : undefined}
       onDelete={onDelete ? () => setDeleteOpen(true) : undefined}
     />
   )
-  const itemsOrNull = hasAny({ onShare, onNewSubfolder, onRename, onDelete }) ? items : null
+  const itemsOrNull = hasAny({ onShare, onNewSubfolder, onRename, onDuplicate, onDelete }) ? items : null
 
   const dialogs = (
     <>

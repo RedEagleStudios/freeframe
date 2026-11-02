@@ -8,12 +8,12 @@ from ..database import get_db
 from ..middleware.auth import get_current_user
 from ..models.user import User
 from ..models.project import Project, ProjectMember, ProjectRole
-from ..models.asset import Asset, AssetVersion, MediaFile, ProcessingStatus
+from ..models.asset import Asset
 from ..schemas.project import ProjectCreate, ProjectUpdate, ProjectResponse, ProjectListItem, ProjectOwner, ProjectMemberResponse, AddProjectMemberRequest, UpdateProjectMemberRequest
 from ..tasks.email_tasks import send_project_added_email
 from ..tasks.celery_app import send_task_safe
 from ..services.s3_service import put_object, generate_presigned_get_url, delete_object
-from ..services.storage import project_storage_used_bytes
+from ..services.storage import committed_media, project_storage_used_bytes
 from ..services.project_members import add_or_revive_member
 from ..config import settings
 
@@ -111,18 +111,16 @@ def build_project_list(
         .all()
     )
 
-    # Batch: storage bytes per project (sum of file sizes)
+    # Batch: storage bytes per project — the same committed, per-object figure as
+    # services.storage.project_storage_used_bytes
+    committed = (
+        committed_media(db, Asset.project_id)
+        .filter(Asset.project_id.in_(all_project_ids))
+        .subquery()
+    )
     storage_query = (
-        db.query(Asset.project_id, func.coalesce(func.sum(MediaFile.file_size_bytes), 0))
-        .join(AssetVersion, AssetVersion.asset_id == Asset.id)
-        .join(MediaFile, MediaFile.version_id == AssetVersion.id)
-        # Committed-only usage — matches services.storage.instance_storage_used_bytes
-        .filter(
-            Asset.project_id.in_(all_project_ids), Asset.deleted_at.is_(None),
-            AssetVersion.deleted_at.is_(None),
-            AssetVersion.processing_status.in_([ProcessingStatus.processing, ProcessingStatus.ready]),
-        )
-        .group_by(Asset.project_id)
+        db.query(committed.c.project_id, func.coalesce(func.sum(committed.c.file_size_bytes), 0))
+        .group_by(committed.c.project_id)
         .all()
     )
     storage_map = {pid: int(size) for pid, size in storage_query}

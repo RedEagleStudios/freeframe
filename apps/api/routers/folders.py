@@ -10,8 +10,17 @@ from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..middleware.auth import get_current_user
-from ..models.asset import Asset, AssetVersion, ProcessingStatus
+from ..models.asset import (
+    Asset,
+    AssetStatus,
+    AssetVersion,
+    CarouselItem,
+    MediaFile,
+    ProcessingStatus,
+)
 from ..models.folder import Folder
+from ..models.link import ProjectLink
+from ..models.metadata import AssetMetadata
 from ..models.project import Project, ProjectRole
 from ..models.user import User
 from ..schemas.folder import (
@@ -21,6 +30,7 @@ from ..schemas.folder import (
     EnsureFoldersRequest,
     EnsureFoldersResponse,
     FolderCreate,
+    FolderDuplicateResponse,
     FolderResponse,
     FolderTreeNode,
     FolderUpdate,
@@ -28,6 +38,7 @@ from ..schemas.folder import (
 from ..services.folder_paths import (
     MAX_ENSURE_NODES,
     MAX_FOLDER_DEPTH,
+    MAX_FOLDER_NAME_LENGTH,
     _get_depth,
     distinct_prefixes,
     ensure_folder_paths,
@@ -123,7 +134,7 @@ def _get_descendant_ids(db: Session, folder_id: uuid.UUID) -> list[uuid.UUID]:
 
 
 def _compute_item_count(db: Session, folder_id: uuid.UUID) -> int:
-    """Count immediate subfolders + assets in a folder."""
+    """Count immediate subfolders + assets + links in a folder."""
     subfolder_count = (
         db.query(func.count(Folder.id))
         .filter(Folder.parent_id == folder_id, Folder.deleted_at.is_(None))
@@ -136,7 +147,10 @@ def _compute_item_count(db: Session, folder_id: uuid.UUID) -> int:
         .scalar()
         or 0
     )
-    return subfolder_count + asset_count
+    link_count = (
+        db.query(func.count(ProjectLink.id)).filter(ProjectLink.folder_id == folder_id).scalar() or 0
+    )
+    return subfolder_count + asset_count + link_count
 
 
 def _folder_to_response(db: Session, folder: Folder) -> FolderResponse:
@@ -346,6 +360,13 @@ def get_folder_tree(
         .all()
     ) if folder_ids else {}
 
+    link_counts = dict(
+        db.query(ProjectLink.folder_id, func.count(ProjectLink.id))
+        .filter(ProjectLink.folder_id.in_(folder_ids))
+        .group_by(ProjectLink.folder_id)
+        .all()
+    ) if folder_ids else {}
+
     # Build tree in Python
     folder_map: dict[uuid.UUID, FolderTreeNode] = {}
     for f in all_folders:
@@ -353,7 +374,9 @@ def get_folder_tree(
             id=f.id,
             name=f.name,
             parent_id=f.parent_id,
-            item_count=(subfolder_counts.get(f.id, 0) + asset_counts.get(f.id, 0)),
+            item_count=(
+                subfolder_counts.get(f.id, 0) + asset_counts.get(f.id, 0) + link_counts.get(f.id, 0)
+            ),
         )
 
     roots: list[FolderTreeNode] = []
@@ -435,6 +458,182 @@ def delete_folder(
     ).update({"deleted_at": now}, synchronize_session="fetch")
 
     db.commit()
+
+
+# ─── Duplicate ────────────────────────────────────────────────────────────────
+
+
+def _copy_name(name: str, taken: set[str]) -> str:
+    """`name copy`, then `name copy 2`, ... : the first not in `taken`, cut to fit the column."""
+    n = 1
+    while True:
+        suffix = " copy" if n == 1 else f" copy {n}"
+        candidate = name[: MAX_FOLDER_NAME_LENGTH - len(suffix)] + suffix
+        if candidate not in taken:
+            return candidate
+        n += 1
+
+
+@router.post(
+    "/folders/{folder_id}/duplicate",
+    response_model=FolderDuplicateResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def duplicate_folder(
+    folder_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Copy a folder, its live subfolders, their links and their live assets next to it.
+
+    Editor or above. Each asset keeps its `ready` versions, their media, carousel
+    order and custom metadata. Comments, approvals, share links, status,
+    assignee and due date are review state and are not copied: the copy starts
+    as a draft. Assets with no `ready` version are skipped and counted.
+
+    The copies reference the same storage objects as the originals instead of
+    copying the bytes, so this takes no storage and no time per file. The
+    retention purge only reclaims an object once no media row names it any more
+    (see `tasks/cleanup_tasks._reclaim_media_s3`).
+    """
+    folder = _get_folder(db, folder_id)
+    project_id = folder.project_id
+    require_project_role(db, project_id, current_user, ProjectRole.editor)
+    # Taken by delete_folder too: a trash of this subtree either lands before
+    # the walk below, which then does not see it, or waits for the copy.
+    lock_project_folders(db, project_id)
+    if not folder_chain_is_live(db, folder_id):
+        raise HTTPException(status_code=404, detail="Folder not found")
+
+    # The live subtree, parents before children, from one read of the project.
+    children: dict[uuid.UUID, list[tuple[uuid.UUID, str]]] = {}
+    for fid, parent_id, name in db.query(Folder.id, Folder.parent_id, Folder.name).filter(
+        Folder.project_id == project_id, Folder.deleted_at.is_(None),
+    ):
+        children.setdefault(parent_id, []).append((fid, name))
+
+    sibling_query = db.query(Folder.name).filter(
+        Folder.project_id == project_id, Folder.deleted_at.is_(None),
+    )
+    sibling_query = sibling_query.filter(
+        Folder.parent_id.is_(None) if folder.parent_id is None else Folder.parent_id == folder.parent_id
+    )
+    new_name = _copy_name(folder.name, {name for (name,) in sibling_query})
+
+    root_copy = Folder(
+        id=uuid.uuid4(), project_id=project_id, parent_id=folder.parent_id,
+        name=new_name, created_by=current_user.id,
+    )
+    folder_map: dict[uuid.UUID, uuid.UUID] = {folder_id: root_copy.id}
+    new_folders = [root_copy]
+    queue = [folder_id]
+    while queue:
+        source_parent = queue.pop(0)
+        for child_id, child_name in children.get(source_parent, []):
+            copy = Folder(
+                id=uuid.uuid4(), project_id=project_id, parent_id=folder_map[source_parent],
+                name=child_name, created_by=current_user.id,
+            )
+            folder_map[child_id] = copy.id
+            new_folders.append(copy)
+            queue.append(child_id)
+    db.add_all(new_folders)
+    db.flush()
+    db.add_all([
+        ProjectLink(
+            project_id=project_id, folder_id=folder_map[link.folder_id],
+            name=link.name, url=link.url, created_by=current_user.id,
+        )
+        for link in db.query(ProjectLink).filter(ProjectLink.folder_id.in_(folder_map.keys()))
+    ])
+
+    assets = (
+        db.query(Asset)
+        .filter(Asset.folder_id.in_(folder_map.keys()), Asset.deleted_at.is_(None))
+        .all()
+    )
+    versions_by_asset: dict[uuid.UUID, list[AssetVersion]] = {}
+    if assets:
+        for v in (
+            db.query(AssetVersion)
+            .filter(
+                AssetVersion.asset_id.in_([a.id for a in assets]),
+                AssetVersion.deleted_at.is_(None),
+                AssetVersion.processing_status == ProcessingStatus.ready,
+            )
+            .order_by(AssetVersion.version_number)
+        ):
+            versions_by_asset.setdefault(v.asset_id, []).append(v)
+
+    asset_map: dict[uuid.UUID, uuid.UUID] = {}
+    version_map: dict[uuid.UUID, uuid.UUID] = {}
+    new_assets: list[Asset] = []
+    new_versions: list[AssetVersion] = []
+    for a in assets:
+        if a.id not in versions_by_asset:
+            continue
+        copy = Asset(
+            id=uuid.uuid4(), project_id=project_id, name=a.name, description=a.description,
+            asset_type=a.asset_type, status=AssetStatus.draft, rating=a.rating,
+            folder_id=folder_map[a.folder_id], keywords=list(a.keywords or []),
+            created_by=current_user.id,
+        )
+        asset_map[a.id] = copy.id
+        new_assets.append(copy)
+        for v in versions_by_asset[a.id]:
+            # Numbers kept as they are, gaps included: comments, exports and
+            # share URLs label by them, so v3 of the copy is v3 of the original.
+            v_copy = AssetVersion(
+                id=uuid.uuid4(), asset_id=copy.id, version_number=v.version_number,
+                processing_status=ProcessingStatus.ready, created_by=v.created_by,
+            )
+            version_map[v.id] = v_copy.id
+            new_versions.append(v_copy)
+    db.add_all(new_assets)
+    db.flush()
+    db.add_all(new_versions)
+    db.flush()
+
+    if version_map:
+        media_map: dict[uuid.UUID, uuid.UUID] = {}
+        new_media: list[MediaFile] = []
+        for mf in db.query(MediaFile).filter(MediaFile.version_id.in_(version_map.keys())):
+            mf_copy = MediaFile(
+                id=uuid.uuid4(), version_id=version_map[mf.version_id],
+                file_type=mf.file_type, original_filename=mf.original_filename,
+                mime_type=mf.mime_type, file_size_bytes=mf.file_size_bytes,
+                s3_key_raw=mf.s3_key_raw, s3_key_processed=mf.s3_key_processed,
+                s3_key_download=mf.s3_key_download, s3_key_thumbnail=mf.s3_key_thumbnail,
+                width=mf.width, height=mf.height, duration_seconds=mf.duration_seconds,
+                fps=mf.fps, sequence_order=mf.sequence_order,
+            )
+            media_map[mf.id] = mf_copy.id
+            new_media.append(mf_copy)
+        db.add_all(new_media)
+        db.flush()
+        db.add_all([
+            CarouselItem(
+                version_id=version_map[ci.version_id],
+                media_file_id=media_map[ci.media_file_id],
+                position=ci.position,
+            )
+            for ci in db.query(CarouselItem).filter(CarouselItem.version_id.in_(version_map.keys()))
+            if ci.media_file_id in media_map
+        ])
+        db.add_all([
+            AssetMetadata(asset_id=asset_map[m.asset_id], field_id=m.field_id, value=m.value)
+            for m in db.query(AssetMetadata).filter(AssetMetadata.asset_id.in_(asset_map.keys()))
+        ])
+
+    with _folder_name_guard(db, new_name):
+        db.commit()
+    db.refresh(root_copy)
+    return FolderDuplicateResponse(
+        folder=_folder_to_response(db, root_copy),
+        folders_copied=len(new_folders),
+        assets_copied=len(new_assets),
+        assets_skipped=len(assets) - len(new_assets),
+    )
 
 
 # ─── Move ─────────────────────────────────────────────────────────────────────

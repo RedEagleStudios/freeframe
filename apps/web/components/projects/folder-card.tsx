@@ -85,6 +85,7 @@ interface FolderCardProps {
   onOpen: (folder: FolderType) => void
   onSelect?: (e: React.MouseEvent) => void
   onRename?: (folderId: string, name: string) => Promise<void>
+  onDuplicate?: (folderId: string) => Promise<void>
   onDelete?: (folderId: string) => Promise<void>
   onShare?: (folderId: string, folderName: string) => void
   /** New Subfolder in the menu, with this folder as the parent. */
@@ -114,6 +115,7 @@ export function FolderCard({
   onOpen,
   onSelect,
   onRename,
+  onDuplicate,
   onDelete,
   onShare,
   onNewSubfolder,
@@ -129,6 +131,7 @@ export function FolderCard({
     onShare,
     onNewSubfolder,
     onRename,
+    onDuplicate,
     onDelete,
   })
 

@@ -253,19 +253,27 @@ review workflow.
 
 ## Database
 
-**Soft delete is common but not universal.** 13 of the 29 models carry a `deleted_at` column;
-16 do not, including `MediaFile`, `Annotation`, `CommentAttachment`, `CommentReaction`,
-`Notification` and `ActivityLog`. Nothing filters the column automatically — every query does
+**Soft delete is common but not universal.** 14 of the 32 models carry a `deleted_at` column;
+18 do not, including `MediaFile`, `Annotation`, `CommentAttachment`, `CommentReaction`,
+`Notification`, `ActivityLog` and `ProjectLink`. Nothing filters the column automatically — every query does
 it by hand. Soft deletion is also not permanent: `tasks/cleanup_tasks.py` hard-deletes
 soft-deleted rows and reclaims their S3 objects after `SOFT_DELETE_RETENTION_DAYS`
 (default 30).
+
+**A storage object can belong to several `MediaFile` rows.** Duplicating a folder
+(`POST /folders/{id}/duplicate`) gives the copied versions the originals' S3 keys instead of
+copying the bytes. The purge deletes an object only when no other media row still names it
+(`_reclaim_media_s3`), and storage usage (`services/storage.committed_media`) counts each raw
+object once. Only `ready` versions are copied, so discarding an upload and the stale-upload
+reaper never meet a shared key. Any other code that deletes media objects needs the same check.
 
 Key entity relationships:
 
 ```
 Projects ──── ProjectMembers
     │
-    ├── Folders (nested, max depth 10) ──── Assets
+    ├── Folders (nested, max depth 10) ──┬── Assets
+    │                                    └── ProjectLinks (outside URLs shown in the tree)
     │
     ├── Assets ──┬── AssetVersions ──── MediaFiles
     │            ├── Comments ──┬── Annotations

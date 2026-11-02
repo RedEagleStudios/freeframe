@@ -11,6 +11,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 
 const project = { id: 'p1', name: 'Launch film', is_public: false }
 
@@ -63,7 +64,7 @@ vi.mock('@/hooks/use-comments', () => ({
 vi.mock('@/hooks/use-folders', () => ({
   useFolders: () => ({
     tree: [], mutateTree: vi.fn(), moveFolder: vi.fn(),
-    deleteFolder: vi.fn(), moveAsset: vi.fn(), ...folders,
+    deleteFolder: vi.fn(), moveAsset: vi.fn(), links: [], ...folders,
   }),
   useTrash: () => ({
     trash: {
@@ -181,7 +182,9 @@ describe('folder writes the server refuses', () => {
       new ApiError(409, "A folder named 'Dailies' already exists here"),
     )
     renderPage()
-    fireEvent.click(screen.getByTitle('New folder'))
+    const user = userEvent.setup({ pointerEventsCheck: 0 })
+    await user.click(screen.getByTitle('Add'))
+    await user.click(await screen.findByRole('menuitem', { name: 'New Folder' }))
 
     fireEvent.change(screen.getByPlaceholderText('Folder name'), { target: { value: 'Dailies' } })
     fireEvent.click(screen.getByRole('button', { name: 'Create' }))

@@ -2,13 +2,44 @@
 
 import useSWR from 'swr'
 import { api } from '@/lib/api'
-import type { Folder, FolderTreeNode, TrashResponse } from '@/types'
+import type { Folder, FolderDuplicateResponse, FolderTreeNode, ProjectLink, TrashResponse } from '@/types'
 
 export function useFolders(projectId: string) {
   const { data: tree, mutate: mutateTree } = useSWR<FolderTreeNode[]>(
     projectId ? `/projects/${projectId}/folder-tree` : null,
     (key: string) => api.get<FolderTreeNode[]>(key),
   )
+  // Links are hidden with a trashed folder and come back with it, so they are
+  // refreshed whenever the tree is.
+  const { data: links, mutate: mutateLinks } = useSWR<ProjectLink[]>(
+    projectId ? `/projects/${projectId}/links` : null,
+    (key: string) => api.get<ProjectLink[]>(key),
+  )
+
+  async function refresh(): Promise<void> {
+    await Promise.all([mutateTree(), mutateLinks()])
+  }
+
+  async function createLink(name: string, url: string, folderId: string | null): Promise<ProjectLink> {
+    const link = await api.post<ProjectLink>(`/projects/${projectId}/links`, {
+      name,
+      url,
+      folder_id: folderId,
+    })
+    await refresh() // a link counts toward its folder's items
+    return link
+  }
+
+  async function updateLink(linkId: string, changes: { name?: string; url?: string }): Promise<ProjectLink> {
+    const link = await api.patch<ProjectLink>(`/links/${linkId}`, changes)
+    await mutateLinks()
+    return link
+  }
+
+  async function deleteLink(linkId: string): Promise<void> {
+    await api.delete(`/links/${linkId}`)
+    await refresh()
+  }
 
   async function createFolder(name: string, parentId?: string | null): Promise<Folder> {
     const folder = await api.post<Folder>(`/projects/${projectId}/folders`, {
@@ -32,7 +63,13 @@ export function useFolders(projectId: string) {
 
   async function deleteFolder(folderId: string): Promise<void> {
     await api.delete(`/folders/${folderId}`)
-    await mutateTree()
+    await refresh()
+  }
+
+  async function duplicateFolder(folderId: string): Promise<FolderDuplicateResponse> {
+    const result = await api.post<FolderDuplicateResponse>(`/folders/${folderId}/duplicate`)
+    await refresh()
+    return result
   }
 
   async function moveAsset(assetId: string, folderId: string | null): Promise<void> {
@@ -60,7 +97,7 @@ export function useFolders(projectId: string) {
 
   async function restoreFolder(folderId: string): Promise<void> {
     await api.post(`/folders/${folderId}/restore`)
-    await mutateTree()
+    await refresh()
   }
 
   return {
@@ -70,6 +107,11 @@ export function useFolders(projectId: string) {
     renameFolder,
     moveFolder,
     deleteFolder,
+    duplicateFolder,
+    links: links ?? [],
+    createLink,
+    updateLink,
+    deleteLink,
     moveAsset,
     bulkMove,
     restoreAsset,

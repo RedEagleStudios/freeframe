@@ -88,3 +88,13 @@ class EnsuredFolder(BaseModel):
 class EnsureFoldersResponse(BaseModel):
     # One entry per requested path, in request order.
     folders: list[EnsuredFolder]
+
+
+class FolderDuplicateResponse(BaseModel):
+    # The new top-level folder, created next to the one that was duplicated.
+    folder: FolderResponse
+    folders_copied: int
+    assets_copied: int
+    # Live assets with no `ready` version yet (still uploading or processing,
+    # or failed): there is nothing finished to copy, so they are left out.
+    assets_skipped: int

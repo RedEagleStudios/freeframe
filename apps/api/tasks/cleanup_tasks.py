@@ -16,6 +16,7 @@ from ..models.approval import Approval
 from ..models.share import ShareLink, ShareLinkItem, ShareLinkActivity, AssetShare
 from ..models.project import Project, ProjectJoinLink, ProjectMember
 from ..models.folder import Folder
+from ..models.link import ProjectLink
 from ..models.metadata import MetadataField, AssetMetadata, Collection, CollectionShare
 from ..models.branding import ProjectBranding, WatermarkSettings
 from ..models.instance_branding import InstanceBranding
@@ -95,20 +96,34 @@ def _purge_comment(db, comment_id, counts: PurgeCounts) -> None:
     db.flush()
 
 
-def _reclaim_media_s3(mf, counts: PurgeCounts) -> None:
-    """Best-effort delete of a MediaFile's S3 objects. processed is a prefix (HLS or single key)."""
-    _safe(delete_object, mf.s3_key_raw)
-    counts.s3_deletes += 1
-    if mf.s3_key_processed:
+def _shared_elsewhere(db, column, key, mf_id) -> bool:
+    """Whether a media row other than `mf_id` still names `key` in `column`.
+
+    Duplicating a folder (`routers/folders.duplicate_folder`) gives the copies
+    the originals' storage keys rather than copies of the bytes, so one object
+    can belong to several rows. It may only be deleted with the last of them.
+    Rows already hard-deleted earlier in this transaction no longer count, so
+    purging the original and its copy in one run still reclaims the object.
+    """
+    return db.query(MediaFile.id).filter(column == key, MediaFile.id != mf_id).first() is not None
+
+
+def _reclaim_media_s3(db, mf, counts: PurgeCounts) -> None:
+    """Best-effort delete of a MediaFile's S3 objects. processed is a prefix (HLS or single key).
+    An object another media row still names is left in place (see `_shared_elsewhere`)."""
+    if not _shared_elsewhere(db, MediaFile.s3_key_raw, mf.s3_key_raw, mf.id):
+        _safe(delete_object, mf.s3_key_raw)
+        counts.s3_deletes += 1
+    if mf.s3_key_processed and not _shared_elsewhere(db, MediaFile.s3_key_processed, mf.s3_key_processed, mf.id):
         _safe(delete_prefix, mf.s3_key_processed)
         counts.s3_deletes += 1
-    if mf.s3_key_download:
+    if mf.s3_key_download and not _shared_elsewhere(db, MediaFile.s3_key_download, mf.s3_key_download, mf.id):
         # Written under the processed prefix, so the sweep above reclaims it in
         # practice. Named anyway: the download rung is a whole rendition, and
         # its reclamation must not rest on the two keys happening to be related.
         _safe(delete_object, mf.s3_key_download)
         counts.s3_deletes += 1
-    if mf.s3_key_thumbnail:
+    if mf.s3_key_thumbnail and not _shared_elsewhere(db, MediaFile.s3_key_thumbnail, mf.s3_key_thumbnail, mf.id):
         _safe(delete_object, mf.s3_key_thumbnail)
         counts.s3_deletes += 1
 
@@ -122,7 +137,7 @@ def _purge_version(db, version_id, counts: PurgeCounts) -> None:
     db.query(CarouselItem).filter(CarouselItem.version_id == version_id).delete(synchronize_session=False)
     media = db.query(MediaFile).filter(MediaFile.version_id == version_id).all()
     for mf in media:
-        _reclaim_media_s3(mf, counts)
+        _reclaim_media_s3(db, mf, counts)
     counts.media_files += len(media)
     db.query(MediaFile).filter(MediaFile.version_id == version_id).delete(synchronize_session=False)
     # comments on this version (recurse each; every comment has a version_id, NOT NULL)
@@ -193,6 +208,7 @@ def _purge_folder(db, folder_id, counts: PurgeCounts) -> None:
         _purge_share_link(db, link.id, counts)
     db.query(ShareLinkItem).filter(ShareLinkItem.folder_id == folder_id).delete(synchronize_session=False)
     db.query(AssetShare).filter(AssetShare.folder_id == folder_id).delete(synchronize_session=False)
+    db.query(ProjectLink).filter(ProjectLink.folder_id == folder_id).delete(synchronize_session=False)
     db.query(Folder).filter(Folder.id == folder_id).delete(synchronize_session=False)
     counts.folders += 1
     db.flush()
@@ -211,6 +227,7 @@ def _purge_project(db, project_id, counts: PurgeCounts) -> None:
     # catch orphaned folders (folders.parent_id has no same-project constraint) not reachable from the project's root folders
     for f in db.query(Folder).filter(Folder.project_id == project_id).all():
         _purge_folder(db, f.id, counts)
+    db.query(ProjectLink).filter(ProjectLink.project_id == project_id).delete(synchronize_session=False)
     for link in db.query(ShareLink).filter(ShareLink.project_id == project_id).all():
         _purge_share_link(db, link.id, counts)
     field_ids = [mf.id for mf in db.query(MetadataField).filter(MetadataField.project_id == project_id).all()]

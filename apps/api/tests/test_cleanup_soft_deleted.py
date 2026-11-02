@@ -406,6 +406,7 @@ def test_gc_covers_all_inbound_fks_to_purged_tables():
     import apps.api.models.asset  # noqa: F401
     import apps.api.models.project  # noqa: F401
     import apps.api.models.folder  # noqa: F401
+    import apps.api.models.link  # noqa: F401
     import apps.api.models.comment  # noqa: F401
     import apps.api.models.share  # noqa: F401
     import apps.api.models.approval  # noqa: F401
@@ -423,7 +424,7 @@ def test_gc_covers_all_inbound_fks_to_purged_tables():
         "collections", "metadata_fields", "approvals", "asset_shares", "asset_metadata", "carousel_items",
         "collection_shares", "share_link_items", "share_link_activity", "watermark_settings",
         "project_members", "project_brandings", "activity_logs", "annotations", "comment_attachments",
-        "comment_reactions", "mentions", "notifications",
+        "comment_reactions", "mentions", "notifications", "project_links",
     }
     # (referencing_table, referencing_column) confirmed handled by a _purge_* helper.
     KNOWN_HANDLED = {
@@ -431,11 +432,11 @@ def test_gc_covers_all_inbound_fks_to_purged_tables():
         ("assets", "project_id"), ("folders", "project_id"), ("share_links", "project_id"),
         ("project_brandings", "project_id"), ("watermark_settings", "project_id"),
         ("metadata_fields", "project_id"), ("collections", "project_id"),
-        ("project_members", "project_id"), ("activity_logs", "project_id"),
+        ("project_members", "project_id"), ("activity_logs", "project_id"), ("project_links", "project_id"),
         ("project_join_links", "project_id"),
         # -> folders.id
         ("assets", "folder_id"), ("share_links", "folder_id"), ("share_link_items", "folder_id"),
-        ("asset_shares", "folder_id"), ("folders", "parent_id"),
+        ("asset_shares", "folder_id"), ("folders", "parent_id"), ("project_links", "folder_id"),
         # -> assets.id
         ("asset_versions", "asset_id"), ("comments", "asset_id"), ("share_links", "asset_id"),
         ("share_link_items", "asset_id"), ("asset_shares", "asset_id"), ("asset_metadata", "asset_id"),

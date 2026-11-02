@@ -32,15 +32,18 @@ def choose_part_size(db: Session, file_size_bytes: int) -> tuple[int, str | None
     return part_size, part_count_error(file_size_bytes, part_size, fixed=bool(configured))
 
 
-def _committed_media_sum(db: Session):
-    """Base query summing MediaFile.file_size_bytes over *committed* media only — the single
-    definition of "used storage" shared by the instance-wide and per-project sums.
+def committed_media(db: Session, *columns):
+    """Distinct `(*columns, s3_key_raw, file_size_bytes)` over *committed* media only — the
+    single definition of "used storage" shared by the instance-wide and per-project sums and
+    the project list.
 
     Counts only bytes actually in S3: versions in `processing`/`ready`, excluding soft-deleted
     assets/versions. MediaFile has no deleted_at, so soft-delete is excluded via the joins.
-    Callers add their own scope (e.g. a project filter) before `.scalar()`.
+    Distinct on the raw key because a duplicated folder's copies name the same objects as the
+    originals: one stored master is counted once however many assets show it.
+    Callers add their own scope (e.g. a project filter), then sum `file_size_bytes`.
     """
-    return db.query(func.coalesce(func.sum(MediaFile.file_size_bytes), 0)) \
+    return db.query(*columns, MediaFile.s3_key_raw, MediaFile.file_size_bytes) \
         .join(AssetVersion, MediaFile.version_id == AssetVersion.id) \
         .join(Asset, AssetVersion.asset_id == Asset.id) \
         .filter(
@@ -49,19 +52,25 @@ def _committed_media_sum(db: Session):
             AssetVersion.processing_status.in_(
                 [ProcessingStatus.processing, ProcessingStatus.ready]
             ),
-        )
+        ) \
+        .distinct()
+
+
+def _sum_bytes(db: Session, query) -> int:
+    rows = query.subquery()
+    return db.query(func.coalesce(func.sum(rows.c.file_size_bytes), 0)).scalar() or 0
 
 
 def instance_storage_used_bytes(db: Session) -> int:
     """Instance-wide committed storage in bytes — the single source of truth for both the
     member GET indicator and cap enforcement."""
-    return _committed_media_sum(db).scalar() or 0
+    return _sum_bytes(db, committed_media(db))
 
 
 def project_storage_used_bytes(db: Session, project_id) -> int:
     """Committed storage in bytes for a single project — same semantics as the instance-wide
     figure, so per-project and instance usage agree."""
-    return _committed_media_sum(db).filter(Asset.project_id == project_id).scalar() or 0
+    return _sum_bytes(db, committed_media(db).filter(Asset.project_id == project_id))
 
 
 def storage_cap_error(db: Session, incoming_bytes: int) -> str | None:
