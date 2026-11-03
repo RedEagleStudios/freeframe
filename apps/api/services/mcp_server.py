@@ -42,6 +42,7 @@ from ..routers import projects as projects_router
 from ..routers import upload as upload_router
 from ..schemas.approval import ApprovalCreate
 from ..schemas.comment import CommentCreate
+from ..schemas.folder import BulkMoveRequest, FolderCreate, FolderUpdate
 from ..schemas.upload import (
     ALLOWED_MIME_TYPES, AbortUploadRequest, CompleteUploadRequest, InitiateUploadRequest,
 )
@@ -61,8 +62,12 @@ file itself: fetch it with `curl -L -OJ "<url>"` (the server names the file). \
 Every asset carries its folder_path (from the project's top level, "" at the \
 top) and a web_url to hand to a person.
 
-add_comment and set_approval change things as the user, and need a \
-connection the user allowed to make changes.
+add_comment, set_approval and the folder tools (create_folder, rename_folder, \
+move_items, duplicate_folder, delete_folder, restore_folder) change things as \
+the user, and need a connection the user allowed to make changes. Changing \
+folders and moving assets needs the editor role, as on the web. delete_folder \
+moves a folder and everything in it to the project's trash; restore_folder \
+brings it back.
 
 To upload a file from your machine (needs changes allowed and the editor \
 role): call start_upload with its path and exact size in bytes, run the \
@@ -230,6 +235,19 @@ def _asset(a: Any, folder_paths: dict[uuid.UUID, str]) -> dict:
 def _assets(db: Session, items: list[Any]) -> list[dict]:
     paths = _folder_paths(db, {a.project_id for a in items})
     return [_asset(a, paths) for a in items]
+
+
+def _folder(db: Session, f: Any) -> dict:
+    """A folder as the folder tools return it, with its path from the project's top level."""
+    return {
+        "id": str(f.id),
+        "name": f.name,
+        "project_id": str(f.project_id),
+        "parent_id": str(f.parent_id) if f.parent_id else None,
+        "folder_path": _folder_paths(db, {f.project_id}).get(f.id),
+        "item_count": f.item_count,
+        "web_url": f"{_project_url(f.project_id)}?folder={f.id}",
+    }
 
 
 def _folder_node(node: Any) -> dict:
@@ -659,6 +677,105 @@ def create_mcp_server(session_scope: SessionScope = default_session_scope) -> MC
             )
             _run_background(background)
             return {"version_id": str(version_id), "cancelled": True}
+        return call(run)
+
+    @server.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False))
+    def create_folder(
+        project_id: uuid.UUID,
+        name: Annotated[str, Field(min_length=1, max_length=255)],
+        parent_id: Annotated[
+            Optional[uuid.UUID], Field(description="Folder to create it in; omit for the project's top level")
+        ] = None,
+    ) -> dict[str, Any]:
+        """Create a folder. Names are unique among a folder's subfolders."""
+        def run(db: Session, user: User, scopes: list[str]) -> dict:
+            require_write(scopes)
+            created = folders_router.create_folder(
+                project_id=project_id, body=FolderCreate(name=name, parent_id=parent_id), db=db, current_user=user,
+            )
+            return _folder(db, created)
+        return call(run)
+
+    @server.tool(annotations=ToolAnnotations(
+        read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False,
+    ))
+    def rename_folder(folder_id: uuid.UUID, name: Annotated[str, Field(min_length=1, max_length=255)]) -> dict[str, Any]:
+        """Rename a folder. It stays where it is."""
+        def run(db: Session, user: User, scopes: list[str]) -> dict:
+            require_write(scopes)
+            updated = folders_router.update_folder(
+                folder_id=folder_id, body=FolderUpdate(name=name), db=db, current_user=user,
+            )
+            return _folder(db, updated)
+        return call(run)
+
+    @server.tool(annotations=ToolAnnotations(
+        read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False,
+    ))
+    def move_items(
+        project_id: uuid.UUID,
+        target_folder_id: Annotated[
+            Optional[uuid.UUID],
+            Field(description="Folder to move into. Omit (or null) to move to the project's top level."),
+        ] = None,
+        folder_ids: Annotated[list[uuid.UUID], Field(description="Folders to move, with everything inside")] = [],
+        asset_ids: Annotated[list[uuid.UUID], Field(description="Assets to move")] = [],
+    ) -> dict[str, Any]:
+        """Move folders and assets into another folder of the same project, all at once or not at all."""
+        def run(db: Session, user: User, scopes: list[str]) -> dict:
+            require_write(scopes)
+            if not folder_ids and not asset_ids:
+                raise ToolError("Name at least one folder or asset to move")
+            folders_router.bulk_move(
+                project_id=project_id,
+                body=BulkMoveRequest(asset_ids=asset_ids, folder_ids=folder_ids, target_folder_id=target_folder_id),
+                db=db,
+                current_user=user,
+            )
+            path = _folder_paths(db, {project_id}).get(target_folder_id) if target_folder_id else ""
+            return {"moved_folders": len(folder_ids), "moved_assets": len(asset_ids), "into_folder_path": path}
+        return call(run)
+
+    @server.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False))
+    def duplicate_folder(folder_id: uuid.UUID) -> dict[str, Any]:
+        """Copy a folder with its subfolders, links and finished assets next to it, as "<name> copy".
+
+        The copies share the stored files (no extra storage) and start without comments or approvals.
+        Assets still uploading or processing are skipped."""
+        def run(db: Session, user: User, scopes: list[str]) -> dict:
+            require_write(scopes)
+            copied = folders_router.duplicate_folder(folder_id=folder_id, db=db, current_user=user)
+            return {
+                "folder": _folder(db, copied.folder),
+                "folders_copied": copied.folders_copied,
+                "assets_copied": copied.assets_copied,
+                "assets_skipped": copied.assets_skipped,
+            }
+        return call(run)
+
+    @server.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=False))
+    def delete_folder(folder_id: uuid.UUID) -> dict[str, Any]:
+        """Move a folder, its subfolders and their assets to the project's trash.
+
+        restore_folder brings them back. The trash is emptied for good after the instance's retention period
+        (30 days by default)."""
+        def run(db: Session, user: User, scopes: list[str]) -> dict:
+            require_write(scopes)
+            folders_router.delete_folder(folder_id=folder_id, db=db, current_user=user)
+            return {"folder_id": str(folder_id), "in_trash": True}
+        return call(run)
+
+    @server.tool(annotations=ToolAnnotations(
+        read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False,
+    ))
+    def restore_folder(folder_id: uuid.UUID) -> dict[str, Any]:
+        """Bring a folder deleted with delete_folder back out of the trash, with what was deleted along with it.
+
+        It returns to its parent folder, or to the top level if the parent is still in the trash."""
+        def run(db: Session, user: User, scopes: list[str]) -> dict:
+            require_write(scopes)
+            folders_router.restore_folder(folder_id=folder_id, db=db, current_user=user)
+            return _folder(db, folders_router._folder_to_response(db, db.get(Folder, folder_id)))
         return call(run)
 
     return server

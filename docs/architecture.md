@@ -282,7 +282,8 @@ revokes it, and when the account is deleted, deactivated or changes its password
 (`token_version`).
 
 Scopes: `freeframe:read` (browse, download, read comments) is always granted; `freeframe:write`
-(upload, post comments, approve or reject) only if the user leaves "Allow changes" on at consent. The
+(upload files; create, rename, move, duplicate, trash and restore folders; move assets; post
+comments; approve or reject) only if the user leaves "Allow changes" on at consent. The
 consent page decides because clients request what the protected-resource metadata advertises.
 
 **Tools act as the user through the web app's own code.** Each tool calls the router function

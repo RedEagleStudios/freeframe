@@ -325,6 +325,58 @@ def test_the_mcp_server_needs_an_https_or_localhost_address(monkeypatch, base, d
     assert (mcp_disabled_reason() is not None) is disabled
 
 
+# ─── Folders ──────────────────────────────────────────────────────────────────
+
+def test_an_agent_organizes_folders_and_moves_assets(real_db, mcp):
+    from apps.api.models.asset import Asset
+
+    me, _other, mine, _theirs, asset = _seed(real_db)
+    _client_id, tokens = _connect(mcp, me)
+    token = tokens["access_token"]
+
+    def tool(tool_name, /, **args):
+        _status, result = _call(mcp, token, tool_name, {k: str(v) if isinstance(v, uuid.UUID) else v for k, v in args.items()})
+        assert not result["isError"], result
+        return result["structuredContent"]
+
+    footage = tool("create_folder", project_id=mine.id, name="Footage")
+    drone = tool("create_folder", project_id=mine.id, name="Drone", parent_id=footage["id"])
+    assert drone["folder_path"] == "Footage/Drone"
+    assert tool("rename_folder", folder_id=footage["id"], name="Shoot 1")["folder_path"] == "Shoot 1"
+
+    moved = tool("move_items", project_id=mine.id, target_folder_id=drone["id"], asset_ids=[str(asset.id)])
+    assert moved["into_folder_path"] == "Shoot 1/Drone"
+    assert str(real_db.get(Asset, asset.id).folder_id) == drone["id"]
+
+    copy = tool("duplicate_folder", folder_id=footage["id"])
+    assert (copy["folder"]["folder_path"], copy["folders_copied"]) == ("Shoot 1 copy", 2)
+
+    tool("delete_folder", folder_id=footage["id"])
+    assert real_db.get(Asset, asset.id).deleted_at is not None
+    restored = tool("restore_folder", folder_id=footage["id"])
+    assert restored["folder_path"] == "Shoot 1"
+    assert real_db.get(Asset, asset.id).deleted_at is None
+
+    # Back to the top level when no target is named.
+    tool("move_items", project_id=mine.id, folder_ids=[drone["id"]])
+    assert {f["name"] for f in tool("list_folder", project_id=mine.id)["folders"]} == {"Drone", "Shoot 1", "Shoot 1 copy"}
+
+
+def test_changing_folders_needs_changes_allowed_and_the_editor_role(real_db, mcp):
+    from apps.api.models.project import ProjectMember, ProjectRole
+
+    me, _other, mine, theirs, _asset = _seed(real_db)
+    real_db.add(ProjectMember(project_id=theirs.id, user_id=me.id, role=ProjectRole.viewer)); real_db.flush()
+
+    _client_id, read_only = _connect(mcp, me, allow_write=False)
+    _status, refused = _call(mcp, read_only["access_token"], "create_folder", {"project_id": str(mine.id), "name": "X"})
+    assert refused["isError"] and "read-only" in refused["content"][0]["text"]
+
+    _client_id, writer = _connect(mcp, me)
+    _status, viewer = _call(mcp, writer["access_token"], "create_folder", {"project_id": str(theirs.id), "name": "X"})
+    assert viewer["isError"] and "editor" in viewer["content"][0]["text"].lower()
+
+
 # ─── Uploads ──────────────────────────────────────────────────────────────────
 
 MIB = 1024 * 1024

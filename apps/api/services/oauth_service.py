@@ -40,7 +40,7 @@ SCOPE_WRITE = "freeframe:write"
 # In the order the consent page lists them.
 SCOPE_DESCRIPTIONS = {
     SCOPE_READ: "See your projects, folders, files and comments, and download files",
-    SCOPE_WRITE: "Upload files, post comments, and approve or reject files, as you",
+    SCOPE_WRITE: "Upload files, organize folders, post comments, and approve or reject files, as you",
 }
 ALL_SCOPES = list(SCOPE_DESCRIPTIONS)
 
