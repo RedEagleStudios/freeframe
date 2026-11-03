@@ -40,7 +40,7 @@ SCOPE_WRITE = "freeframe:write"
 # In the order the consent page lists them.
 SCOPE_DESCRIPTIONS = {
     SCOPE_READ: "See your projects, folders, files and comments, and download files",
-    SCOPE_WRITE: "Post comments, and approve or reject files, as you",
+    SCOPE_WRITE: "Upload files, post comments, and approve or reject files, as you",
 }
 ALL_SCOPES = list(SCOPE_DESCRIPTIONS)
 
@@ -238,11 +238,11 @@ def rotate_grant(db: Session, grant_id: uuid.UUID, refresh_token: str) -> Option
     return IssuedTokens(access, refresh, settings.mcp_access_token_expire_minutes * 60, list(row.scopes))
 
 
-def _live_grant(db: Session, column, token: str, expiry_column) -> Optional[LiveGrant]:
+def _live_grant(db: Session, *conditions) -> Optional[LiveGrant]:
     row = (
         db.query(OAuthGrant, User)
         .join(User, User.id == OAuthGrant.user_id)
-        .filter(column == hash_token(token), OAuthGrant.revoked_at.is_(None), expiry_column > _now())
+        .filter(OAuthGrant.revoked_at.is_(None), *conditions)
         .first()
     )
     if row is None:
@@ -258,13 +258,18 @@ def _live_grant(db: Session, column, token: str, expiry_column) -> Optional[Live
 def grant_for_access_token(db: Session, token: str) -> Optional[LiveGrant]:
     if not token.startswith(ACCESS_TOKEN_PREFIX):
         return None
-    return _live_grant(db, OAuthGrant.access_token_hash, token, OAuthGrant.access_expires_at)
+    return _live_grant(db, OAuthGrant.access_token_hash == hash_token(token), OAuthGrant.access_expires_at > _now())
 
 
 def grant_for_refresh_token(db: Session, token: str) -> Optional[LiveGrant]:
     if not token.startswith(REFRESH_TOKEN_PREFIX):
         return None
-    return _live_grant(db, OAuthGrant.refresh_token_hash, token, OAuthGrant.refresh_expires_at)
+    return _live_grant(db, OAuthGrant.refresh_token_hash == hash_token(token), OAuthGrant.refresh_expires_at > _now())
+
+
+def live_grant(db: Session, grant_id: uuid.UUID) -> Optional[LiveGrant]:
+    """A connection that has not been revoked or lapsed, held by an account that may still hold it."""
+    return _live_grant(db, OAuthGrant.id == grant_id, OAuthGrant.refresh_expires_at > _now())
 
 
 def revoke_by_token(db: Session, token: str) -> None:

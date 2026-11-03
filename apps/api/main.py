@@ -16,9 +16,9 @@ from .middleware.setup_guard import SetupGuardMiddleware
 
 
 # Paths whose next segment is a credential: an invite token sets the account's
-# password, a share token opens the link, and an OAuth request id is what the
-# consent page approves.
-_TOKEN_IN_PATH = re.compile(r"^(/auth/invite/|/share/|/oauth/requests/)[^/]+")
+# password, a share token opens the link, an OAuth request id is what the
+# consent page approves, and an agent upload ticket signs an upload's parts.
+_TOKEN_IN_PATH = re.compile(r"^(/auth/invite/|/share/|/oauth/requests/|/upload/agent/)[^/]+")
 
 
 class _DropQueryStringFilter(logging.Filter):

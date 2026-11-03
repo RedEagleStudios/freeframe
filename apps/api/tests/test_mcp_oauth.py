@@ -6,7 +6,10 @@ and the one-time code; a dict stands in for it (CI has no Redis service).
 """
 import base64
 import hashlib
+import os
 import secrets
+import shutil
+import subprocess
 import uuid
 from contextlib import nullcontext
 from urllib.parse import parse_qs, urlparse
@@ -320,3 +323,162 @@ def test_consent_answers_once(client, fake_redis, test_user, auth_headers):
 def test_the_mcp_server_needs_an_https_or_localhost_address(monkeypatch, base, disabled):
     monkeypatch.setattr(settings, "public_api_url", base)
     assert (mcp_disabled_reason() is not None) is disabled
+
+
+# ─── Uploads ──────────────────────────────────────────────────────────────────
+
+MIB = 1024 * 1024
+
+
+@pytest.fixture
+def storage(monkeypatch):
+    """Object storage, as the upload router and the discard cleanup see it."""
+    from apps.api.routers import upload as upload_router
+    from apps.api.tasks import cleanup_tasks
+
+    state = {"parts": [], "transcodes": []}
+    monkeypatch.setattr(upload_router, "create_multipart_upload", lambda key, mime: "mpu-1")
+    monkeypatch.setattr(upload_router, "presign_upload_part", lambda key, uid, n: f"https://storage.test/{key}?part={n}")
+    monkeypatch.setattr(upload_router, "list_upload_parts", lambda key, uid: list(state["parts"]))
+    monkeypatch.setattr(upload_router, "complete_multipart_upload", lambda key, uid, parts: None)
+    monkeypatch.setattr(upload_router, "head_object_size", lambda key: None)
+    monkeypatch.setattr(upload_router, "abort_multipart_upload", lambda key, uid: None)
+    monkeypatch.setattr(upload_router, "_trigger_processing", lambda a, v: state["transcodes"].append((a, v)))
+    for name in ("abort_multipart_upload", "delete_object", "delete_prefix"):
+        monkeypatch.setattr(cleanup_tasks, name, lambda *a, **k: None)
+    return state
+
+
+def _ticket(upload_command):
+    parts_url = next(line for line in upload_command.splitlines() if line.startswith("PARTS="))
+    return parts_url.split("/upload/agent/")[1].split("/")[0]
+
+
+def _part_url(real_db, ticket, n=1):
+    from fastapi import HTTPException
+    from apps.api.routers.upload import presign_agent_part
+
+    try:
+        return presign_agent_part(ticket, n, db=real_db).body.decode()
+    except HTTPException as exc:
+        return exc.status_code
+
+
+def test_an_agent_uploads_a_file_into_a_folder(real_db, mcp, storage):
+    from apps.api.models.asset import Asset, MediaFile
+    from apps.api.models.folder import Folder
+
+    me, _other, mine, _theirs, _asset = _seed(real_db)
+    folder = Folder(project_id=mine.id, name="Incoming", created_by=me.id)
+    real_db.add(folder); real_db.flush()
+    _client_id, tokens = _connect(mcp, me)
+
+    _status, started = _call(mcp, tokens["access_token"], "start_upload", {
+        "project_id": str(mine.id), "folder_id": str(folder.id),
+        "file_path": "/home/me/Footage/Day 2.mov", "file_size_bytes": 25 * MIB,
+    })
+    assert not started["isError"], started
+    up = started["structuredContent"]
+    assert (up["part_size_bytes"], up["part_count"]) == (10 * MIB, 3)
+    assert "FILE='/home/me/Footage/Day 2.mov'" in up["upload_command"]
+    assert _part_url(real_db, _ticket(up["upload_command"]), 3).endswith("?part=3")
+
+    _status, early = _call(mcp, tokens["access_token"], "finish_upload", {"version_id": up["version_id"]})
+    assert early["isError"] and "No uploaded parts" in early["content"][0]["text"]
+    assert storage["transcodes"] == []
+
+    storage["parts"] = [
+        {"PartNumber": 1, "ETag": "a", "Size": 10 * MIB},
+        {"PartNumber": 2, "ETag": "b", "Size": 10 * MIB},
+        {"PartNumber": 3, "ETag": "c", "Size": 5 * MIB},
+    ]
+    _status, done = _call(mcp, tokens["access_token"], "finish_upload", {"version_id": up["version_id"]})
+    assert not done["isError"], done
+    assert done["structuredContent"]["status"] == "processing"
+    assert storage["transcodes"] == [(uuid.UUID(up["asset_id"]), uuid.UUID(up["version_id"]))]
+
+    asset = real_db.get(Asset, uuid.UUID(up["asset_id"]))
+    media = real_db.query(MediaFile).filter(MediaFile.version_id == uuid.UUID(up["version_id"])).one()
+    assert (asset.name, asset.folder_id) == ("Day 2.mov", folder.id)
+    assert (media.original_filename, media.mime_type) == ("Day 2.mov", "video/quicktime")
+
+
+def test_uploading_needs_changes_allowed_and_the_editor_role(real_db, mcp, storage):
+    from apps.api.models.project import ProjectMember, ProjectRole
+
+    me, _other, mine, theirs, _asset = _seed(real_db)
+    real_db.add(ProjectMember(project_id=theirs.id, user_id=me.id, role=ProjectRole.viewer)); real_db.flush()
+    request = {"file_path": "clip.mp4", "file_size_bytes": MIB}
+
+    _client_id, read_only = _connect(mcp, me, allow_write=False)
+    _status, refused = _call(mcp, read_only["access_token"], "start_upload", {**request, "project_id": str(mine.id)})
+    assert refused["isError"] and "read-only" in refused["content"][0]["text"]
+
+    _client_id, writer = _connect(mcp, me)
+    _status, viewer = _call(mcp, writer["access_token"], "start_upload", {**request, "project_id": str(theirs.id)})
+    assert viewer["isError"] and "editor" in viewer["content"][0]["text"].lower()
+
+
+def test_an_upload_link_ends_with_the_connection_it_came_from(real_db, mcp, storage):
+    from apps.api.services.auth_service import create_access_token
+
+    me, _other, mine, _theirs, _asset = _seed(real_db)
+    _client_id, tokens = _connect(mcp, me)
+    _status, started = _call(mcp, tokens["access_token"], "start_upload", {
+        "project_id": str(mine.id), "file_path": "clip.mp4", "file_size_bytes": MIB,
+    })
+    ticket = _ticket(started["structuredContent"]["upload_command"])
+    assert _part_url(real_db, ticket).startswith("https://storage.test/")
+
+    # A sign-in token is not an upload ticket.
+    assert _part_url(real_db, create_access_token(str(me.id), 1)) == 401
+
+    [(grant, _client)] = oauth_service.list_user_grants(real_db, me.id)
+    oauth_service.revoke_user_grant(real_db, me.id, grant.id)
+    assert _part_url(real_db, ticket) == 401
+
+
+def test_cancelling_an_upload_throws_it_away(real_db, mcp, storage):
+    from apps.api.models.asset import Asset
+
+    me, _other, mine, _theirs, _asset = _seed(real_db)
+    _client_id, tokens = _connect(mcp, me)
+    _status, started = _call(mcp, tokens["access_token"], "start_upload", {
+        "project_id": str(mine.id), "file_path": "clip.mp4", "file_size_bytes": MIB,
+    })
+    up = started["structuredContent"]
+
+    _status, cancelled = _call(mcp, tokens["access_token"], "cancel_upload", {"version_id": up["version_id"]})
+    assert not cancelled["isError"], cancelled
+    assert real_db.get(Asset, uuid.UUID(up["asset_id"])).deleted_at is not None
+    assert _part_url(real_db, _ticket(up["upload_command"])) == 404
+
+
+@pytest.mark.skipif(not (shutil.which("bash") and shutil.which("dd")), reason="needs bash and dd")
+def test_the_upload_command_sends_the_file_cut_on_the_upload_parts(tmp_path):
+    """Runs the generated script with curl replaced by a stub that keeps each PUT's body."""
+    from apps.api.services.mcp_server import _upload_command
+
+    source = tmp_path / "it's a clip.mov"
+    source.write_bytes(os.urandom(2500))
+    received = tmp_path / "received"
+    received.mkdir()
+    stub = tmp_path / "bin" / "curl"
+    stub.parent.mkdir()
+    stub.write_text(
+        "#!/bin/sh\n"
+        'url=""; put=0\n'
+        'for a in "$@"; do case "$a" in PUT) put=1;; http*) url="$a";; esac; done\n'
+        'if [ "$put" = 1 ]; then cat > "$RECEIVED/${url##*/}"; else echo "http://storage.test/${url##*/}"; fi\n'
+    )
+    stub.chmod(0o755)
+
+    script = _upload_command(str(source), "https://api.test/upload/agent/T/parts", 1000, 3)
+    run = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True,
+        env={**os.environ, "PATH": f"{stub.parent}:{os.environ['PATH']}", "RECEIVED": str(received)},
+    )
+    assert run.returncode == 0, run.stderr
+    parts = [(received / str(n)).read_bytes() for n in (1, 2, 3)]
+    assert [len(p) for p in parts] == [1000, 1000, 500]
+    assert b"".join(parts) == source.read_bytes()

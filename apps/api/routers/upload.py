@@ -8,6 +8,7 @@ from botocore.exceptions import (
     ConnectionError as BotoConnectionError,
 )
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -35,6 +36,7 @@ from ..schemas.upload import (
     ResumeUploadResponse,
     ALLOWED_MIME_TYPES, CHUNK_SIZE_BYTES, _format_bytes, mime_to_asset_type,
 )
+from ..services import oauth_service, upload_tickets
 from ..services.storage import choose_part_size, upload_guard_error
 from ..services.versions import next_version_number
 
@@ -208,6 +210,36 @@ def presign_part(
     db.commit()
 
     return PresignPartResponse(presigned_url=url, part_number=body.part_number)
+
+
+@router.get("/agent/{ticket}/parts/{part_number}", response_class=PlainTextResponse)
+def presign_agent_part(ticket: str, part_number: int, db: Session = Depends(get_db)):
+    """A part's presigned storage URL, as plain text, for an upload an AI agent
+    started over MCP (services/upload_tickets.py). The ticket stands in for the
+    bearer token, which stays inside the agent's MCP client; it is checked
+    against the connection it came from on every part, then the request is the
+    browser's presign-part."""
+    claim = upload_tickets.read_ticket(ticket)
+    if claim is None:
+        raise HTTPException(status_code=401, detail="This upload link has expired or is not valid. Start the upload again.")
+    grant = oauth_service.live_grant(db, claim.grant_id)
+    if grant is None or grant.user_id != claim.user_id or oauth_service.SCOPE_WRITE not in grant.scopes:
+        raise HTTPException(status_code=401, detail="The AI connection this upload came from has ended.")
+    user = db.get(User, claim.user_id)
+    version = db.query(AssetVersion).filter(
+        AssetVersion.id == claim.version_id, AssetVersion.deleted_at.is_(None),
+    ).first()
+    media_file = db.query(MediaFile).filter(MediaFile.version_id == claim.version_id).first()
+    if user is None or version is None or media_file is None or version.upload_id is None:
+        raise HTTPException(status_code=404, detail="Upload not found")
+    if version.processing_status != ProcessingStatus.uploading:
+        raise HTTPException(status_code=409, detail=f"This upload is already {version.processing_status.value}.")
+    signed = presign_part(
+        PresignPartRequest(s3_key=media_file.s3_key_raw, upload_id=version.upload_id, part_number=part_number),
+        db=db,
+        current_user=user,
+    )
+    return PlainTextResponse(signed.presigned_url)
 
 
 # Codes S3 and its clones use for "try again shortly", throttling included. Some

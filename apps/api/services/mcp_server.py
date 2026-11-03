@@ -5,12 +5,16 @@ OAuth (services/mcp_auth.py). Each tool acts as the signed-in user by calling
 the same router function the web app calls, so access rules, soft-delete
 filters and download policy are the web app's own.
 """
+import math
+import mimetypes
+import shlex
 import uuid
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Callable, Literal, Optional, TypeVar
 from urllib.parse import urlparse
 
-from fastapi import HTTPException
+import anyio.from_thread
+from fastapi import BackgroundTasks, HTTPException
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.routes import validate_issuer_url
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
@@ -18,7 +22,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
-from pydantic import AnyHttpUrl, Field
+from pydantic import AnyHttpUrl, Field, ValidationError
 from sqlalchemy.orm import Session
 from starlette.applications import Starlette
 from starlette.routing import Route
@@ -26,6 +30,7 @@ from starlette.types import Receive, Scope, Send
 from typing_extensions import Annotated
 
 from ..config import settings
+from ..models.asset import Asset, AssetVersion, MediaFile
 from ..models.folder import Folder
 from ..models.user import User
 from ..routers import approvals as approvals_router
@@ -34,8 +39,13 @@ from ..routers import comments as comments_router
 from ..routers import folders as folders_router
 from ..routers import me as me_router
 from ..routers import projects as projects_router
+from ..routers import upload as upload_router
 from ..schemas.approval import ApprovalCreate
 from ..schemas.comment import CommentCreate
+from ..schemas.upload import (
+    ALLOWED_MIME_TYPES, AbortUploadRequest, CompleteUploadRequest, InitiateUploadRequest,
+)
+from . import oauth_service, upload_tickets
 from .mcp_auth import FreeFrameOAuthProvider, SessionScope, default_session_scope
 from .oauth_service import ALL_SCOPES, SCOPE_READ, SCOPE_WRITE
 
@@ -52,12 +62,65 @@ Every asset carries its folder_path (from the project's top level, "" at the \
 top) and a web_url to hand to a person.
 
 add_comment and set_approval change things as the user, and need a \
-connection the user allowed to make changes.\
+connection the user allowed to make changes.
+
+To upload a file from your machine (needs changes allowed and the editor \
+role): call start_upload with its path and exact size in bytes, run the \
+upload_command it returns in a shell (it sends the file straight to storage \
+with curl and dd), then call finish_upload. cancel_upload throws an \
+unfinished upload away.\
 """
 
 T = TypeVar("T")
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, open_world_hint=False)
+
+# Extensions the upload accepts, by the type /upload/initiate checks. The
+# system's MIME table is the fallback; it differs between machines.
+_MIME_BY_EXTENSION = {
+    ".mp4": "video/mp4", ".m4v": "video/x-m4v", ".mov": "video/quicktime", ".qt": "video/quicktime",
+    ".mkv": "video/x-matroska", ".webm": "video/webm", ".avi": "video/x-msvideo",
+    ".mpg": "video/mpeg", ".mpeg": "video/mpeg", ".wmv": "video/x-ms-wmv",
+    ".mp3": "audio/mpeg", ".aac": "audio/aac", ".ogg": "audio/ogg", ".wav": "audio/wav", ".bwf": "audio/wav",
+    ".aif": "audio/aiff", ".aiff": "audio/aiff", ".flac": "audio/flac", ".m4a": "audio/x-m4a",
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp",
+    ".heic": "image/heic", ".tif": "image/tiff", ".tiff": "image/tiff", ".gif": "image/gif",
+}
+
+
+def _guess_mime(file_name: str) -> Optional[str]:
+    ext = ("." + file_name.rsplit(".", 1)[-1].lower()) if "." in file_name else ""
+    mime = _MIME_BY_EXTENSION.get(ext) or mimetypes.guess_type(file_name)[0]
+    return mime if mime in ALLOWED_MIME_TYPES else None
+
+
+def _upload_command(file_path: str, parts_url: str, part_size: int, part_count: int) -> str:
+    """A POSIX shell script that sends a file in the upload's parts, in order.
+
+    Each part's presigned URL comes from the ticket endpoint just before it is
+    sent (they expire after an hour), and dd cuts the part on the boundaries the
+    upload was started with. The Content-Type header is dropped because the URL
+    is not signed for one. Runs with the curl and dd on macOS, Linux and Git Bash."""
+    return "\n".join([
+        f"FILE={shlex.quote(file_path)}",
+        f"PARTS={shlex.quote(parts_url)}",
+        f"PART_SIZE={part_size}",
+        f"COUNT={part_count}",
+        "n=1",
+        'while [ "$n" -le "$COUNT" ]; do',
+        '  URL=$(curl -fsS --retry 3 "$PARTS/$n") || exit 1',
+        '  dd if="$FILE" bs="$PART_SIZE" skip=$((n - 1)) count=1 2>/dev/null |',
+        '    curl -fsS --retry 3 -X PUT -H "Content-Type:" -H "Expect:" --data-binary @- -o /dev/null "$URL" || exit 1',
+        '  echo "sent part $n of $COUNT" >&2',
+        "  n=$((n + 1))",
+        "done",
+    ])
+
+
+def _run_background(tasks: BackgroundTasks) -> None:
+    """Run what a router queued for after its response (the transcode dispatch),
+    as FastAPI would. Tools run in a worker thread of the server's event loop."""
+    anyio.from_thread.run(tasks)
 
 
 def mcp_disabled_reason() -> Optional[str]:
@@ -237,6 +300,8 @@ def create_mcp_server(session_scope: SessionScope = default_session_scope) -> MC
                 return fn(db, user, token.scopes)
             except HTTPException as exc:
                 raise ToolError(str(exc.detail)) from None
+            except ValidationError as exc:
+                raise ToolError(str(exc)) from None
 
     def require_write(scopes: list[str]) -> None:
         if SCOPE_WRITE not in scopes:
@@ -463,6 +528,137 @@ def create_mcp_server(session_scope: SessionScope = default_session_scope) -> MC
                 "status": approval.status,
                 "note": approval.note,
             }
+        return call(run)
+
+    def own_upload(db: Session, user: User, version_id: uuid.UUID) -> tuple[AssetVersion, MediaFile]:
+        version = db.query(AssetVersion).filter(
+            AssetVersion.id == version_id, AssetVersion.deleted_at.is_(None),
+        ).first()
+        media_file = db.query(MediaFile).filter(MediaFile.version_id == version_id).first()
+        if version is None or media_file is None or version.created_by != user.id:
+            raise ToolError("No upload of yours with that version_id")
+        return version, media_file
+
+    @server.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False))
+    def start_upload(
+        project_id: uuid.UUID,
+        file_path: Annotated[str, Field(
+            min_length=1, description="The file's path on the machine that will run upload_command",
+        )],
+        file_size_bytes: Annotated[int, Field(gt=0, description="Its exact size in bytes, e.g. from `wc -c < FILE`")],
+        folder_id: Annotated[
+            Optional[uuid.UUID], Field(description="Folder for a new asset; omit for the project's top level")
+        ] = None,
+        asset_id: Annotated[
+            Optional[uuid.UUID], Field(description="Upload as the next version of this asset instead of a new asset")
+        ] = None,
+        name: Annotated[Optional[str], Field(description="Name for a new asset; defaults to the file name")] = None,
+        mime_type: Annotated[
+            Optional[str], Field(description="Only if the file's extension does not say what it is, e.g. video/mp4")
+        ] = None,
+    ) -> dict[str, Any]:
+        """Start uploading a video, audio or image file from your machine, as a new asset or a new version.
+
+        Returns upload_command, a shell script that sends the file straight to storage in parts with curl and
+        dd (the file never passes through this connection). Run it in a shell that can read file_path, then call
+        finish_upload with the version_id. The command works for 24 hours. Needs the editor role or higher."""
+        def run(db: Session, user: User, scopes: list[str]) -> dict:
+            require_write(scopes)
+            token = get_access_token()
+            grant = oauth_service.grant_for_access_token(db, token.token) if token else None
+            if grant is None:
+                raise ToolError("Not signed in")
+            file_name = file_path.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+            mime = mime_type or _guess_mime(file_name)
+            if mime not in ALLOWED_MIME_TYPES:
+                raise ToolError(
+                    f"FreeFrame does not take {mime or file_name!r}. Pass mime_type, one of: "
+                    + ", ".join(sorted(ALLOWED_MIME_TYPES))
+                )
+            started = upload_router.initiate_upload(
+                InitiateUploadRequest(
+                    project_id=project_id,
+                    asset_name=name or file_name,
+                    original_filename=file_name,
+                    mime_type=mime,
+                    file_size_bytes=file_size_bytes,
+                    asset_id=asset_id,
+                    folder_id=folder_id,
+                ),
+                db=db,
+                current_user=user,
+            )
+            ticket, expires_at = upload_tickets.create_ticket(user.id, started.version_id, grant.id)
+            part_count = math.ceil(file_size_bytes / started.chunk_size_bytes)
+            return {
+                "asset_id": str(started.asset_id),
+                "version_id": str(started.version_id),
+                "part_size_bytes": started.chunk_size_bytes,
+                "part_count": part_count,
+                "expires_at": expires_at.isoformat(),
+                "upload_command": _upload_command(
+                    file_path,
+                    f"{settings.api_base_url}/upload/agent/{ticket}/parts",
+                    started.chunk_size_bytes,
+                    part_count,
+                ),
+                "next_step": "Run upload_command in a shell, then call finish_upload with this version_id.",
+            }
+        return call(run)
+
+    @server.tool(annotations=ToolAnnotations(
+        read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False,
+    ))
+    def finish_upload(version_id: uuid.UUID) -> dict[str, Any]:
+        """Finish an upload once upload_command has sent every part: the file is checked and its processing starts.
+
+        If parts are missing it says which; run upload_command again and call this again."""
+        def run(db: Session, user: User, scopes: list[str]) -> dict:
+            require_write(scopes)
+            version, media_file = own_upload(db, user, version_id)
+            background = BackgroundTasks()
+            done = upload_router.complete_upload(
+                CompleteUploadRequest(
+                    s3_key=media_file.s3_key_raw,
+                    upload_id=version.upload_id or "",
+                    asset_id=version.asset_id,
+                    version_id=version.id,
+                ),
+                background_tasks=background,
+                db=db,
+                current_user=user,
+            )
+            _run_background(background)
+            asset = db.get(Asset, done.asset_id)
+            return {
+                "asset_id": str(done.asset_id),
+                "version_id": str(done.version_id),
+                "status": done.status,
+                "web_url": _asset_url(asset.project_id, asset.id),
+            }
+        return call(run)
+
+    @server.tool(annotations=ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=False))
+    def cancel_upload(version_id: uuid.UUID) -> dict[str, Any]:
+        """Throw away an upload that has not been finished: its sent parts are deleted, and so is the asset
+        if this was its only version."""
+        def run(db: Session, user: User, scopes: list[str]) -> dict:
+            require_write(scopes)
+            version, media_file = own_upload(db, user, version_id)
+            background = BackgroundTasks()
+            upload_router.abort_upload(
+                AbortUploadRequest(
+                    s3_key=media_file.s3_key_raw,
+                    upload_id=version.upload_id or "",
+                    version_id=version.id,
+                    discard=True,
+                ),
+                background_tasks=background,
+                db=db,
+                current_user=user,
+            )
+            _run_background(background)
+            return {"version_id": str(version_id), "cancelled": True}
         return call(run)
 
     return server

@@ -86,7 +86,7 @@ export default function AiAccessPage() {
         <div>
           <h1 className="text-lg font-semibold text-text-primary">AI access</h1>
           <p className="text-sm text-text-secondary">
-            Let AI assistants find, review and download your files over MCP
+            Let AI assistants find, review, download and upload your files over MCP
           </p>
         </div>
       </div>

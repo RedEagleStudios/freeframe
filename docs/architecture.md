@@ -282,7 +282,7 @@ revokes it, and when the account is deleted, deactivated or changes its password
 (`token_version`).
 
 Scopes: `freeframe:read` (browse, download, read comments) is always granted; `freeframe:write`
-(post comments, approve or reject) only if the user leaves "Allow changes" on at consent. The
+(upload, post comments, approve or reject) only if the user leaves "Allow changes" on at consent. The
 consent page decides because clients request what the protected-resource metadata advertises.
 
 **Tools act as the user through the web app's own code.** Each tool calls the router function
@@ -290,6 +290,15 @@ the matching web request would reach (`list_projects`, `list_assets`, `get_strea
 `create_comment`, …) with the token's user, so the permission model above, the `deleted_at`
 filters and the download policy apply unchanged. `get_download_url` returns the same presigned
 link the web app's download button gets.
+
+**Uploads keep the file out of the MCP connection.** `start_upload` runs the browser's
+`/upload/initiate` and returns a shell script (`curl` and `dd`) plus an upload ticket, a JWT
+(`services/upload_tickets.py`, 24 hours) naming the version, the user and the OAuth grant. The
+script asks `GET /upload/agent/{ticket}/parts/{n}` for each part's presigned URL just before
+sending it, and PUTs the part straight to storage on the boundaries the upload was started with.
+That endpoint checks the grant is still live and allowed to make changes on every part, so
+disconnecting the app stops an upload in progress, then runs the browser's presign-part.
+`finish_upload` and `cancel_upload` are `/upload/complete` and `/upload/abort` with discard.
 
 Discovery lives at the origin root, which the production proxy hands to the web app, so
 `app/.well-known/oauth-*` route handlers pass those requests to the API (`lib/oauth-metadata.ts`).
