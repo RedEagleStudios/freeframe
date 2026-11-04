@@ -11,7 +11,8 @@ The flow:
    browser back to the client.
 4. The client trades the code (with its PKCE verifier) for an access token and
    a refresh token, kept hashed on an OAuthGrant.
-5. Every refresh replaces both tokens, so a refresh token works once.
+5. Every refresh replaces both tokens. The refresh token it was made with keeps
+   working until the client uses the new access token (see rotate_grant).
 
 Parked requests and codes are short-lived and live in Redis. Clients and grants
 live in Postgres.
@@ -63,14 +64,43 @@ def _now() -> datetime:
 
 # ─── Clients ───────────────────────────────────────────────────────────────────
 
+_LOOPBACK_HOSTS = {"127.0.0.1", "[::1]", "::1", "localhost"}
+
+
+def _is_loopback(url) -> bool:
+    return url.scheme == "http" and (url.host or "").lower() in _LOOPBACK_HOSTS
+
+
+class FreeFrameClient(OAuthClientInformationFull):
+    """A registered client, with RFC 8252 §7.3's rule for apps on the user's machine.
+
+    A command-line or desktop app receives the code on a local port it picks
+    each time, so a loopback redirect URI matches a registered loopback one
+    whatever its port, and whichever loopback name (localhost, 127.0.0.1, ::1)
+    each uses: they all reach the same machine. Scheme, path and query must
+    still match. A code sent there is useless without the PKCE verifier, which
+    only the app that started the request holds."""
+
+    def validate_redirect_uri(self, redirect_uri):
+        if redirect_uri is not None and _is_loopback(redirect_uri):
+            for registered in self.redirect_uris or []:
+                if (
+                    _is_loopback(registered)
+                    and (registered.path or "/") == (redirect_uri.path or "/")
+                    and registered.query == redirect_uri.query
+                ):
+                    return redirect_uri
+        return super().validate_redirect_uri(redirect_uri)
+
+
 def save_client(db: Session, client: OAuthClientInformationFull) -> None:
     db.add(OAuthClient(client_id=client.client_id, client_info=client.model_dump(mode="json", exclude_none=True)))
     db.commit()
 
 
-def load_client(db: Session, client_id: str) -> Optional[OAuthClientInformationFull]:
+def load_client(db: Session, client_id: str) -> Optional[FreeFrameClient]:
     row = db.get(OAuthClient, client_id)
-    return OAuthClientInformationFull.model_validate(row.client_info) if row else None
+    return FreeFrameClient.model_validate(row.client_info) if row else None
 
 
 # ─── Authorization requests and codes (Redis) ──────────────────────────────────
@@ -178,6 +208,8 @@ class LiveGrant:
     scopes: list[str]
     access_expires_at: datetime
     refresh_expires_at: datetime
+    # A refresh issued tokens the client has not used yet (see rotate_grant).
+    awaiting_first_use: bool = False
 
 
 def _fresh_token_columns(now: datetime) -> tuple[str, str, dict]:
@@ -216,20 +248,29 @@ def create_grant(
     return IssuedTokens(access, refresh, settings.mcp_access_token_expire_minutes * 60, scopes)
 
 
-def rotate_grant(db: Session, grant_id: uuid.UUID, refresh_token: str) -> Optional[IssuedTokens]:
-    """Replace a grant's tokens, if `refresh_token` is still its current one.
+def _refresh_matches(hashed: str):
+    return or_(OAuthGrant.refresh_token_hash == hashed, OAuthGrant.previous_refresh_token_hash == hashed)
 
-    The compare-and-set makes a refresh token single-use even when two
-    refreshes race: only one of them matches the hash."""
+
+def rotate_grant(db: Session, grant_id: uuid.UUID, refresh_token: str) -> Optional[IssuedTokens]:
+    """Replace a grant's tokens, given its current refresh token or, until the
+    client has used the tokens the last refresh gave it, the one before.
+
+    A refresh whose response never reached the client (a dropped connection,
+    an app that did not save it) would otherwise end the connection for good:
+    the client still holds only the token the refresh retired. So the token a
+    refresh was made with stays usable until the new access token is first
+    used, which proves the client got the new pair (grant_for_access_token).
+    After that only the current refresh token works.
+
+    The compare-and-set keeps two refreshes that race from both winning
+    against a stale view: each matches the row as it is when it lands."""
+    hashed = hash_token(refresh_token)
     access, refresh, columns = _fresh_token_columns(_now())
     row = db.execute(
         update(OAuthGrant)
-        .where(
-            OAuthGrant.id == grant_id,
-            OAuthGrant.refresh_token_hash == hash_token(refresh_token),
-            OAuthGrant.revoked_at.is_(None),
-        )
-        .values(**columns)
+        .where(OAuthGrant.id == grant_id, _refresh_matches(hashed), OAuthGrant.revoked_at.is_(None))
+        .values(**columns, previous_refresh_token_hash=hashed)
         .returning(OAuthGrant.scopes)
     ).first()
     db.commit()
@@ -252,19 +293,29 @@ def _live_grant(db: Session, *conditions) -> Optional[LiveGrant]:
         return None
     return LiveGrant(
         grant.id, grant.user_id, grant.client_id, list(grant.scopes), grant.access_expires_at, grant.refresh_expires_at,
+        awaiting_first_use=grant.previous_refresh_token_hash is not None,
     )
 
 
 def grant_for_access_token(db: Session, token: str) -> Optional[LiveGrant]:
     if not token.startswith(ACCESS_TOKEN_PREFIX):
         return None
-    return _live_grant(db, OAuthGrant.access_token_hash == hash_token(token), OAuthGrant.access_expires_at > _now())
+    grant = _live_grant(db, OAuthGrant.access_token_hash == hash_token(token), OAuthGrant.access_expires_at > _now())
+    if grant is not None and grant.awaiting_first_use:
+        # The client has the new pair: the refresh token before it is done.
+        db.execute(
+            update(OAuthGrant)
+            .where(OAuthGrant.id == grant.id, OAuthGrant.access_token_hash == hash_token(token))
+            .values(previous_refresh_token_hash=None)
+        )
+        db.commit()
+    return grant
 
 
 def grant_for_refresh_token(db: Session, token: str) -> Optional[LiveGrant]:
     if not token.startswith(REFRESH_TOKEN_PREFIX):
         return None
-    return _live_grant(db, OAuthGrant.refresh_token_hash == hash_token(token), OAuthGrant.refresh_expires_at > _now())
+    return _live_grant(db, _refresh_matches(hash_token(token)), OAuthGrant.refresh_expires_at > _now())
 
 
 def live_grant(db: Session, grant_id: uuid.UUID) -> Optional[LiveGrant]:
@@ -278,7 +329,7 @@ def revoke_by_token(db: Session, token: str) -> None:
     db.execute(
         update(OAuthGrant)
         .where(
-            or_(OAuthGrant.access_token_hash == hashed, OAuthGrant.refresh_token_hash == hashed),
+            or_(OAuthGrant.access_token_hash == hashed, _refresh_matches(hashed)),
             OAuthGrant.revoked_at.is_(None),
         )
         .values(revoked_at=_now())

@@ -26,8 +26,9 @@ class OAuthGrant(Base):
     """One user's approval of one client: the connection Settings → AI access lists.
 
     Holds the hashes of the current access and refresh token. A refresh replaces
-    both (rotation), so a refresh token works once. Revoking sets `revoked_at`;
-    a password change (token_version) or deactivation also ends the grant."""
+    both (rotation); the refresh token it was made with keeps working only until
+    the client uses the new access token. Revoking sets `revoked_at`; a password
+    change (token_version) or deactivation also ends the grant."""
     __tablename__ = "oauth_grants"
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id: Mapped[uuid.UUID] = mapped_column(
@@ -43,6 +44,9 @@ class OAuthGrant(Base):
     access_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     refresh_token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
     refresh_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # The refresh token the last refresh was made with, until the client first
+    # uses the access token that refresh issued (services/oauth_service.rotate_grant).
+    previous_refresh_token_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     # Last token issue or refresh. Agents refresh about hourly while in use.
     last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)

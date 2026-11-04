@@ -576,6 +576,17 @@ def _thumbnail_filter(is_hdr: bool, dv_software: bool) -> str:
         )
     return f"{vf},{_THUMB_GEOMETRY},format=yuvj420p"
 
+
+def poster_key(output_s3_prefix: str) -> str:
+    """Where a version's poster frame is stored, by whichever step makes it first."""
+    return f"{output_s3_prefix}/thumbnail.jpg"
+
+
+def poster_filter(stream: dict) -> str:
+    """The poster frame's -vf for a probed video stream, HDR and Dolby Vision
+    profile 5 included, as the transcode makes it."""
+    return _thumbnail_filter(stream.get("color_transfer") in _HDR_TRANSFERS, _dovi_profile(stream) == 5)
+
 # NVENC constant-quality (CQ) settings, keyed by output mode.
 # This ffmpeg/nvenc build has no "-rc cq" mode and ignores "-rc vbr -cq",
 # so constant quality is achieved via "-rc constqp -qp <value>"
@@ -2051,7 +2062,7 @@ class FFmpegTranscoder(BaseTranscoder):
                 str(early_thumb),
             ], timeout=300, label="ffmpeg")
             if early_thumb.exists():
-                key = f"{job.output_s3_prefix}/thumbnail.jpg"
+                key = poster_key(job.output_s3_prefix)
                 self.s3.upload_file(
                     str(early_thumb), self.bucket, key,
                     ExtraArgs=self._extra_args("image/jpeg", "max-age=86400"),
@@ -2743,7 +2754,7 @@ class FFmpegTranscoder(BaseTranscoder):
                 str(work_dir / "thumb_%04d.jpg"),
             ]
             self._run(thumb_cmd, label="ffmpeg")
-            thumbnail_key = f"{job.output_s3_prefix}/thumbnail.jpg"
+            thumbnail_key = poster_key(job.output_s3_prefix)
             uploaded_thumb = False
             if thumb_path.exists():
                 self.s3.upload_file(

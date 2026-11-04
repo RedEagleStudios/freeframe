@@ -274,8 +274,11 @@ The SDK runs the protocol endpoints and checks clients, redirect URIs, PKCE and 
 Parked consent requests (10 minutes) and one-time codes (5 minutes) live in Redis. Registered
 clients (`oauth_clients`) and each user's approval of a client (`oauth_grants`) live in
 Postgres. A grant stores only SHA-256 hashes of its current access and refresh token. Every
-refresh replaces both tokens with a compare-and-set, so a refresh token works once even when two
-refreshes race, and renews the refresh token's lifetime. A connection in use therefore never
+refresh replaces both tokens with a compare-and-set and renews the refresh token's lifetime. The
+refresh token a refresh was made with keeps working until the client first uses the new access
+token, so a refresh whose response the client lost does not end the connection; after that only
+the current one works. A loopback redirect URI (an app on the user's machine) matches a
+registered loopback one whatever its port (RFC 8252 §7.3). A connection in use therefore never
 expires, and an unused one lapses after `MCP_REFRESH_TOKEN_EXPIRE_DAYS`. A grant ends when the
 user disconnects it (Settings → AI access, `DELETE /oauth/grants/{id}`), when the client
 revokes it, and when the account is deleted, deactivated or changes its password

@@ -38,6 +38,7 @@ from ..schemas.upload import (
 )
 from ..services import oauth_service, upload_tickets
 from ..services.storage import choose_part_size, upload_guard_error
+from ..services.poster_frame import make_poster_in_background
 from ..services.versions import next_version_number
 
 logger = logging.getLogger(__name__)
@@ -843,6 +844,9 @@ def complete_upload(
             # rather than by way of a check thirty lines up that a later edit
             # could move.
             background_tasks.add_task(_trigger_processing, asset_id, version_id)
+            # A video's poster frame now, not when its transcode's turn comes,
+            # so a share link pasted right away unfurls with a picture.
+            background_tasks.add_task(make_poster_in_background, version_id)
         else:
             # Someone else moved it off `uploading` first. Dispatching again would
             # be the double transcode this guard exists to prevent. A version that

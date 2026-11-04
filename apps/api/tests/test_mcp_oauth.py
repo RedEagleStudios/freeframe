@@ -175,18 +175,43 @@ def test_assets_say_which_folder_they_are_in(real_db, mcp):
 
 
 
-def test_a_refresh_token_works_once_and_replaces_both_tokens(real_db, mcp):
+def test_a_refresh_replaces_both_tokens_and_survives_a_lost_response(real_db, mcp):
     me, *_ = _seed(real_db)
     client_id, first = _connect(mcp, me)
 
     r = _refresh(mcp, client_id, first["refresh_token"])
     assert r.status_code == 200
-    second = r.json()
+    assert _call(mcp, first["access_token"], "whoami")[0] == 401
 
+    # The client never got that response: the token it still holds works again...
+    retried = _refresh(mcp, client_id, first["refresh_token"])
+    assert retried.status_code == 200
+    current = retried.json()
+    assert _call(mcp, r.json()["access_token"], "whoami")[0] == 401
+
+    # ...until it uses the new access token, which proves it has the new pair.
+    assert _call(mcp, current["access_token"], "whoami")[0] == 200
     reused = _refresh(mcp, client_id, first["refresh_token"])
     assert reused.status_code == 400 and reused.json()["error"] == "invalid_grant"
-    assert _call(mcp, first["access_token"], "whoami")[0] == 401
-    assert _call(mcp, second["access_token"], "whoami")[0] == 200
+    assert _refresh(mcp, client_id, current["refresh_token"]).status_code == 200
+
+
+@pytest.mark.parametrize("asked, allowed", [
+    ("http://localhost:3000/callback", True),      # the port an app picked this time
+    ("http://127.0.0.1:51234/callback", True),     # another loopback name
+    ("http://localhost:3000/elsewhere", False),    # path must match
+    ("https://evil.example/callback", False),      # not on the user's machine
+])
+def test_an_app_on_the_users_machine_may_pick_its_callback_port(real_db, mcp, asked, allowed):
+    client_id = _register(mcp)  # registered http://localhost:33418/callback
+    r = mcp.get("/authorize", params={
+        "client_id": client_id, "response_type": "code", "redirect_uri": asked, "state": "s",
+        "code_challenge": "x" * 43, "code_challenge_method": "S256",
+    }, follow_redirects=False)
+    if allowed:
+        assert r.status_code == 302 and "/oauth/consent?request=" in r.headers["location"]
+    else:
+        assert r.status_code == 400 and "not registered" in r.json()["error_description"]
 
 
 def test_a_refresh_token_only_works_for_the_client_it_was_issued_to(real_db, mcp):
@@ -396,6 +421,7 @@ def storage(monkeypatch):
     monkeypatch.setattr(upload_router, "head_object_size", lambda key: None)
     monkeypatch.setattr(upload_router, "abort_multipart_upload", lambda key, uid: None)
     monkeypatch.setattr(upload_router, "_trigger_processing", lambda a, v: state["transcodes"].append((a, v)))
+    monkeypatch.setattr(upload_router, "make_poster_in_background", lambda v: None)
     for name in ("abort_multipart_upload", "delete_object", "delete_prefix"):
         monkeypatch.setattr(cleanup_tasks, name, lambda *a, **k: None)
     return state
