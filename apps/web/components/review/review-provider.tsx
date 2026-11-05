@@ -10,6 +10,7 @@ import React, {
   useState,
 } from "react";
 import { api } from "@/lib/api";
+import { shareAuthHeaders } from "@/lib/auth";
 import { useReviewStore } from "@/stores/review-store";
 import type { AssetResponse, AssetVersion, Comment, ShareStreamResponse } from "@/types";
 
@@ -110,11 +111,7 @@ export function ReviewProvider({
         // Share mode: fetch stream info to build a pseudo asset
         const API_URL =
           process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-        const headers: Record<string, string> = {};
-        try {
-          const t = localStorage.getItem("ff_access_token");
-          if (t) headers["Authorization"] = `Bearer ${t}`;
-        } catch {}
+        const headers = await shareAuthHeaders();
         const streamRes = await fetch(
           `${API_URL}/share/${shareToken}/stream/${assetId}?_=1${shareSessionParam}`,
           { headers },
@@ -189,11 +186,7 @@ export function ReviewProvider({
         streamedVersionRef.current = data.latest_version?.id ?? null;
         const API_URL =
           process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-        const headers: Record<string, string> = {};
-        try {
-          const t = localStorage.getItem("ff_access_token");
-          if (t) headers["Authorization"] = `Bearer ${t}`;
-        } catch {}
+        const headers = await shareAuthHeaders();
         try {
           const vres = await fetch(
             `${API_URL}/share/${shareToken}/assets/${assetId}/versions?_=1${shareSessionParam}`,
@@ -307,15 +300,13 @@ export function ReviewProvider({
     if (currentVersionId === streamedVersionRef.current) return; // already showing this version
     let cancelled = false;
     const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-    const headers: Record<string, string> = {};
-    try {
-      const t = localStorage.getItem("ff_access_token");
-      if (t) headers["Authorization"] = `Bearer ${t}`;
-    } catch {}
-    fetch(
-      `${API_URL}/share/${shareToken}/stream/${assetId}?version_id=${currentVersionId}${shareSessionParam}`,
-      { headers },
-    )
+    shareAuthHeaders()
+      .then((headers) =>
+        fetch(
+          `${API_URL}/share/${shareToken}/stream/${assetId}?version_id=${currentVersionId}${shareSessionParam}`,
+          { headers },
+        ),
+      )
       .then((r) => (r.ok ? r.json() : null))
       .then((streamData: ShareStreamResponse | null) => {
         if (cancelled || !mountedRef.current || !streamData?.url) return;
@@ -347,12 +338,10 @@ export function ReviewProvider({
     if (!awaitingReady) return;
     const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
     const id = setInterval(() => {
-      const headers: Record<string, string> = {};
-      try {
-        const t = localStorage.getItem("ff_access_token");
-        if (t) headers["Authorization"] = `Bearer ${t}`;
-      } catch {}
-      fetch(`${API_URL}/share/${shareToken}/stream/${assetId}?_=1${shareSessionParam}`, { headers })
+      shareAuthHeaders()
+        .then((headers) =>
+          fetch(`${API_URL}/share/${shareToken}/stream/${assetId}?_=1${shareSessionParam}`, { headers }),
+        )
         .then((r) => (r.ok ? r.json() : null))
         .then((streamData: ShareStreamResponse | null) => {
           if (!mountedRef.current || !streamData?.url) return;
@@ -375,11 +364,8 @@ export function ReviewProvider({
           process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
         const headers: Record<string, string> = {
           "Content-Type": "application/json",
+          ...(await shareAuthHeaders()),
         };
-        try {
-          const t = localStorage.getItem("ff_access_token");
-          if (t) headers["Authorization"] = `Bearer ${t}`;
-        } catch {}
         // Include guest identity if available (for non-authenticated users)
         const guestFields: Record<string, string> = {};
         try {

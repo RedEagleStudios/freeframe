@@ -23,9 +23,18 @@ import { fetchShareDownloadOptions, handleDownload } from './share-download'
 import { DownloadMenu } from '@/components/shared/download-menu'
 import { ShareBrandMark } from './share-brand-mark'
 import { ProcessingPlaceholder } from '@/components/review/processing-placeholder'
+import { getFreshAccessToken } from '@/lib/auth'
 
-/** Signed in, or a guest who has already given a name and email. */
-function hasIdentity(): boolean {
+/**
+ * Signed in, or a guest who has already given a name and email. An expired
+ * session is refreshed first, and one whose refresh is refused is gone by the
+ * time storage is read, so its viewer is asked for a guest identity instead of
+ * posting as nobody.
+ */
+async function hasIdentity(): Promise<boolean> {
+  try {
+    await getFreshAccessToken()
+  } catch {}
   try {
     return !!localStorage.getItem('ff_access_token') || !!localStorage.getItem('ff_guest_identity')
   } catch {
@@ -198,7 +207,6 @@ function ShareReviewInner({
       if (stored) setGuestIdentity(JSON.parse(stored))
     } catch {}
   }, [])
-  const isLoggedIn = typeof window !== 'undefined' && !!localStorage.getItem('ff_access_token')
 
   const submitComment = React.useCallback(async (body: string, timecodeStart?: number, timecodeEnd?: number, annotationData?: Record<string, unknown>, parentId?: string) => {
     const payload: CreateCommentPayload = { body }
@@ -215,7 +223,7 @@ function ShareReviewInner({
   }, [addComment, currentVersion, refetchComments])
 
   const submitReply = React.useCallback(async (parentId: string, body: string) => {
-    if (!hasIdentity()) {
+    if (!(await hasIdentity())) {
       // Resolved once the guest names themselves and the reply is sent; until
       // then the reply box keeps what was typed.
       return new Promise<void>((resolve, reject) => {
@@ -286,7 +294,7 @@ function ShareReviewInner({
       assetType={asset.asset_type}
       allowInternal={false}
       onSubmit={async (body: string, timecodeStart?: number, timecodeEnd?: number, annotationData?: Record<string, unknown>) => {
-        if (!hasIdentity()) {
+        if (!(await hasIdentity())) {
           pendingCommentRef.current = { body, timecodeStart, timecodeEnd, annotationData }
           setShowGuestPrompt(true)
           return

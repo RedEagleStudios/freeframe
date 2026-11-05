@@ -1,5 +1,5 @@
 import { withBasePath } from './base-path'
-import { subjectOf } from './jwt-subject'
+import { expiresWithin, subjectOf } from './jwt-subject'
 
 const ACCESS_TOKEN_KEY = 'ff_access_token'
 const REFRESH_TOKEN_KEY = 'ff_refresh_token'
@@ -81,8 +81,17 @@ export function onSessionEnded(cb: () => void): () => void {
  * listener that throws does not keep the page from leaving.
  */
 export function clearTokens(): void {
+  endSession(true)
+}
+
+/**
+ * `clearTokens`, with the navigation to /login only when `leave` is set. A share
+ * page ends a dead session without leaving (`getFreshAccessToken`): its viewer
+ * carries on as a guest, and sending them to /login would lose the link.
+ */
+function endSession(leave: boolean): void {
   if (typeof window === 'undefined') return
-  leaveGuardSuppressed = true
+  if (leave) leaveGuardSuppressed = true
   localStorage.removeItem(ACCESS_TOKEN_KEY)
   localStorage.removeItem(REFRESH_TOKEN_KEY)
   // Clear auth cookies
@@ -95,22 +104,70 @@ export function clearTokens(): void {
       console.warn('A listener failed as the session ended', err)
     }
   })
-  window.location.href = withBasePath('/login')
+  if (leave) window.location.href = withBasePath('/login')
 }
 
 // Deduplicate concurrent refresh calls — when access token expires, multiple
-// API calls may simultaneously get 401 and try to refresh. Only one should run.
+// API calls may simultaneously get 401 and try to refresh. Only one should run,
+// and a caller that joins one already out gets that one's handling of a
+// refusal.
 let _refreshPromise: Promise<string | null> | null = null
 
-export async function refreshAccessToken(): Promise<string | null> {
+/**
+ * Trades the refresh token for a new access token; null when it could not.
+ * A refusal ends the session, and by default leaves for /login; with
+ * `leaveOnRefusal: false` the page stays where it is.
+ */
+export async function refreshAccessToken(
+  { leaveOnRefusal = true }: { leaveOnRefusal?: boolean } = {},
+): Promise<string | null> {
   if (_refreshPromise) return _refreshPromise
 
-  _refreshPromise = _doRefresh()
+  _refreshPromise = _doRefresh(leaveOnRefusal)
   try {
     return await _refreshPromise
   } finally {
     _refreshPromise = null
   }
+}
+
+// A token this close to expiry is refreshed before it is sent: it could expire
+// on the way.
+const EXPIRY_SKEW_MS = 30_000
+
+/**
+ * The access token to send to an endpoint that answers anyone but acts on a
+ * signed-in viewer when there is one: the public share endpoints. Refreshed
+ * first when it has expired or is about to; null when there is no session, or
+ * the refresh failed.
+ *
+ * Those endpoints never answer 401. They read an expired token as no token, so
+ * the refresh-on-401 in `lib/api.ts` never runs, and a signed-in viewer whose
+ * access token had lapsed (it lives 15 minutes) was taken for an anonymous
+ * guest: a comment failed with "guest_email and guest_name required", and a
+ * secure link asked them to sign in. Opening the app first used to be the only
+ * way to get a fresh one.
+ *
+ * A refused refresh ends the session without leaving the page, so the viewer
+ * carries on as a guest rather than lose the link to /login.
+ */
+export async function getFreshAccessToken(): Promise<string | null> {
+  const token = getAccessToken()
+  if (!token || !expiresWithin(token, EXPIRY_SKEW_MS)) return token
+  return refreshAccessToken({ leaveOnRefusal: false })
+}
+
+/**
+ * `getFreshAccessToken` as request headers: `Authorization` when there is a
+ * token, none when there is not or storage cannot be read (a sandboxed frame),
+ * which the share endpoints answer as a guest.
+ */
+export async function shareAuthHeaders(): Promise<Record<string, string>> {
+  let token: string | null = null
+  try {
+    token = await getFreshAccessToken()
+  } catch {}
+  return token ? { Authorization: `Bearer ${token}` } : {}
 }
 
 /**
@@ -128,10 +185,10 @@ function sessionMovedOn(sentRefreshToken: string): string | null {
   return sub !== null && sub === subjectOf(sentRefreshToken) ? access : null
 }
 
-async function _doRefresh(): Promise<string | null> {
+async function _doRefresh(leaveOnRefusal: boolean): Promise<string | null> {
   const refreshToken = getRefreshToken()
   if (!refreshToken) {
-    clearTokens()
+    endSession(leaveOnRefusal)
     return null
   }
 
@@ -150,7 +207,7 @@ async function _doRefresh(): Promise<string | null> {
       // is the server being briefly unavailable, and signing the user out for
       // it loses whatever they had open.
       if (response.status === 401 || response.status === 403) {
-        clearTokens()
+        endSession(leaveOnRefusal)
       }
       return null
     }

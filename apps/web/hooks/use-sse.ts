@@ -2,6 +2,7 @@
 
 import * as React from 'react'
 import { getAccessToken, refreshAccessToken } from '@/lib/auth'
+import { expiresWithin } from '@/lib/jwt-subject'
 
 // ─── Event payload types ──────────────────────────────────────────────────────
 
@@ -90,16 +91,6 @@ const EXPIRY_SKEW_MS = 10_000
 // other reason means access itself was taken away.
 const TOKEN_REASONS = new Set(['token_expired', 'token_revoked'])
 
-function isExpiringSoon(token: string): boolean {
-  try {
-    const part = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/')
-    const { exp } = JSON.parse(atob(part)) as { exp?: number }
-    return typeof exp === 'number' && exp * 1000 <= Date.now() + EXPIRY_SKEW_MS
-  } catch {
-    return false // not ours to judge; the server will answer
-  }
-}
-
 // ─── Hook ─────────────────────────────────────────────────────────────────────
 
 export function useSSE(projectId: string | null | undefined, options: UseSSEOptions = {}): UseSSEReturn {
@@ -158,7 +149,7 @@ export function useSSE(projectId: string | null | undefined, options: UseSSEOpti
       if (destroyed) return
 
       let token = getAccessToken()
-      if (token && (token === rejectedToken || isExpiringSoon(token))) {
+      if (token && (token === rejectedToken || expiresWithin(token, EXPIRY_SKEW_MS))) {
         // A refused refresh signs the user out (lib/auth); a failed one
         // returns null and we try again later.
         token = await refreshAccessToken()

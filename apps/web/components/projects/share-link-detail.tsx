@@ -22,6 +22,7 @@ import {
 import { cn, dateInputValue, endOfDayISO } from "@/lib/utils";
 import { withBasePath } from "@/lib/base-path";
 import { api } from "@/lib/api";
+import { shareAuthHeaders } from "@/lib/auth";
 import { ShareLinkActivityPanel } from "@/components/projects/share-link-activity";
 import {
   ShareAppearanceFields,
@@ -588,12 +589,10 @@ export function ShareLinkContent({
       // Folder, project root, or multi-share: use the share endpoint
       // to get only the items actually included in this share link
       const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
-      const headers: Record<string, string> = {};
-      try {
-        const t = localStorage.getItem('ff_access_token');
-        if (t) headers['Authorization'] = `Bearer ${t}`;
-      } catch {}
-      fetch(`${API_URL}/share/${token}/assets?page=1&per_page=${SHARE_ASSETS_PAGE_SIZE}`, { headers })
+      shareAuthHeaders()
+        .then((headers) =>
+          fetch(`${API_URL}/share/${token}/assets?page=1&per_page=${SHARE_ASSETS_PAGE_SIZE}`, { headers }),
+        )
         .then((r) => r.ok ? r.json() : Promise.reject())
         .then((data) => {
           setPreviewTotal(data.total ?? (data.assets || []).length);

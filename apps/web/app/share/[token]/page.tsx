@@ -8,6 +8,7 @@ import {
   Loader2,
 } from 'lucide-react'
 import { withBasePath } from '@/lib/base-path'
+import { shareAuthHeaders } from '@/lib/auth'
 import { resolveBrandingLogo } from '@/lib/branding-logo'
 import { Button } from '@/components/ui/button'
 import { FolderShareViewer } from '@/components/share/folder-share-viewer'
@@ -64,16 +65,7 @@ async function fetchShareInfo(
   logOpen?: boolean,
 ): Promise<ShareValidateResponse> {
   // Include auth token if user is already logged in (for secure links)
-  const headers: Record<string, string> = {}
-  let accessToken: string | null = null
-  try {
-    if (typeof window !== 'undefined') {
-      accessToken = localStorage.getItem('ff_access_token')
-    }
-  } catch {}
-  if (accessToken) {
-    headers['Authorization'] = `Bearer ${accessToken}`
-  }
+  const headers: Record<string, string> = await shareAuthHeaders()
 
   // When a password is supplied, use POST /share/{token}/verify so the
   // password travels in the request body — not as a query string, which
