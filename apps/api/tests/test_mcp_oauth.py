@@ -249,6 +249,60 @@ def test_a_connection_with_changes_allowed_comments_as_its_user(real_db, mcp):
     assert row.author_id == me.id and row.timecode_start == 10
 
 
+def test_an_agent_downloads_an_older_version(real_db, mcp, monkeypatch):
+    """get_asset lists any version's download options, and get_download_url serves
+    that version's file and says which version it is, not the latest's."""
+    from apps.api.models.asset import Asset, AssetType, AssetVersion, FileType, MediaFile, ProcessingStatus
+    from apps.api.routers import assets as assets_router
+    from apps.api.services import downloads
+
+    monkeypatch.setattr(assets_router, "generate_presigned_get_url", lambda key, **_kw: f"https://s3.test/{key}")
+    monkeypatch.setattr(downloads, "head_object_size", lambda key: 7)
+
+    me, _other, mine, _theirs, _asset = _seed(real_db)
+    still = Asset(project_id=mine.id, name="poster", asset_type=AssetType.image, created_by=me.id)
+    real_db.add(still); real_db.flush()
+    versions = {}
+    for n in (1, 2):
+        v = AssetVersion(asset_id=still.id, version_number=n, processing_status=ProcessingStatus.ready, created_by=me.id)
+        real_db.add(v); real_db.flush()
+        real_db.add(MediaFile(
+            version_id=v.id, file_type=FileType.image, original_filename=f"poster-v{n}.png",
+            mime_type="image/png", file_size_bytes=100 * n,
+            s3_key_raw=f"raw/v{n}/original.png", s3_key_processed=f"processed/v{n}/out.webp",
+        ))
+        versions[n] = v
+    real_db.flush()
+    _client_id, tokens = _connect(mcp, me)
+    v1 = str(versions[1].id)
+
+    _status, latest = _call(mcp, tokens["access_token"], "get_asset", {"asset_id": str(still.id)})
+    assert latest["structuredContent"]["download_options_version"]["version_number"] == 2
+
+    _status, older = _call(mcp, tokens["access_token"], "get_asset", {"asset_id": str(still.id), "version_id": v1})
+    content = older["structuredContent"]
+    assert content["download_options_version"] == {"id": v1, "version_number": 1}
+    assert {o["id"]: o["size_bytes"] for o in content["download_options"]} == {"original": 100, "transcode": 7}
+
+    _status, link = _call(mcp, tokens["access_token"], "get_download_url", {
+        "asset_id": str(still.id), "version_id": v1, "rendition": "transcode",
+    })
+    assert not link["isError"], link
+    assert link["structuredContent"]["url"] == "https://s3.test/processed/v1/out.webp"
+    assert link["structuredContent"]["version"] == {"id": v1, "version_number": 1}
+
+    # With no version named, the latest ready one, and the link says so.
+    _status, link = _call(mcp, tokens["access_token"], "get_download_url", {"asset_id": str(still.id)})
+    assert link["structuredContent"]["version"]["version_number"] == 2
+    assert link["structuredContent"]["url"] == "https://s3.test/raw/v2/original.png"
+
+    # A version of another asset is refused, by both tools, not swapped for the latest.
+    clip_v1 = str(real_db.query(AssetVersion).filter(AssetVersion.asset_id == _asset.id).one().id)
+    for tool in ("get_asset", "get_download_url"):
+        _status, wrong = _call(mcp, tokens["access_token"], tool, {"asset_id": str(still.id), "version_id": clip_v1})
+        assert wrong["isError"], tool
+
+
 @pytest.mark.parametrize("end_account", ["password_change", "deactivation"])
 def test_a_connection_ends_with_the_accounts_session(real_db, mcp, end_account):
     from apps.api.models.user import UserStatus

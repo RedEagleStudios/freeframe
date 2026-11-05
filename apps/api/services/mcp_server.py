@@ -57,8 +57,9 @@ You act as the signed-in user and see what they see.
 
 Find things with list_projects, then get_folder_tree or list_folder, or \
 search_assets by name. get_asset shows an asset's versions, media details and \
-download options. get_download_url returns a direct, time-limited link to the \
-file itself: fetch it with `curl -L -OJ "<url>"` (the server names the file). \
+download options (for the latest version, or the version_id you pass). \
+get_download_url returns a direct, time-limited link to the file itself, of \
+any ready version: fetch it with `curl -L -OJ "<url>"` (the server names the file). \
 Every asset carries its folder_path (from the project's top level, "" at the \
 top) and a web_url to hand to a person.
 
@@ -415,20 +416,43 @@ def create_mcp_server(session_scope: SessionScope = default_session_scope) -> MC
         return call(run)
 
     @server.tool(annotations=READ_ONLY)
-    def get_asset(asset_id: uuid.UUID) -> dict[str, Any]:
-        """One asset in full: every version with its media details, and the download options for the latest."""
+    def get_asset(
+        asset_id: uuid.UUID,
+        version_id: Annotated[
+            Optional[uuid.UUID],
+            Field(description="Version whose download options to list; omit for the latest ready one"),
+        ] = None,
+    ) -> dict[str, Any]:
+        """One asset in full: every version with its media details, and the download options for one version.
+
+        download_options_version says which version the options are for; pass its id and a rendition to
+        get_download_url. Options are empty when that version is not ready."""
         def run(db: Session, user: User, scopes: list[str]) -> dict:
             asset = assets_router.get_asset(asset_id=asset_id, db=db, current_user=user)
             versions = assets_router.list_asset_versions(asset_id=asset_id, db=db, current_user=user)
-            try:
-                options = assets_router.list_download_options(
-                    asset_id=asset_id, version_id=None, db=db, current_user=user,
-                )
-            except HTTPException:
-                options = []  # nothing ready to download yet
+            by_id = {v.id: v for v in versions}
+            if version_id is not None:
+                target = by_id.get(version_id)
+                if target is None:
+                    raise ToolError("No such version of this asset")
+            else:
+                playable = assets_router._playable_version(db, asset_id)
+                target = by_id.get(playable.id) if playable is not None else None
+            options = []
+            if target is not None:
+                try:
+                    options = assets_router.list_download_options(
+                        asset_id=asset_id, version_id=target.id, db=db, current_user=user,
+                    )
+                except HTTPException:
+                    pass  # that version is not ready to download
             return {
                 **_assets(db, [asset])[0],
                 "versions": [_version(v) for v in versions],
+                "download_options_version": (
+                    {"id": str(target.id), "version_number": target.version_number}
+                    if target is not None else None
+                ),
                 "download_options": [o.model_dump() for o in options],
             }
         return call(run)
@@ -441,16 +465,20 @@ def create_mcp_server(session_scope: SessionScope = default_session_scope) -> MC
         ] = None,
         rendition: Annotated[
             Optional[str],
-            Field(description="An id from get_asset's download_options, such as 'original' or 'transcode'. "
-                              "Omit for the original upload when you may download it, else the transcode."),
+            Field(description="An id from get_asset's download_options for this version, such as 'original' or "
+                              "'transcode'. Omit for the original upload when you may download it, else the transcode."),
         ] = None,
     ) -> dict[str, Any]:
-        """A direct, time-limited download link for an asset's file.
+        """A direct, time-limited download link for a version of an asset: the latest ready one, or any other.
 
-        Fetch it with `curl -L -OJ "<url>"`; the link names the file. It expires after expires_in seconds."""
+        Fetch it with `curl -L -OJ "<url>"`; the link names the file. It expires after expires_in seconds.
+        version says which version the link is for."""
         def run(db: Session, user: User, scopes: list[str]) -> dict:
+            # Resolved once, so the options and the link are for the same
+            # version even if another becomes ready in between.
+            _asset, version = assets_router._requested_version(db, asset_id, version_id, user)
             options = assets_router.list_download_options(
-                asset_id=asset_id, version_id=version_id, db=db, current_user=user,
+                asset_id=asset_id, version_id=version.id, db=db, current_user=user,
             )
             by_id = {o.id: o for o in options}
             if rendition is not None and rendition not in by_id:
@@ -461,12 +489,13 @@ def create_mcp_server(session_scope: SessionScope = default_session_scope) -> MC
             if chosen is None:
                 raise ToolError("This version has nothing to download")
             link = assets_router.get_stream_url(
-                asset_id=asset_id, version_id=version_id, download=True, rendition=chosen.id,
+                asset_id=asset_id, version_id=version.id, download=True, rendition=chosen.id,
                 prefer_original=False, db=db, current_user=user,
             )
             return {
                 "url": link.url,
                 "expires_in": link.expires_in,
+                "version": {"id": str(version.id), "version_number": version.version_number},
                 "rendition": chosen.id,
                 "label": chosen.label,
                 "format": chosen.format,

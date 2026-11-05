@@ -149,13 +149,16 @@ export function DownloadMenu({
 }
 
 /** The same choice as a submenu, for a "Download" entry in a larger menu --
- *  a ⋯ menu or a right-click one, whichever it is placed in. */
+ *  a ⋯ menu or a right-click one, whichever it is placed in. `children`, when
+ *  given, is the entry's label in place of the Download icon and word. */
 export function DownloadSubmenu({
   load,
   onPick,
+  children,
 }: {
   load: () => Promise<DownloadOption[] | null>
   onPick: (rendition?: string) => void
+  children?: React.ReactNode
 }) {
   const { options, state, refresh } = useDownloadOptions(load)
   const contentRef = React.useRef<HTMLDivElement>(null)
@@ -163,8 +166,12 @@ export function DownloadSubmenu({
   return (
     <MenuSub onOpenChange={(open) => { if (open) void refresh() }}>
       <MenuSubTrigger className={cn(menuItemClass, 'data-[state=open]:bg-bg-hover data-[state=open]:text-text-primary')}>
-        <Download className="h-3.5 w-3.5 text-text-tertiary" />
-        <span className="flex-1">Download</span>
+        {children ?? (
+          <>
+            <Download className="h-3.5 w-3.5 text-text-tertiary" />
+            <span className="flex-1">Download</span>
+          </>
+        )}
         <ChevronRight className="h-3.5 w-3.5 text-text-tertiary" />
       </MenuSubTrigger>
       <MenuSubContent

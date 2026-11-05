@@ -963,7 +963,7 @@ export default function ProjectDetailPage() {
               }}
               onAssetDownload={async (asset, rendition) => {
                 try {
-                  await downloadAsset(asset.id, rendition);
+                  await downloadAsset(asset.id, { rendition });
                 } catch {}
               }}
               loadAssetDownloadOptions={(asset) => fetchAssetDownloadOptions(asset.id)}
@@ -989,7 +989,7 @@ export default function ProjectDetailPage() {
                 // All on a share link.
                 async function downloadOne(id: string) {
                   try {
-                    await downloadAsset(id, undefined, true);
+                    await downloadAsset(id, { preferOriginal: true });
                     await new Promise((r) => setTimeout(r, 300));
                   } catch {}
                 }
@@ -1318,7 +1318,7 @@ export default function ProjectDetailPage() {
                         load={() => fetchAssetDownloadOptions(selectedAsset.id)}
                         onPick={async (rendition) => {
                           try {
-                            await downloadAsset(selectedAsset.id, rendition);
+                            await downloadAsset(selectedAsset.id, { rendition });
                           } catch {
                             // Silent fail
                           }

@@ -18,6 +18,7 @@ import { CommentInput } from '@/components/review/comment-input'
 // ApprovalBar removed for now
 import { VersionSwitcher } from '@/components/review/version-switcher'
 import { ShareDialog } from '@/components/review/share-dialog'
+import { VersionDownloadMenu } from '@/components/review/version-download-menu'
 import { CompareOverlay } from '@/components/review/compare/compare-overlay'
 import { useReviewStore } from '@/stores/review-store'
 import { useAuthStore } from '@/stores/auth-store'
@@ -693,6 +694,7 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
             <Upload className="h-3.5 w-3.5" />
             New Version
           </button>
+          <VersionDownloadMenu assetId={asset.id} versions={versions} currentVersionId={currentVersion?.id} />
           <ShareDialog assetId={asset.id} assetName={asset.name} projectId={projectId} asset={asset} />
           <button
             // When the sheet is the comment surface, this button drives the
